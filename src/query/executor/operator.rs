@@ -13099,36 +13099,11 @@ impl PhysicalOperator for CreateIndexOperator {
             return Ok(None);
         }
 
-        store.property_index.create_index(self.label.clone(), self.property.clone());
-
-        // Backfill index
-        // Since we have mutable access to store, we can get nodes
-        // But we need to avoid borrowing store while mutating property_index if we accessed it differently
-        // Here we use get_nodes_by_label which borrows store.
-        // property_index is inside store. 
-        // IndexManager uses RwLock internally so it handles its own mutability.
-        
-        // We collect entries to release the borrow on nodes
-        // Check both Node HashMap AND ColumnStore (for stub-loaded graphs)
-        let mut entries = Vec::new();
-        let nodes = store.get_nodes_by_label(&self.label);
-
-        for node in nodes {
-            // Try Node HashMap first
-            if let Some(val) = node.get_property(&self.property) {
-                entries.push((node.id, val.clone()));
-            } else {
-                // Fall back to ColumnStore (create_node_stub + set_column_property path)
-                let col_val = store.node_columns.get_property(node.id.as_u64() as usize, &self.property);
-                if !col_val.is_null() {
-                    entries.push((node.id, col_val));
-                }
-            }
-        }
-
-        for (node_id, val) in entries {
-            store.property_index.index_insert(&self.label, &self.property, val, node_id);
-        }
+        // Declaring and backfilling both live on the store, so that the index
+        // is recorded in the catalog that survives a restart (#1477) and the
+        // two-tier backfill exists once rather than once here and once in
+        // `CompositeCreateIndexOperator`.
+        store.create_property_index(&self.label, &self.property);
 
         self.executed = true;
         Ok(Some(Record::new()))
@@ -13412,25 +13387,10 @@ impl PhysicalOperator for CompositeCreateIndexOperator {
         }
 
         // Create individual indexes for each property
-        for property in &self.properties {
-            store.property_index.create_index(self.label.clone(), property.clone());
-
-            // Backfill each index (check both HashMap and ColumnStore)
-            let mut entries = Vec::new();
-            let nodes = store.get_nodes_by_label(&self.label);
-            for node in nodes {
-                if let Some(val) = node.get_property(property) {
-                    entries.push((node.id, val.clone()));
-                } else {
-                    let col_val = store.node_columns.get_property(node.id.as_u64() as usize, property);
-                    if !col_val.is_null() {
-                        entries.push((node.id, col_val));
-                    }
-                }
-            }
-            for (node_id, val) in entries {
-                store.property_index.index_insert(&self.label, property, val, node_id);
-            }
+        // A composite index is N single-property indexes, which is how it is
+        // planned and how it is listed by `SHOW INDEXES`.
+        for property in self.properties.clone() {
+            store.create_property_index(&self.label, &property);
         }
 
         self.executed = true;
@@ -13479,39 +13439,13 @@ impl PhysicalOperator for CreateConstraintOperator {
             return Ok(None);
         }
 
-        // Check existing data for uniqueness violations
-        let nodes = store.get_nodes_by_label(&self.label);
-        let mut seen_values: std::collections::HashSet<PropertyValue> = std::collections::HashSet::new();
-        for node in nodes {
-            // Through the store: on a restored graph the row is empty, so this
-            // check saw no values and created a constraint over data that
-            // already violated it (#1187).
-            if let Some(val) = store.node_property(node.id, &self.property) {
-                if !val.is_null() && !seen_values.insert(val.clone()) {
-                    return Err(ExecutionError::RuntimeError(format!(
-                        "Cannot create unique constraint: duplicate value {:?} for :{}({})",
-                        val, self.label.as_str(), self.property
-                    )));
-                }
-            }
-        }
-
-        // Create the constraint
-        store.property_index.create_unique_constraint(self.label.clone(), self.property.clone());
-
-        // Backfill constraint index. Through the store, not `node.get_property`:
-        // on a restored graph the row is empty, the backfill saw no existing
-        // values, and the first duplicate of any of them went through (#1187).
-        let mut entries = Vec::new();
-        let nodes = store.get_nodes_by_label(&self.label);
-        for node in nodes {
-            if let Some(val) = store.node_property(node.id, &self.property) {
-                entries.push((node.id, val));
-            }
-        }
-        for (node_id, val) in entries {
-            store.property_index.constraint_insert(&self.label, &self.property, val, node_id);
-        }
+        // The duplicate check, the declaration and the backfill all live on
+        // the store, so the constraint is recorded in the catalog that survives
+        // a restart (#1477). An unpersisted constraint is not a slower query:
+        // the first duplicate after the restart goes in.
+        store
+            .create_unique_constraint(&self.label, &self.property)
+            .map_err(ExecutionError::RuntimeError)?;
 
         self.executed = true;
         Ok(Some(Record::new()))
@@ -13559,13 +13493,14 @@ impl PhysicalOperator for DropIndexOperator {
             return Ok(None);
         }
 
-        if !store.property_index.has_index(&self.label, &self.property) {
+        // Through the store, so the drop reaches the persisted catalog. A drop
+        // that only cleared memory came back on the next restart (#1477).
+        if !store.drop_property_index(&self.label, &self.property) {
             return Err(ExecutionError::RuntimeError(
                 format!("Index on :{}({}) does not exist", self.label.as_str(), self.property)
             ));
         }
 
-        store.property_index.drop_index(&self.label, &self.property);
         self.executed = true;
         Ok(Some(Record::new()))
     }
@@ -15245,6 +15180,17 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         "Firefly", "Cuckoo", "GWO", "Bat",
         "NSGA2", "MORaoDE", "SAPHR",
     ];
+
+    /// The subset of `SOLVERS` that optimise more than one objective.
+    ///
+    /// A multi-objective algorithm is routed to the Pareto branch whatever the
+    /// caller's cost count, which is what the two hardcoded names in the route
+    /// condition used to do for `NSGA2` and `MOTLBO` alone (#1499). Naming the
+    /// set once means a new multi-objective solver is routed by being added
+    /// here rather than by remembering to edit an `||` chain — the omission
+    /// that made `MOBMWR` and `MORaoDE` report a dispatch bug.
+    const MULTI_OBJECTIVE_SOLVERS: &'static [&'static str] =
+        &["MOTLBO", "MOBMWR", "NSGA2", "MORaoDE"];
 
     /// Procedures that need `&mut GraphStore`, and the refusal the read path owes
     /// a caller who asks for one there.
@@ -17327,17 +17273,26 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             for node in nodes {
                 node_ids.push(node.id);
                 
-                // Single cost (for single objective solvers)
-                if cost_props.len() == 1 {
-                    let cost = store.node_property(node.id, &cost_props[0]).and_then(|v| v.as_float()).unwrap_or(1.0);
-                    single_costs.push(cost);
-                } else if !cost_props.is_empty() {
+                // Both shapes, always (#1499). `multi_costs` is allocated with
+                // one row per cost property; it used to be filled only when
+                // there was more than one, so a single `cost_property` left one
+                // EMPTY row behind. `MultiObjectiveProblem::objectives` then
+                // indexed `costs[i]` for `i in 0..dim` into that empty row and
+                // panicked — on an unauthenticated query, since NSGA2 and
+                // MOTLBO are routed to the multi branch by name whatever the
+                // cost count.
+                //
+                // Filling both costs a vector push per node and removes the
+                // branch that made the two disagree.
+                if cost_props.is_empty() {
+                    single_costs.push(1.0);
+                } else {
+                    let first = store.node_property(node.id, &cost_props[0]).and_then(|v| v.as_float()).unwrap_or(1.0);
+                    single_costs.push(first);
                     for (i, cp) in cost_props.iter().enumerate() {
                         let cost = store.node_property(node.id, cp).and_then(|v| v.as_float()).unwrap_or(1.0);
                         multi_costs[i].push(cost);
                     }
-                } else {
-                    single_costs.push(1.0);
                 }
             }
         }
@@ -17363,7 +17318,13 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         };
 
         // 3. Run Solver
-        if algorithm == "NSGA2" || algorithm == "MOTLBO" || cost_props.len() > 1 {
+        // One list, not two names in a condition (#1499). `MOBMWR` and
+        // `MORaoDE` are multi-objective and were missing from it, so with a
+        // single cost property they fell through to the single-objective
+        // branch, which has no arm for them, and hit the #1341 "no
+        // implementation wired" guard — a dispatch bug that did not exist.
+        // They are implemented; they were unroutable.
+        if Self::MULTI_OBJECTIVE_SOLVERS.contains(&algorithm) || cost_props.len() > 1 {
             let res = match algorithm {
                 "MOTLBO" => MOTLBOSolver::new(solver_config).solve(&problem),
                 "MOBMWR" => MOBMWRSolver::new(solver_config, MOBMWRVariant::MOBMR).solve(&problem),
@@ -17444,8 +17405,25 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             let mut record = Record::new();
             record.bind("fitness".to_string(), Value::Property(PropertyValue::Float(result.best_fitness)));
             record.bind("algorithm".to_string(), Value::Property(PropertyValue::String(algorithm.to_string())));
-            record.bind("iterations".to_string(), Value::Property(PropertyValue::Integer(max_iter as i64)));
-            
+            // The iterations the solver *ran*, not the cap it was given (#1443).
+            // This used to bind `max_iter`, so `YIELD iterations` echoed the
+            // request: ask for 50 and you got 50 whether the solver ran 50 or
+            // stopped at 12. Five solvers break out of their loop on
+            // convergence (fpa, motlbo, nsga2, tlbo, mo_bmwr_family), and early
+            // convergence is the case the number is most interesting in. It
+            // also made the field useless for comparing how hard two solvers
+            // worked on one problem: both reported the cap, so both looked
+            // identical.
+            //
+            // `history` holds one entry per iteration performed, which is what
+            // `/optimize/solve` has always reported over SSE. The two surfaces
+            // disagreed; this one was the wrong one.
+            let iterations_run = result.history.len();
+            record.bind("iterations".to_string(), Value::Property(PropertyValue::Integer(iterations_run as i64)));
+            // The cap, as a separate column. Overloading one name would leave a
+            // caller unable to tell "ran 50 of 50" from "ran 50 of 200".
+            record.bind("max_iterations".to_string(), Value::Property(PropertyValue::Integer(max_iter as i64)));
+
             // Yield history as an array for plotting
             let history_props: Vec<PropertyValue> = result.history.into_iter().map(PropertyValue::Float).collect();
             record.bind("history".to_string(), Value::Property(PropertyValue::Array(history_props)));
