@@ -1324,7 +1324,16 @@ pub async fn import_csv_handler(
                     }
                 }
 
-                if let Some(node) = store_guard.get_node_mut(node_id) {
+                // Collected first, then written through `set_node_property`
+                // (#1505). Setting them on the `&mut Node` from `get_node_mut`
+                // maintains nothing: the full-text index is updated from
+                // `apply_property_set_readback`, which only the setter runs, so
+                // a corpus imported here was searchable by `MATCH` and returned
+                // nothing from `db.index.fulltext.queryNodes` — no error, no
+                // warning. The two-step exists because `get_node_mut` borrows
+                // the store mutably and `set_node_property` needs it again.
+                let mut props: Vec<(String, PropertyValue)> = Vec::new();
+                {
                     for (i, header) in headers.iter().enumerate() {
                         if let Some(value) = record.get(i) {
                             let trimmed = value.trim();
@@ -1348,9 +1357,12 @@ pub async fn import_csv_handler(
                                 PropertyValue::String(trimmed.to_string())
                             };
 
-                            node.set_property(header.as_str(), prop_val);
+                            props.push((header.to_string(), prop_val));
                         }
                     }
+                }
+                for (k, v) in props {
+                    let _ = store_guard.set_node_property(&graph, node_id, k, v);
                 }
                 count += 1;
             }
@@ -1404,9 +1416,10 @@ pub async fn import_json_handler(
             for node_json in &payload.nodes {
                 let node_id = store_guard.create_node(payload.label.as_str());
 
-                if let (Some(node), Some(obj)) =
-                    (store_guard.get_node_mut(node_id), node_json.as_object())
-                {
+                // Through `set_node_property`, not the `&mut Node` (#1505) —
+                // see the CSV handler above for why.
+                let mut props: Vec<(String, PropertyValue)> = Vec::new();
+                if let Some(obj) = node_json.as_object() {
                     for (key, val) in obj {
                         let prop_val = match val {
                             serde_json::Value::String(s) => PropertyValue::String(s.clone()),
@@ -1422,8 +1435,11 @@ pub async fn import_json_handler(
                             serde_json::Value::Bool(b) => PropertyValue::Boolean(*b),
                             _ => continue,
                         };
-                        node.set_property(key, prop_val);
+                        props.push((key.to_string(), prop_val));
                     }
+                }
+                for (k, v) in props {
+                    let _ = store_guard.set_node_property(&payload.graph, node_id, k, v);
                 }
                 count += 1;
             }
@@ -2986,8 +3002,17 @@ mod tests {
         assert_eq!(json["nodes_created"], 1);
 
         let store = state.store.read().await;
-        let node = store.get_nodes_by_label(&"Person".into())[0];
-        let prop = |k: &str| node.properties.get(k).cloned();
+        let node_id = store.get_nodes_by_label(&"Person".into())[0].id;
+        // Through the merged view, not `node.properties` (#1505). Since #1188
+        // `set_node_property` writes the column and deliberately drops the row
+        // shadow, so a node written by any ordinary path has an empty
+        // `properties` map. This test read the map directly and passed only
+        // because CSV import was the outlier that still wrote row storage --
+        // it was asserting where the value was stored, not the column shift it
+        // is named for. `merged_node_properties` exists for exactly this
+        // reason (#333).
+        let merged = store.node_properties_full(node_id);
+        let prop = |k: &str| merged.get(k).cloned();
         // Compared as values, not as rendered strings: `PropertyValue`'s `Display`
         // quotes strings, so `to_string()` would pass on a shifted column too.
         assert_eq!(
