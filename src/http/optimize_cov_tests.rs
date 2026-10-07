@@ -84,6 +84,30 @@ async fn stream_events(app: Router, job: &str) -> (StatusCode, Vec<(String, serd
     (status, events)
 }
 
+/// `total_time_ms` on a `done` event is a measurement, not a placeholder.
+///
+/// It was the constant 0 (#1798). A real solve takes some time, however
+/// small, so a measured value is strictly positive; 0 is what the old
+/// constant sent and must not come back.
+fn assert_solve_was_timed(done: &serde_json::Value) {
+    let ms = done["total_time_ms"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("total_time_ms is a number: {done}"));
+    assert!(
+        ms.is_finite() && ms > 0.0,
+        "total_time_ms is measured, got {ms}"
+    );
+}
+
+#[test]
+fn as_millis_f64_keeps_the_sub_millisecond_part() {
+    use std::time::Duration;
+    assert_eq!(as_millis_f64(Duration::ZERO), 0.0);
+    assert_eq!(as_millis_f64(Duration::from_micros(1_500)), 1.5);
+    assert_eq!(as_millis_f64(Duration::from_micros(250)), 0.25);
+    assert_eq!(as_millis_f64(Duration::from_secs(2)), 2_000.0);
+}
+
 #[tokio::test]
 async fn the_algorithm_catalogue_lists_every_solver_once() {
     let (status, json) = get_json(app(), "/optimize/algorithms").await;
@@ -189,6 +213,7 @@ async fn a_single_objective_solve_streams_iterations_then_done_with_its_seed() {
         last["final_fitness"].as_f64().unwrap() >= 0.0,
         "sphere is non-negative"
     );
+    assert_solve_was_timed(last);
 
     // The receiver has been taken: a second stream of the same job is refused.
     let resp = app
@@ -220,6 +245,7 @@ async fn a_multi_objective_solve_stamps_the_pareto_front_on_the_last_iteration()
     let (_, events) = stream_events(app, &job).await;
     let (name, done) = events.last().unwrap();
     assert_eq!(name, "done");
+    assert_solve_was_timed(done);
     let front = done["final_pareto"].as_array().expect("a pareto front");
     assert!(!front.is_empty());
     assert!(
