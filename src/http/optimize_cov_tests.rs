@@ -519,3 +519,151 @@ async fn the_test_router_serves_the_optimizer_alone() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no graph routes");
 }
+
+// ---------------------------------------------------------------------------
+// Extra verification of #1798 (`total_time_ms` on `done`), beyond the PR's own.
+// ---------------------------------------------------------------------------
+
+async fn start_job(app: Router, body: &str) -> String {
+    let (s, resp) = post(app, "/optimize/solve", body).await;
+    assert_eq!(s, StatusCode::OK, "{resp}");
+    serde_json::from_str::<serde_json::Value>(&resp).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn done_of(app: Router, body: &str) -> serde_json::Value {
+    let job = start_job(app.clone(), body).await;
+    let (_, events) = stream_events(app, &job).await;
+    let (name, done) = events.last().expect("some events").clone();
+    assert_eq!(name, "done", "{events:?}");
+    done
+}
+
+#[tokio::test]
+async fn total_time_ms_is_a_json_float_not_the_old_integer_zero() {
+    let done = done_of(
+        app(),
+        r#"{"algorithm":"jaya","benchmark":"sphere","population_size":6,"iterations":3,"dim":2,"seed":3}"#,
+    )
+    .await;
+    let v = &done["total_time_ms"];
+    assert!(v.is_f64(), "serialised as a float, got {v}");
+    assert!(!v.is_u64() && !v.is_i64(), "not an integer, got {v}");
+}
+
+#[tokio::test]
+async fn total_time_ms_never_exceeds_the_wall_clock_of_the_whole_request() {
+    let app = app();
+    let t0 = std::time::Instant::now();
+    let done = done_of(
+        app,
+        r#"{"algorithm":"jaya","benchmark":"rastrigin","population_size":40,"iterations":60,"dim":10,"seed":9}"#,
+    )
+    .await;
+    let wall_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+    let ms = done["total_time_ms"].as_f64().unwrap();
+    assert!(ms > 0.0 && ms <= wall_ms, "0 < {ms} <= wall {wall_ms}");
+}
+
+#[tokio::test]
+async fn a_heavier_solve_reports_a_longer_time_than_a_tiny_one() {
+    let tiny = done_of(
+        app(),
+        r#"{"algorithm":"jaya","benchmark":"sphere","population_size":4,"iterations":1,"dim":2,"seed":1}"#,
+    )
+    .await["total_time_ms"]
+        .as_f64()
+        .unwrap();
+    // ~4 orders of magnitude more evaluations than `tiny`.
+    let heavy = done_of(
+        app(),
+        r#"{"algorithm":"jaya","benchmark":"rastrigin","population_size":200,"iterations":300,"dim":30,"seed":1}"#,
+    )
+    .await["total_time_ms"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        heavy > tiny,
+        "heavy {heavy} ms should exceed tiny {tiny} ms"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn total_time_ms_excludes_time_spent_waiting_for_the_stream_reader() {
+    // 400 iterations > the 256-slot channel, so the emitter blocks until the
+    // stream is read. A slow reader must not inflate the solver's time.
+    let app = app();
+    let job = start_job(
+        app.clone(),
+        r#"{"algorithm":"jaya","benchmark":"sphere","population_size":4,"iterations":400,"dim":2,"seed":5}"#,
+    )
+    .await;
+    let delay_ms = 1_500.0;
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+    let (_, events) = stream_events(app, &job).await;
+    let (name, done) = events.last().unwrap();
+    assert_eq!(name, "done");
+    assert_eq!(events.iter().filter(|(n, _)| n == "iteration").count(), 400);
+    let ms = done["total_time_ms"].as_f64().unwrap();
+    assert!(
+        ms > 0.0 && ms < delay_ms,
+        "solver time {ms} ms must not include the {delay_ms} ms the reader waited"
+    );
+}
+
+#[tokio::test]
+async fn error_and_cancel_events_carry_no_time() {
+    let app = app();
+    let job = start_job(
+        app.clone(),
+        r#"{"algorithm":"mo_bmr","benchmark":"sphere","population_size":4,"iterations":1}"#,
+    )
+    .await;
+    let (_, events) = stream_events(app.clone(), &job).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "error");
+    assert!(
+        events[0].1.get("total_time_ms").is_none(),
+        "{:?}",
+        events[0]
+    );
+
+    let job = start_job(
+        app.clone(),
+        r#"{"algorithm":"jaya","benchmark":"sphere","population_size":4,"iterations":600,"dim":2,"seed":1}"#,
+    )
+    .await;
+    post(app.clone(), &format!("/optimize/solve/{job}/cancel"), "").await;
+    let (_, events) = stream_events(app, &job).await;
+    assert!(events
+        .iter()
+        .all(|(n, d)| n != "done" && d.get("total_time_ms").is_none()));
+}
+
+#[tokio::test]
+async fn every_algorithm_reports_a_measured_time_over_http() {
+    let (_, algos) = get_json(app(), "/optimize/algorithms").await;
+    let algos = algos.as_array().unwrap();
+    assert_eq!(algos.len(), 23);
+    for a in algos {
+        let id = a["id"].as_str().unwrap();
+        let bench = if a["multi_objective"].as_bool().unwrap() {
+            "zdt1"
+        } else {
+            "sphere"
+        };
+        let body = format!(
+            r#"{{"algorithm":"{id}","benchmark":"{bench}","population_size":8,"iterations":3,"seed":11}}"#
+        );
+        let done = done_of(app(), &body).await;
+        let ms = done["total_time_ms"].as_f64().unwrap_or(-1.0);
+        assert!(
+            ms.is_finite() && ms > 0.0,
+            "{id} on {bench}: total_time_ms = {}",
+            done["total_time_ms"]
+        );
+        assert_eq!(done["seed"], 11, "{id}");
+    }
+}
