@@ -582,3 +582,61 @@ jobs:
           set -euo pipefail
           cargo run --release --example snapshot_portability -- \
             --verify snap.sgsnap --against wrote.json
+
+  # The one check branch protection should require.
+  #
+  # `test` and the two snapshot jobs take their check names from a matrix. When an
+  # `if:` skips a matrix job, GitHub never expands the matrix, so the check is
+  # reported under the LITERAL name -- `test (${{ matrix.os }})` -- and the names
+  # protection requires, `test (ubuntu-latest)` and `test (ubuntu-24.04-arm)`, are
+  # never reported at all. A required context that never reports leaves the pull
+  # request permanently BLOCKED.
+  #
+  # That is #1860: a docs-only change, MERGEABLE, every suite correctly skipped,
+  # and unmergeable. The comment on `changes` above says a job GitHub skips
+  # satisfies its requirement, and for a job with a fixed name it is right --
+  # `supply-chain (cargo-deny)` does report, skipped, under exactly the required
+  # name. It is wrong only for a matrix job, which is the case nobody could have
+  # tested: no docs-only pull request was opened between that filter landing in
+  # #1851 and #1860.
+  #
+  # This job has a fixed name and `if: always()`, so it reports on every run
+  # whatever the suites did. `skipped` counts as success -- a change that touches
+  # no code is supposed to skip them. `failure` and `cancelled` do not.
+  #
+  # tests/ci_gate_enumeration.rs asserts that every other job in this file is
+  # listed in `needs` below, because a suite added without being added here would
+  # stop gating silently: the aggregator would go green without ever waiting for
+  # it.
+  ci-ok:
+    name: ci-ok
+    # always() is load-bearing. Without it a failed dependency SKIPS this job, and
+    # a skipped check with a fixed name counts as satisfied -- which would turn the
+    # gate off in precisely the case it exists for.
+    if: always()
+    needs:
+      - changes
+      - supply-chain
+      - test
+      - typescript-sdk
+      - python-sdk
+      - snapshot-portability
+      - snapshot-portability-read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every suite either succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RESULTS"
+          bad=$(printf '%s' "$RESULTS" | jq -r '
+            to_entries
+            | map(select(.value.result != "success" and .value.result != "skipped")
+                  | .key)
+            | join(" ")')
+          if [ -n "$bad" ]; then
+            echo "::error::did not succeed: $bad"
+            exit 1
+          fi
+          echo "all suites accounted for"
