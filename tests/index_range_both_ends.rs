@@ -26,7 +26,7 @@ fn store(n: i64, indexed: bool) -> GraphStore {
             .execute(&q)
             .unwrap();
     }
-    let mut add = |s: &mut GraphStore, v: Option<PropertyValue>| {
+    let add = |s: &mut GraphStore, v: Option<PropertyValue>| {
         let id = s.create_node("P");
         if let Some(v) = v {
             s.set_node_property("default", id, "id".to_string(), v).unwrap();
