@@ -1940,6 +1940,10 @@ async fn start_server() {
 
     // Recover persisted data from RocksDB
     let mut recovered = false;
+    // A recovery failure, carried out of the borrow of `persistence` so the
+    // refusal can close it first: exiting with RocksDB open segfaults about
+    // one run in ten (#1577).
+    let mut refusal: Option<String> = None;
     if let Some(ref pm) = persistence {
         match pm.list_persisted_tenants() {
             Ok(tenants) if !tenants.is_empty() => {
@@ -1960,11 +1964,15 @@ async fn start_server() {
                         }
                         // Serving the other tenants with this one missing is
                         // the same empty-database answer, one tenant at a time.
-                        Err(e) => refuse_to_start(&format!(
-                            "cannot recover tenant '{tenant}' from the data directory: {e}"
-                        )),
+                        Err(e) => {
+                            refusal = Some(format!(
+                                "cannot recover tenant '{tenant}' from the data directory: {e}"
+                            ));
+                            break;
+                        }
                     }
                 }
+                if refusal.is_none() {
                 // The index definitions, after every tenant's rows are in
                 // (#1477). A second pass rather than part of the loop above
                 // because all tenants share one `graph` here: an index restored
@@ -1995,12 +2003,17 @@ async fn start_server() {
                     "Recovery complete. Total: {} nodes, {} edges, {} indexes in-memory",
                     graph.node_count(), graph.edge_count(), restored_indexes
                 );
+                }
             }
             Ok(_) => println!("No persisted tenants found."),
-            Err(e) => refuse_to_start(&format!(
-                "cannot list the tenants in the data directory: {e}"
-            )),
+            Err(e) => {
+                refusal = Some(format!("cannot list the tenants in the data directory: {e}"));
+            }
         }
+    }
+    if let Some(reason) = refusal {
+        explain_refusal(&reason);
+        exit_closing(persistence, 3);
     }
 
     // Load demo data based on --demo flag (skip if persisted data was recovered)
@@ -2302,15 +2315,21 @@ fn exit_closing(persistence: Option<Arc<samyama::PersistenceManager>>, code: i32
 #[path = "main_cov_tests.rs"]
 mod cov_tests;
 
-/// Stop before serving anything, with the reason and the way out.
-///
-/// Exit status 3, distinct from a usage error, so a supervisor can tell
-/// "the data could not be read" from "the flags were wrong" (#1657).
-fn refuse_to_start(reason: &str) -> ! {
+/// Why the server will not start, and the way out.
+fn explain_refusal(reason: &str) {
     eprintln!("Refusing to start: {reason}");
     eprintln!(
         "  The server has not served any request and has not changed the directory. \
          Fix the cause above and start again, or pass --ephemeral to run without it."
     );
+}
+
+/// Stop before serving anything, when persistence never opened.
+///
+/// Exit status 3, distinct from a usage error, so a supervisor can tell
+/// "the data could not be read" from "the flags were wrong" (#1657). Once
+/// persistence *is* open, use `explain_refusal` and `exit_closing` instead.
+fn refuse_to_start(reason: &str) -> ! {
+    explain_refusal(reason);
     std::process::exit(3)
 }
