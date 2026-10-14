@@ -1919,13 +1919,20 @@ async fn start_server() {
         .and_then(|pos| std::env::args().nth(pos + 1));
 
     // Initialize persistence FIRST (before loading data)
+    // A data directory that cannot be opened stops the server. It used to
+    // print the error and carry on with persistence off: the process answered
+    // queries against an empty graph while the operator's data sat unread on
+    // disk, and every write it acknowledged was lost on the next restart. A
+    // format mismatch looked exactly like an empty database (#1657). Starting
+    // without the data is a choice an operator makes with `--ephemeral`, not
+    // one the server makes for them.
     let persistence = if let Some(path) = &config.data_path {
         match samyama::PersistenceManager::new(path) {
             Ok(pm) => Some(Arc::new(pm)),
-            Err(e) => {
-                eprintln!("Failed to initialize persistence: {}", e);
-                None
-            }
+            Err(e) => refuse_to_start(&format!(
+                "cannot open the data directory {}: {e}",
+                path
+            )),
         }
     } else {
         None
@@ -1951,7 +1958,11 @@ async fn start_server() {
                             }
                             recovered = true;
                         }
-                        Err(e) => eprintln!("  Error recovering tenant '{}': {}", tenant, e),
+                        // Serving the other tenants with this one missing is
+                        // the same empty-database answer, one tenant at a time.
+                        Err(e) => refuse_to_start(&format!(
+                            "cannot recover tenant '{tenant}' from the data directory: {e}"
+                        )),
                     }
                 }
                 // The index definitions, after every tenant's rows are in
@@ -1986,7 +1997,9 @@ async fn start_server() {
                 );
             }
             Ok(_) => println!("No persisted tenants found."),
-            Err(e) => eprintln!("Error listing persisted tenants: {}", e),
+            Err(e) => refuse_to_start(&format!(
+                "cannot list the tenants in the data directory: {e}"
+            )),
         }
     }
 
@@ -2288,3 +2301,16 @@ fn exit_closing(persistence: Option<Arc<samyama::PersistenceManager>>, code: i32
 #[cfg(test)]
 #[path = "main_cov_tests.rs"]
 mod cov_tests;
+
+/// Stop before serving anything, with the reason and the way out.
+///
+/// Exit status 3, distinct from a usage error, so a supervisor can tell
+/// "the data could not be read" from "the flags were wrong" (#1657).
+fn refuse_to_start(reason: &str) -> ! {
+    eprintln!("Refusing to start: {reason}");
+    eprintln!(
+        "  The server has not served any request and has not changed the directory. \
+         Fix the cause above and start again, or pass --ephemeral to run without it."
+    );
+    std::process::exit(3)
+}

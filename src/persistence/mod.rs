@@ -50,6 +50,7 @@
 //! used to say the WAL was written first and replayed on start-up; neither has
 //! been true (#1592).
 
+pub mod format;
 pub mod health;
 pub mod storage;
 pub mod tenant;
@@ -87,6 +88,11 @@ impl PersistenceManager {
     pub fn new(base_path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         let base_path = base_path.as_ref().to_path_buf();
 
+        // Which format wrote this directory, asked before anything is created
+        // or opened: a directory this engine refuses is left as it was found
+        // (#1657).
+        let found = format::check(&base_path)?;
+
         // Create subdirectories
         let storage_path = base_path.join("data");
         let wal_path = base_path.join("wal");
@@ -109,6 +115,10 @@ impl PersistenceManager {
         // Initialize tenant manager
         let tenants = TenantManager::new();
         info!("Tenant manager initialized");
+
+        // Stamped only now, once both stores opened: a directory is marked as
+        // this engine's format only when this engine could actually read it.
+        format::stamp(&base_path, found)?;
 
         Ok(Self {
             base_path,
@@ -829,6 +839,9 @@ pub enum PersistenceError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Format(#[from] format::FormatError),
 }
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
