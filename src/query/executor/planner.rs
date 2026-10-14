@@ -59,7 +59,7 @@
 //! (`execute_cached`, #1153), which returns the rows and never reaches the
 //! planner at all: 14.8x on that same selective read.
 
-use crate::query::executor::operator::{CreateFullTextIndexOperator, DropFullTextIndexOperator, FullTextSearchOperator, TargetComparison};
+use crate::query::executor::operator::{numeric_tie_end, CreateFullTextIndexOperator, DropFullTextIndexOperator, FullTextSearchOperator, OtherEnd, TargetComparison};
 use crate::graph::GraphStore;
 use crate::graph::{Label, PropertyValue};  // Added for CREATE support
 use crate::query::ast::*;
@@ -4159,8 +4159,18 @@ impl QueryPlanner {
             } else if let Some((idx, label, property, op, val)) =
                 find_index_predicate(&start_var, &path.start.labels, &remaining_predicates, store)
             {
+                // Before the remove, so the index it skips is still the scan's.
+                let other_end =
+                    range_other_end(&start_var, &property, &op, &val, &remaining_predicates, idx);
                 remaining_predicates.remove(idx);
-                Box::new(IndexScanOperator::new(start_var.clone(), label, property, op, val))
+                // The range conjunct stays in the WHERE filter (a range scan
+                // answers none), so the scan's bounds may be loose.
+                let scan = IndexScanOperator::new(start_var.clone(), label, property, op, val)
+                    .with_loose_bounds();
+                Box::new(match other_end {
+                    Some(end) => scan.with_other_end(end),
+                    None => scan,
+                })
             } else {
                 Box::new(NodeScanOperator::new(
                     start_var.clone(),
@@ -4978,8 +4988,14 @@ impl QueryPlanner {
         } else if let Some((idx, label, property, op, val)) =
             find_index_predicate(&anchor_var, &anchor.labels, &candidates, store)
         {
+            let other_end = range_other_end(&anchor_var, &property, &op, &val, &candidates, idx);
             candidates.remove(idx);
-            Box::new(IndexScanOperator::new(anchor_var.clone(), label, property, op, val))
+            let scan = IndexScanOperator::new(anchor_var.clone(), label, property, op, val)
+                .with_loose_bounds();
+            Box::new(match other_end {
+                Some(end) => scan.with_other_end(end),
+                None => scan,
+            })
         } else {
             Box::new(NodeScanOperator::new(anchor_var.clone(), anchor.labels.clone()))
         };
@@ -6743,6 +6759,114 @@ struct PathNodeRef {
 
 /// Flip a comparison operator to normalize a reversed-operand predicate.
 /// E.g. `5 < n.age` is equivalent to `n.age > 5`, so `Lt` flips to `Gt`.
+/// A literal, or `+`, `-`, `*` over literals, folded to its value (#1482).
+///
+/// Parameters arrive as literals, so `p.id < $k + 50` reaches the planner as
+/// `Integer(k) + Integer(50)`: a constant the index could use, written as an
+/// expression it could not. Only integer and float arithmetic, with integer
+/// overflow declining rather than wrapping; anything else is `None` and the
+/// predicate stays what it was.
+fn fold_constant(expr: &Expression) -> Option<PropertyValue> {
+    match expr {
+        Expression::Literal(v) => Some(v.clone()),
+        Expression::Binary { left, op, right }
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
+        {
+            let (l, r) = (fold_constant(left)?, fold_constant(right)?);
+            use PropertyValue::{Float, Integer};
+            Some(match (l, r) {
+                (Integer(a), Integer(b)) => Integer(match op {
+                    BinaryOp::Add => a.checked_add(b)?,
+                    BinaryOp::Sub => a.checked_sub(b)?,
+                    _ => a.checked_mul(b)?,
+                }),
+                (a, b) => {
+                    let f = |v: PropertyValue| match v {
+                        Integer(i) => Some(i as f64),
+                        Float(x) => Some(x),
+                        _ => None,
+                    };
+                    let (a, b) = (f(a)?, f(b)?);
+                    Float(match op {
+                        BinaryOp::Add => a + b,
+                        BinaryOp::Sub => a - b,
+                        _ => a * b,
+                    })
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The opposite end of a range index scan on `var.property`, from another
+/// conjunct in `preds` (#1482). `scan_op` is the scan's own, already-normalised
+/// op; `skip` is the conjunct it came from.
+///
+/// The returned bound is **inclusive and widened across the numeric tie**,
+/// because the conjunct keeps its filter and the bound may only drop rows that
+/// filter drops. `PropertyValue::cmp` orders `Integer(n)` just below
+/// `Float(n as f64)`, so an upper bound of `150` is taken as `150.0` (the
+/// larger of the pair) and a lower bound of `100.0` as `100`. Declines a value
+/// in a different type bucket from the scan's own -- the B-tree orders buckets,
+/// not values, across them -- and an integer too large for an `f64` to hold
+/// exactly.
+fn range_other_end(
+    var: &str,
+    property: &str,
+    scan_op: &BinaryOp,
+    scan_value: &PropertyValue,
+    preds: &[Expression],
+    skip: usize,
+) -> Option<OtherEnd> {
+    use PropertyValue::{Float, Integer};
+    let numeric = |v: &PropertyValue| matches!(v, Integer(_) | Float(_));
+    let same_bucket = |v: &PropertyValue| {
+        (numeric(v) && numeric(scan_value))
+            || std::mem::discriminant(v) == std::mem::discriminant(scan_value)
+    };
+    let want_upper = matches!(scan_op, BinaryOp::Gt | BinaryOp::Ge);
+    let want_lower = matches!(scan_op, BinaryOp::Lt | BinaryOp::Le);
+    if !(want_upper || want_lower) {
+        return None;
+    }
+    for (i, pred) in preds.iter().enumerate() {
+        if i == skip {
+            continue;
+        }
+        let Expression::Binary { left, op, right } = pred else { continue };
+        let (op, value) = match (left.as_ref(), right.as_ref()) {
+            (Expression::Property { variable, property: p }, other)
+                if variable == var && p == property =>
+            {
+                (op.clone(), fold_constant(other))
+            }
+            (other, Expression::Property { variable, property: p })
+                if variable == var && p == property =>
+            {
+                (flip_comparison_op(op), fold_constant(other))
+            }
+            _ => continue,
+        };
+        let Some(value) = value else { continue };
+        if !same_bucket(&value) {
+            continue;
+        }
+        match op {
+            BinaryOp::Lt | BinaryOp::Le if want_upper => {
+                let Some(hi) = numeric_tie_end(&value, true) else { continue };
+                return Some(OtherEnd::AtMost(hi));
+            }
+            BinaryOp::Gt | BinaryOp::Ge if want_lower => {
+                let Some(lo) = numeric_tie_end(&value, false) else { continue };
+                return Some(OtherEnd::AtLeast(lo));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn flip_comparison_op(op: &BinaryOp) -> BinaryOp {
     match op {
         BinaryOp::Lt => BinaryOp::Gt,
