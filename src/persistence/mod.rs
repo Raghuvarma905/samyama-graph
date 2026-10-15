@@ -480,6 +480,14 @@ impl PersistenceManager {
     ///
     /// A row that fails part-way still leaves every row before it on disk, as
     /// before: what was staged is committed before the error is returned.
+    ///
+    /// **The WAL is synced once per commit, not once per row.** Each row's
+    /// record is appended without the durability barrier, and `Wal::sync` runs
+    /// before every storage commit -- so a chunk's records are on disk before
+    /// its rows are, and all of them before the statement is acknowledged. With
+    /// `SAMYAMA_FSYNC=1` a 1,000-row statement was 1,000 fsyncs and ran at 50
+    /// rows a second; it is now one (#1666). A sync that fails commits nothing:
+    /// storage never gets ahead of a log that did not reach the disk.
     #[allow(clippy::too_many_arguments)]
     fn write_batch(
         &self,
@@ -491,14 +499,27 @@ impl PersistenceManager {
         per_row: bool,
         usage: &mut UsageDelta,
     ) -> Result<usize, PersistenceError> {
+        let mut wal = wal::lock(&self.wal);
         let mut rows = storage::RowBatch::default();
-        let result = self.stage_rows(tenant, store, order, last, exists, per_row, usage, &mut rows);
+        let result =
+            self.stage_rows(tenant, store, order, last, exists, per_row, usage, &mut wal, &mut rows);
         // Committed whether or not a row failed: the rows staged before the
         // failure are the ones the old per-row writes had already put on disk.
-        let committed = self.storage.commit_rows(&mut rows);
+        // Their records first.
+        let committed = self.commit_logged(&mut wal, &mut rows);
         let written = result?;
         committed?;
         Ok(written)
+    }
+
+    /// Sync the WAL, then commit the staged rows: the order a crash must see.
+    fn commit_logged(&self, wal: &mut Wal, rows: &mut storage::RowBatch) -> Result<(), PersistenceError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        wal.sync()?;
+        self.storage.commit_rows(rows)?;
+        Ok(())
     }
 
     /// Rows a statement's storage writes are committed in. Bounds the memory a
@@ -515,13 +536,13 @@ impl PersistenceManager {
         exists: &std::collections::HashMap<(bool, u64), bool>,
         per_row: bool,
         usage: &mut UsageDelta,
+        wal: &mut Wal,
         rows: &mut storage::RowBatch,
     ) -> Result<usize, PersistenceError> {
-        let mut wal = wal::lock(&self.wal);
         let mut written = 0usize;
         for &key in order {
             if rows.len() >= Self::ROWS_PER_COMMIT {
-                self.storage.commit_rows(rows)?;
+                self.commit_logged(wal, rows)?;
             }
             let (is_edge, id) = key;
             let deleted = last[&key];
@@ -544,7 +565,7 @@ impl PersistenceManager {
                             self.tenants.check_quota(tenant, "nodes")?;
                         }
                         let properties = bincode::serialize(&node.properties)?;
-                        wal.append(WalEntry::CreateNode {
+                        wal.append_unsynced(WalEntry::CreateNode {
                             tenant: tenant.to_string(),
                             node_id: id,
                             labels: node.labels.iter().map(|l| l.as_str().to_string()).collect(),
@@ -559,7 +580,7 @@ impl PersistenceManager {
                 }
                 (false, true) => {
                     if existed {
-                        wal.append(WalEntry::DeleteNode {
+                        wal.append_unsynced(WalEntry::DeleteNode {
                             tenant: tenant.to_string(),
                             node_id: id,
                         })?;
@@ -574,7 +595,7 @@ impl PersistenceManager {
                             self.tenants.check_quota(tenant, "edges")?;
                         }
                         let properties = bincode::serialize(&edge.properties)?;
-                        wal.append(WalEntry::CreateEdge {
+                        wal.append_unsynced(WalEntry::CreateEdge {
                             tenant: tenant.to_string(),
                             edge_id: id,
                             source: edge.source.as_u64(),
@@ -591,7 +612,7 @@ impl PersistenceManager {
                 }
                 (true, true) => {
                     if existed {
-                        wal.append(WalEntry::DeleteEdge {
+                        wal.append_unsynced(WalEntry::DeleteEdge {
                             tenant: tenant.to_string(),
                             edge_id: id,
                         })?;
