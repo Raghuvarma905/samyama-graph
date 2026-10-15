@@ -13624,9 +13624,72 @@ pub struct IndexScanOperator {
     /// dropping a filter the scan has not fully answered turns a cost into a
     /// wrong answer.
     satisfied: Option<Expression>,
+    /// The other end of a range, from a second conjunct on the same property
+    /// (#1482): `p.id > $k AND p.id < $k + 50` read only the `>` from the
+    /// index, so every node above `$k` -- half the label on average -- came
+    /// out of the scan for a filter to discard all but fifty. On CH-PERF-CONC
+    /// that one query was 68 ms of CPU, a quarter of the mix, and the whole
+    /// of the read-throughput ceiling.
+    ///
+    /// **Inclusive and loose at the bound, on purpose.** The conjunct it came
+    /// from keeps its filter, so this may only drop rows that filter would
+    /// drop; it never decides one. The planner widens a numeric bound across
+    /// the `Integer`/`Float` tie (see `PropertyValue::cmp`), so `p.id <= 150`
+    /// keeps `150.0`.
+    other_end: Option<OtherEnd>,
+    /// Read the scan's own range bound inclusively and across the numeric
+    /// tie, as `other_end` already is. Only for a caller that keeps the range
+    /// predicate as a filter, which the legacy planner does: a range scan
+    /// answers no predicate there (`filter_predicate` is `None`).
+    ///
+    /// Without it `p.id >= 100.0` missed `Integer(100)` and `p.id <= 150`
+    /// missed `Float(150.0)`: `PropertyValue::cmp` orders `Integer(n)` just
+    /// below `Float(n)`, and an exact bound on one variant cuts the other off.
+    loose: bool,
+}
+
+/// The value at the low end of `v`'s numeric tie (`Integer(n)` for `n` or
+/// `n.0`), or at the high end (`Float(n.0)`), so an inclusive bound keeps both
+/// spellings of the same number. `None` for an integer an `f64` cannot hold
+/// exactly, where the caller keeps its exact bound.
+pub(crate) fn numeric_tie_end(v: &PropertyValue, high: bool) -> Option<PropertyValue> {
+    const EXACT: i64 = 1 << 53;
+    Some(match (v, high) {
+        (PropertyValue::Float(x), _) if x.is_nan() => return None,
+        (PropertyValue::Integer(n), true) if n.abs() < EXACT => PropertyValue::Float(*n as f64),
+        (PropertyValue::Integer(_), true) => return None,
+        (PropertyValue::Float(x), false) if x.fract() == 0.0 && x.abs() < EXACT as f64 => {
+            PropertyValue::Integer(*x as i64)
+        }
+        (other, _) => other.clone(),
+    })
+}
+
+/// The second, opposite bound of a range index scan. See
+/// `IndexScanOperator::other_end`.
+#[derive(Debug, Clone)]
+pub enum OtherEnd {
+    /// Keep keys at or below this one.
+    AtMost(PropertyValue),
+    /// Keep keys at or above this one.
+    AtLeast(PropertyValue),
 }
 
 impl IndexScanOperator {
+    /// Bound the scan's other end too. Meaningful only for a range scan whose
+    /// own op points the other way: an `AtMost` on a `>`/`>=` scan, an
+    /// `AtLeast` on a `<`/`<=` one. Ignored otherwise.
+    pub fn with_other_end(mut self, end: OtherEnd) -> Self {
+        self.other_end = Some(end);
+        self
+    }
+
+    /// See `loose`. The caller promises the range predicate stays a filter.
+    pub fn with_loose_bounds(mut self) -> Self {
+        self.loose = true;
+        self
+    }
+
     pub fn new(variable: String, label: Label, property: String, op: BinaryOp, value: PropertyValue) -> Self {
         // Built to match what the parser produces for `var.prop = literal`, so
         // the planner's structural comparison against the WHERE conjunct finds
@@ -13649,6 +13712,8 @@ impl IndexScanOperator {
             node_ids: Vec::new(),
             current: 0,
             satisfied,
+            other_end: None,
+            loose: false,
         }
     }
 
@@ -13658,31 +13723,47 @@ impl IndexScanOperator {
         }
 
         if let Some(index_lock) = store.property_index.get_index(&self.label, &self.property) {
+            use std::ops::Bound::{Excluded, Included, Unbounded};
             let index = index_lock.read().unwrap();
-            self.node_ids = match self.op {
-                BinaryOp::Eq => index.get(&self.value),
-                BinaryOp::Gt => {
-                    use std::ops::Bound::Excluded;
-                    use std::ops::Bound::Unbounded;
-                    index.range((Excluded(self.value.clone()), Unbounded))
-                },
-                BinaryOp::Ge => {
-                    use std::ops::Bound::Included;
-                    use std::ops::Bound::Unbounded;
-                    index.range((Included(self.value.clone()), Unbounded))
-                },
-                BinaryOp::Lt => {
-                    use std::ops::Bound::Excluded;
-                    use std::ops::Bound::Unbounded;
-                    index.range((Unbounded, Excluded(self.value.clone())))
-                },
-                BinaryOp::Le => {
-                    use std::ops::Bound::Included;
-                    use std::ops::Bound::Unbounded;
-                    index.range((Unbounded, Included(self.value.clone())))
-                },
-                _ => Vec::new(),
+            let v = self.value.clone();
+            // The scan's own bound -- exact, or inclusive across the numeric
+            // tie when the filter above decides -- and the other end when a
+            // second conjunct supplied one.
+            let own_low = |exact: std::ops::Bound<PropertyValue>| match self.loose {
+                true => numeric_tie_end(&self.value, false).map_or(exact, Included),
+                false => exact,
             };
+            let own_high = |exact: std::ops::Bound<PropertyValue>| match self.loose {
+                true => numeric_tie_end(&self.value, true).map_or(exact, Included),
+                false => exact,
+            };
+            let (lower, upper) = match (&self.op, &self.other_end) {
+                (BinaryOp::Eq, _) => {
+                    self.node_ids = index.get(&self.value);
+                    return;
+                }
+                (BinaryOp::Gt, Some(OtherEnd::AtMost(hi))) => (own_low(Excluded(v)), Included(hi.clone())),
+                (BinaryOp::Gt, _) => (own_low(Excluded(v)), Unbounded),
+                (BinaryOp::Ge, Some(OtherEnd::AtMost(hi))) => (own_low(Included(v)), Included(hi.clone())),
+                (BinaryOp::Ge, _) => (own_low(Included(v)), Unbounded),
+                (BinaryOp::Lt, Some(OtherEnd::AtLeast(lo))) => (Included(lo.clone()), own_high(Excluded(v))),
+                (BinaryOp::Lt, _) => (Unbounded, own_high(Excluded(v))),
+                (BinaryOp::Le, Some(OtherEnd::AtLeast(lo))) => (Included(lo.clone()), own_high(Included(v))),
+                (BinaryOp::Le, _) => (Unbounded, own_high(Included(v))),
+                _ => {
+                    self.node_ids = Vec::new();
+                    return;
+                }
+            };
+            // `BTreeMap::range` panics on a start past its end, which is what
+            // `p.id > 100 AND p.id < 50` asks for. That range is empty.
+            let inverted = match (&lower, &upper) {
+                (Included(a) | Excluded(a), Included(b) | Excluded(b)) => {
+                    a > b || (a == b && !(matches!(lower, Included(_)) && matches!(upper, Included(_))))
+                }
+                _ => false,
+            };
+            self.node_ids = if inverted { Vec::new() } else { index.range((lower, upper)) };
         }
     }
 }
@@ -13758,9 +13839,18 @@ impl PhysicalOperator for IndexScanOperator {
             BinaryOp::Eq => "=", BinaryOp::Gt => ">", BinaryOp::Ge => ">=",
             BinaryOp::Lt => "<", BinaryOp::Le => "<=", _ => "?",
         };
+        let other_end = match &self.other_end {
+            Some(OtherEnd::AtMost(hi)) if matches!(self.op, BinaryOp::Gt | BinaryOp::Ge) => {
+                format!(", <= {:?}", hi)
+            }
+            Some(OtherEnd::AtLeast(lo)) if matches!(self.op, BinaryOp::Lt | BinaryOp::Le) => {
+                format!(", >= {:?}", lo)
+            }
+            _ => String::new(),
+        };
         OperatorDescription {
             name: "IndexScan".to_string(),
-            details: format!("var={}, {}.{} {} {:?}", self.variable, self.label, self.property, op_str, self.value),
+            details: format!("var={}, {}.{} {} {:?}{other_end}", self.variable, self.label, self.property, op_str, self.value),
             children: Vec::new(),
         }
     }
