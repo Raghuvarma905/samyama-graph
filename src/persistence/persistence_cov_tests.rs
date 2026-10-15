@@ -607,3 +607,43 @@ fn a_usage_run_applied_once_matches_applying_each_step() {
         }
     }
 }
+
+/// A statement's storage writes are committed in chunks, and every chunk
+/// lands (#1666).
+///
+/// `write_batch` stages rows and commits them `ROWS_PER_COMMIT` at a time
+/// instead of one RocksDB write per row. A statement larger than one chunk
+/// crosses at least two mid-loop commits and a final one; every row, edges
+/// included, must be on disk afterwards, and a later statement that deletes
+/// some of them must take them off it.
+#[test]
+fn a_statement_larger_than_one_commit_lands_whole() {
+    let (_dir, m) = manager();
+    m.tenants()
+        .update_quotas("default", ResourceQuotas::unlimited())
+        .unwrap();
+    let rows = PersistenceManager::ROWS_PER_COMMIT * 2 + 7;
+
+    let mut store = GraphStore::new();
+    store.enable_write_log();
+    let nodes: Vec<NodeId> = (0..rows).map(|_| store.create_node("P")).collect();
+    let edge = store.create_edge(nodes[0], nodes[rows - 1], "R").unwrap();
+    let log = store.take_write_log();
+    assert_eq!(m.apply_mutations("default", &store, &log).unwrap(), rows + 1);
+
+    let (on_disk, edges) = m.recover("default").unwrap();
+    assert_eq!(on_disk.len(), rows, "every staged node was committed");
+    assert_eq!(edges.len(), 1);
+    assert!(m.storage().get_edge("default", edge.as_u64()).unwrap().is_some());
+
+    // Deletes are staged and committed the same way.
+    for &n in &nodes[..3] {
+        store.delete_node("default", n).unwrap();
+    }
+    let log = store.take_write_log();
+    m.apply_mutations("default", &store, &log).unwrap();
+    for &n in &nodes[..3] {
+        assert!(m.storage().get_node("default", n.as_u64()).unwrap().is_none());
+    }
+    assert!(m.storage().get_node("default", nodes[3].as_u64()).unwrap().is_some());
+}
