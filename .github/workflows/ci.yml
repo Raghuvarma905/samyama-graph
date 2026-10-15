@@ -426,87 +426,146 @@ jobs:
           echo
           echo "all gates ran and passed"
 
-  typescript-sdk:
-    # 22 tests, none of which ran on a pull request until now. `sdk/typescript`
-    # is not a cargo crate, so `cargo test --workspace` cannot reach it and the
-    # only workflows mentioning it publish on a tag. Six of the tests are about
-    # request deadlines and retry, which is precisely the behaviour that is
-    # invisible until a server goes quiet in production (#1326).
-    name: typescript-sdk (transport and connection management)
+  # One job for both SDKs.
+  #
+  # These were two check runs for two directories that share a trigger, a runner
+  # image and a purpose, and between them they were the whole of the pull-request
+  # lane's non-cargo testing. Collapsing them removes a check run and a runner VM;
+  # it costs about twenty seconds of wall clock, because the TypeScript half takes
+  # that long and now runs before the Python half instead of beside it.
+  #
+  # Every step is `continue-on-error` with a final gate, which is not decoration.
+  # Two jobs fail independently; six sequential steps do not. #1134 is what that
+  # costs here: the CH gates were sequential steps in one job, a failure at step N
+  # skipped N+1 onwards, and nothing in the log distinguished "passed" from "never
+  # ran" -- CH-API was red for a day and took four gates with it. Merging two jobs
+  # into one job's steps reintroduces exactly that, so it is answered the same way
+  # the GATES step above answers it. `skipped` is a failure here too: a check that
+  # did not run has not passed.
+  #
+  # The two halves are independent -- different language, different directory, no
+  # shared artefact -- so neither failing is a reason to stop asking the other.
+  sdks:
+    name: sdks (typescript transport, python MCP tools)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Each half had 10. Sequential now, so the sum plus room for a cold cargo
+    # cache on the `cargo check`.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+
+      # ---- TypeScript: 22 tests, none of which ran on a pull request before
+      # #1326. `sdk/typescript` is not a cargo crate, so `cargo test --workspace`
+      # cannot reach it, and the only workflows that mentioned it publish on a
+      # tag. Six of the tests are about request deadlines and retry, which is
+      # precisely the behaviour that stays invisible until a server goes quiet in
+      # production.
       - uses: actions/setup-node@v4
+        continue-on-error: true
         with:
           node-version: "20"
-      - name: Install
+      - name: typescript -- install
+        id: ts_install
+        continue-on-error: true
         working-directory: sdk/typescript
         run: npm ci || npm install
-      - name: Typecheck
+      - name: typescript -- typecheck
+        id: ts_typecheck
+        continue-on-error: true
         working-directory: sdk/typescript
         run: npx tsc --noEmit -p tsconfig.json
-      - name: Tests
+      - name: typescript -- tests
+        id: ts_tests
+        continue-on-error: true
         working-directory: sdk/typescript
         run: npm run build && npm test
 
-  python-sdk:
-    # `sdk/python` holds 95 tests and until now no workflow ran them on a pull
-    # request: `cargo test --workspace` cannot reach the directory because the
-    # crate is `exclude`d from the workspace, and the only files that mentioned
-    # `sdk/python` were the four publish workflows, which run on a tag. The
-    # tests were therefore green in whatever state they were last run by hand.
-    #
-    # The MCP tools are generated from a discovered schema, so a defect here is
-    # a wrong tool handed to a model rather than a test failure anyone notices.
-    name: python-sdk (MCP tools and schema discovery)
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
+      # ---- Python: `sdk/python` holds 95 tests and until #1326 no workflow ran
+      # them on a pull request. The crate is `exclude`d from the workspace, so
+      # `cargo test --workspace` cannot reach the directory and the tests below
+      # are pure-Python; the only files that mentioned `sdk/python` were the four
+      # publish workflows, which run on a tag. The tests were therefore green in
+      # whatever state someone last ran them by hand.
+      #
+      # The MCP tools are generated from a discovered schema, so a defect here is
+      # a wrong tool handed to a model rather than a test failure anyone notices.
       - uses: actions/setup-python@v5
+        continue-on-error: true
         with:
           python-version: "3.12"
-      # Compile the binding. `sdk/python` is `exclude`d from the workspace, so
-      # `cargo check --workspace` cannot reach it, and the tests below are
-      # pure-Python. Nothing on a pull request built this crate, and nothing in
-      # the nightly did either -- the first thing to compile it was the publish
-      # workflow, on the tag.
-      #
-      # v1.9.0 is what that cost: #1333 changed the SDK's `dijkstra` to return
-      # `Result<Option<PathResult>, NegativeWeight>`, every workspace caller was
-      # updated, and this one was not. All five wheels failed on the same two
-      # E0308s and PyPI got nothing, while crates.io and npm published fine.
-      #
-      # `cargo check`, not a maturin build: it catches a signature drift like
-      # that one in a couple of minutes and needs no Python toolchain, which is
-      # what kept the full build out of the pull-request lane.
       - uses: dtolnay/rust-toolchain@stable
+        continue-on-error: true
       - uses: Swatinem/rust-cache@v2
-      - name: Compile the extension crate
+        continue-on-error: true
+
+      # `cargo check`, not a maturin build. v1.9.0 is what skipping this cost:
+      # #1333 changed the SDK's `dijkstra` to return `Result<Option<PathResult>,
+      # NegativeWeight>`, every workspace caller was updated and this one was not,
+      # because `cargo check --workspace` cannot reach an excluded crate. All five
+      # wheels failed on the same two E0308s and PyPI got nothing, while crates.io
+      # and npm published fine. A check catches that drift in a couple of minutes
+      # and needs no Python toolchain, which is what kept the full build out of
+      # the pull-request lane.
+      - name: python -- compile the extension crate
+        id: py_compile
+        continue-on-error: true
         working-directory: sdk/python
         run: cargo check --all-targets
-
-      - name: Install test dependencies
+      - name: python -- install test dependencies
+        id: py_deps
+        continue-on-error: true
         run: pip install pytest fastmcp
-      - name: Tests
+      - name: python -- tests
+        id: py_tests
+        continue-on-error: true
         working-directory: sdk/python
         # The suites that need the compiled extension (`test_embedded.py`,
-        # `test_vector.py`) are not selected: building it needs maturin and a
-        # full release compile, which belongs in the nightly sweep rather than
-        # on every pull request. Naming the files that do run keeps that
-        # deliberate -- a bare `pytest tests/` would collect them and fail on
-        # the import, and the usual repair is to make the failure disappear.
+        # `test_vector.py`) are not selected: building it needs maturin and a full
+        # release compile, which belongs in the nightly sweep rather than on every
+        # pull request. Naming the files that do run keeps that deliberate -- a
+        # bare `pytest tests/` would collect them and fail on the import, and the
+        # usual repair is to make the failure disappear.
         run: |
           PYTHONPATH=. python -m pytest -q \
             tests/test_mcp_schema.py \
             tests/test_mcp_generators.py \
             tests/test_mcp_escape.py \
             tests/test_mcp_server.py
+
+      - name: SDKS -- every step above ran, and every one of them passed
+        # The only step that fails this job. See the comment on the job.
+        if: always()
+        env:
+          TS_INSTALL_OUTCOME: ${{ steps.ts_install.outcome }}
+          TS_TYPECHECK_OUTCOME: ${{ steps.ts_typecheck.outcome }}
+          TS_TESTS_OUTCOME: ${{ steps.ts_tests.outcome }}
+          PY_COMPILE_OUTCOME: ${{ steps.py_compile.outcome }}
+          PY_DEPS_OUTCOME: ${{ steps.py_deps.outcome }}
+          PY_TESTS_OUTCOME: ${{ steps.py_tests.outcome }}
+        run: |
+          failed=""
+          check() {
+            eval "outcome=\$$(echo "$1" | tr '[:lower:]' '[:upper:]')_OUTCOME"
+            case "$outcome" in
+              success) printf '  PASS  %s\n' "$2" ;;
+              *)       printf '  FAIL  %s (%s)\n' "$2" "$outcome"; failed="$failed $2" ;;
+            esac
+          }
+          check ts_install "typescript install"
+          check ts_typecheck "typescript typecheck"
+          check ts_tests "typescript tests"
+          check py_compile "python extension compiles"
+          check py_deps "python test dependencies"
+          check py_tests "python MCP tests"
+          if [ -n "$failed" ]; then
+            echo
+            echo "failed:$failed"
+            exit 1
+          fi
+          echo
+          echo "both SDKs ran and passed"
 
   # HW-07 and KG-11 ask that a `.sgsnap` written on one tier loads on another
   # with the same results. Nothing had ever checked it, because checking it
@@ -582,3 +641,60 @@ jobs:
           set -euo pipefail
           cargo run --release --example snapshot_portability -- \
             --verify snap.sgsnap --against wrote.json
+
+  # The one check branch protection should require.
+  #
+  # `test` and the two snapshot jobs take their check names from a matrix. When an
+  # `if:` skips a matrix job, GitHub never expands the matrix, so the check is
+  # reported under the LITERAL name -- `test (${{ matrix.os }})` -- and the names
+  # protection requires, `test (ubuntu-latest)` and `test (ubuntu-24.04-arm)`, are
+  # never reported at all. A required context that never reports leaves the pull
+  # request permanently BLOCKED.
+  #
+  # That is #1860: a docs-only change, MERGEABLE, every suite correctly skipped,
+  # and unmergeable. The comment on `changes` above says a job GitHub skips
+  # satisfies its requirement, and for a job with a fixed name it is right --
+  # `supply-chain (cargo-deny)` does report, skipped, under exactly the required
+  # name. It is wrong only for a matrix job, which is the case nobody could have
+  # tested: no docs-only pull request was opened between that filter landing in
+  # #1851 and #1860.
+  #
+  # This job has a fixed name and `if: always()`, so it reports on every run
+  # whatever the suites did. `skipped` counts as success -- a change that touches
+  # no code is supposed to skip them. `failure` and `cancelled` do not.
+  #
+  # tests/ci_gate_enumeration.rs asserts that every other job in this file is
+  # listed in `needs` below, because a suite added without being added here would
+  # stop gating silently: the aggregator would go green without ever waiting for
+  # it.
+  ci-ok:
+    name: ci-ok
+    # always() is load-bearing. Without it a failed dependency SKIPS this job, and
+    # a skipped check with a fixed name counts as satisfied -- which would turn the
+    # gate off in precisely the case it exists for.
+    if: always()
+    needs:
+      - changes
+      - supply-chain
+      - test
+      - sdks
+      - snapshot-portability
+      - snapshot-portability-read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every suite either succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RESULTS"
+          bad=$(printf '%s' "$RESULTS" | jq -r '
+            to_entries
+            | map(select(.value.result != "success" and .value.result != "skipped")
+                  | .key)
+            | join(" ")')
+          if [ -n "$bad" ]; then
+            echo "::error::did not succeed: $bad"
+            exit 1
+          fi
+          echo "all suites accounted for"
