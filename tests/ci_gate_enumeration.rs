@@ -78,17 +78,19 @@ fn the_aggregator_waits_for_every_suite() {
         .iter()
         .filter(|j| j.as_str() != AGGREGATOR && !needs.contains(j))
         .collect();
-    assert!(
-        unguarded.is_empty(),
-        "these jobs run but {AGGREGATOR} does not wait for them, so a failure in \
-         them cannot block a merge: {unguarded:?}. Add each to `needs:` in \
-         .github/workflows/ci.yml."
-    );
-
     let phantom: Vec<&String> = needs.iter().filter(|n| !all.contains(n)).collect();
+
+    // Both lists in one message. Renaming a job produces both faults at once -- the
+    // new name unguarded, the old one phantom -- and asserting them separately
+    // reports the first, hides the second, and converges over two runs. A gate that
+    // tells you half of what is wrong is a gate you run twice.
     assert!(
-        phantom.is_empty(),
-        "{AGGREGATOR} lists needs that are not jobs in this workflow: {phantom:?}"
+        unguarded.is_empty() && phantom.is_empty(),
+        "{AGGREGATOR}'s `needs:` does not match the jobs in this workflow.\n  \
+         these jobs run but {AGGREGATOR} does not wait for them, so a failure in \
+         them cannot block a merge: {unguarded:?}\n  \
+         these `needs:` entries name no job in this workflow: {phantom:?}\n\
+         Both are edited in .github/workflows/ci.yml."
     );
 }
 
