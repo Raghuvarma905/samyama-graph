@@ -91,6 +91,9 @@ jobs:
         run: cargo build --release --bin samyama
 
       - name: Run the suite against the baseline
+        # Keep the suite checkout out of the Rust target cache.
+        env:
+          WORK: ${{ runner.temp }}/gpml-conformance
         run: ./tools/conformance/run.sh
 
       - name: Keep the map, whatever the verdict
@@ -99,6 +102,6 @@ jobs:
         with:
           name: conformance-map
           path: |
-            target/conformance/suite/results/map.json
-            target/conformance/suite/results/summary.json
+            ${{ runner.temp }}/gpml-conformance/suite/results/map.json
+            ${{ runner.temp }}/gpml-conformance/suite/results/summary.json
           if-no-files-found: warn
