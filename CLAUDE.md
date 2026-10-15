@@ -15,7 +15,7 @@ Cypher conformance is **measured, not estimated**: 97.3% of the openCypher TCK's
 cargo build                    # Debug build
 cargo build --release          # Release build (optimized)
 
-# Run tests (1814 unit tests)
+# Run workspace unit and integration tests
 cargo test                     # All tests
 cargo test graph::node         # Specific module tests
 cargo test -- --nocapture      # Tests with output
@@ -231,8 +231,8 @@ running 329x too slow (#584).
 Benchmarks are the opposite — always `--release`, on a quiet host, with the
 calibration line compared before the timings (#529).
 
-- **1814 unit tests** across all modules (87.8% coverage)
+- **Unit and integration tests** across the workspace; `scripts/coverage.sh` measures coverage for the current checkout.
 - **31 benchmark binaries** in `benches/` (Criterion micro-benchmarks + domain benchmarks)
-- **Integration tests**: Python scripts in `tests/integration/`
+- **Integration tests**: Rust suites in `tests/` and Python scripts in `tests/integration/`
 - **20 demos on built-in data** in `examples/`
 - **17 dataset loaders and post-processing passes** in `examples/`

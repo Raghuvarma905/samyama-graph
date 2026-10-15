@@ -641,7 +641,7 @@ every example, starts a server, and runs each in turn with a pass/fail summary
 demos: `grid_dispatch_demo`, `amr_stewardship_demo`, `healthcare_allocation_demo`,
 `wildfire_evac_demo`, `pca_demo`, `sdk_demo`, …*
 
-**Guide to all 122 programs:** [`examples/README.md`](examples/README.md) — demos, loaders, tools, and which ones are internal probes.
+**Guide to all 127 programs:** [`examples/README.md`](examples/README.md) — 125 Rust examples, a Python client, and an ESP32 sketch; demos, loaders, tools, and internal probes.
 
 ### Data Loaders
 

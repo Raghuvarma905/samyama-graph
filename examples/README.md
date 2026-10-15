@@ -9,11 +9,11 @@ external knowledge-graph repositories invoke them by name, so they do not get re
 **Start here** if you are new: the demos on built-in data. They need nothing but a
 checkout.
 
-**Most of this directory is internal.** Of the 122 programs, 57 are performance
+**Most of this directory is internal.** Of the 127 programs, 60 are performance
 investigations, conformance checks or maintainer tools — written to answer one question
 about the engine, usually once, often to kill a hypothesis. They print verdicts and
 timings, not results you can use. Those sections say *Internal* in their opening line;
-you are not expected to run them. The 8 benchmark runners are runnable but need a quiet
+you are not expected to run them. The 10 benchmark runners are runnable but need a quiet
 host and an external corpus to mean anything.
 
 Purposes below are taken from each file's own header comment.
@@ -24,8 +24,8 @@ Purposes below are taken from each file's own header comment.
 | [UC1-UC5 optimization use cases](#uc1-uc5-optimization-use-cases) | 9 | Yes |
 | [Dataset loaders and post-processing passes](#dataset-loaders-and-post-processing-passes) | 17 | Yes |
 | [Import, export and user-facing tools](#import-export-and-user-facing-tools) | 10 | Yes |
-| [Benchmark runners](#benchmark-runners) | 8 | No - internal |
-| [Performance investigations](#performance-investigations) | 22 | No - internal |
+| [Benchmark runners](#benchmark-runners) | 10 | No - internal |
+| [Performance investigations](#performance-investigations) | 25 | No - internal |
 | [Conformance and correctness checks](#conformance-and-correctness-checks) | 32 | No - internal |
 | [Maintainer tools](#maintainer-tools) | 3 | No - internal |
 | [Hardware client sketch](#hardware-client-sketch) | 1 | No - internal |
@@ -139,6 +139,7 @@ anything; a number from a loaded machine is not a measurement.
 | `ldbc_http_serve` | Serves an LDBC SNB extract over the HTTP API so Samyama is measured across the same wire as the engines it is compared with (PERF-04), not in-process. | `--data-dir <ldbc extract>`. |
 | `mesh_scale_bench` | Hierarchical roll-up over the real MeSH tree with a literature-shaped fact table — does the hierarchy index still pay on a real ontology at real volume? | Built-in / MeSH tree data. |
 | `query_probe` | Times arbitrary Cypher against an LDBC extract, one line per query; each `--q "<label>=<cypher>"` is a separate variant. The general form of `is7_probe` and `ic11_probe`. | `--data-dir <ldbc extract>`. |
+| `read_concurrency` | HTTP read throughput at different client counts, using indexed lookups, one- and two-hop reads, and a range aggregation; reports client CPU time to expose client-side limits (#1482). | A running HTTP server; `--load` builds a 200,000-node chain, then use `--clients 1,16,64 --seconds 10`. |
 | `sort_cost_decompose` | Splits what an `ORDER BY` costs per row into extracting the key, comparing keys and moving records, at three row counts and three key shapes, and prints the engine's own whole-query number beside the replica (#1819). | `--data-dir <ldbc extract>`. |
 | `unified_benchmark` | 200+ queries over up to 9 KGs loaded into one graph, each by whichever of snapshot import or direct Rust loader is fastest for it. | Snapshots and data dirs for the 9 KGs; `--queries`. |
 
@@ -166,11 +167,14 @@ extract via `--data-dir`.
 | `ic1_distinct_multiplicity` | `RETURN DISTINCT` decides whether a var-length segment enumerates paths — re-measures the 505,660-row claim in #1054. | Built-in. |
 | `ic1_index_regression` | Did indexing `Person.firstName` make IC1 slower? CH-REGRESS read 1.2x in the same window the index landed. | Built-in. |
 | `ic1_inline_vs_where` | Does an inline property on the far side of a var-length pattern drop rows? Asks the inline form, the WHERE form and bare reachability. | Built-in. |
+| `import_tax_probe` | Separates the phases of bulk-import completion to identify whether cost follows nodes, edges or segments; `sequence` compares eager and deferred imports with matching graph counts (#1807). | Built-in; optional node, edge and import counts. |
 | `is7_forms` | IS7 as we run it (`EXISTS`) against the form the competitors are given (`OPTIONAL MATCH` + `IS NOT NULL`) (#725). | `--data-dir` (LDBC extract). |
 | `is7_probe` | Where LDBC IS7's time goes — ~93% profiles into `Project`, so: the subquery, the property reads, or the plan feeding both (#618). | `--data-dir` (LDBC extract). |
 | `ldbc_name_index_probe` | Do the LDBC `name`/`firstName` anchors lower to an IndexScan? Inline properties and deferred `WHERE` predicates are two different planner paths. | Built-in / LDBC extract. |
 | `result_path_probe` | What the client path costs on top of the executor, per returned row — `client.query_readonly` and `QueryExecutor::execute` disagree by 3.3x on IS3 (#718). | `--data-dir` (LDBC extract). |
 | `shortestpath_plan_probe` | Which operators `shortestPath` between two indexed anchors actually plans — bidirectional BFS did not move CR-3 at all, so the BFS was not the cost. | Built-in. |
+| `top_k_degree_scaling` | Measures degree-aggregate TopN cost against group count, comparing limited and full sorts, declined ordering, and property group keys (#304). | Built-in citation graph; optional article and degree counts. |
+| `topn_property_group_regression` | Reproduces endpoint-property aggregation and TopN shapes on a synthetic PubMed-like graph, reporting plans and third-run timings for comparisons between engine versions (#1812). | Built-in; `--articles`, `--terms`, `--per-article`. |
 | `varlen_emit_cost` | How much of a var-length expansion is walking and how much is emitting — measured by pointing the pattern at a label nothing carries. | Built-in. |
 
 ## Conformance and correctness checks
