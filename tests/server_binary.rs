@@ -1059,18 +1059,33 @@ fn a_refusal_with_persistence_open_exits_with_its_status() {
 }
 
 #[test]
-fn an_unusable_data_path_runs_without_persistence() {
+fn an_unusable_data_path_is_refused_unless_ephemeral_is_explicit() {
     let cwd = tempfile::tempdir().unwrap();
-    // A file where the directory should be.
-    std::fs::write(cwd.path().join("taken"), "").unwrap();
+    // A file where the directory should be; refusing must leave it untouched.
+    let taken = cwd.path().join("taken");
+    std::fs::write(&taken, "keep me").unwrap();
     run_in(
         cwd.path(),
         &["--data-path", "taken/db", "--max-nodes", "?"],
         &[],
         None,
     )
-    .assert_code(2)
-    .err_has("Failed to initialize persistence");
+    .assert_code(3)
+    .err_has("Refusing to start: cannot open the data directory")
+    .err_has("has not served any request and has not changed the directory")
+    .err_has("--ephemeral");
+    assert_eq!(std::fs::read_to_string(&taken).unwrap(), "keep me");
+
+    // Explicit ephemeral mode bypasses the unusable path and reaches the later
+    // quota validation, which refuses the deliberately invalid max-nodes value.
+    run_in(
+        cwd.path(),
+        &["--ephemeral", "--data-path", "taken/db", "--max-nodes", "?"],
+        &[],
+        None,
+    )
+    .assert_code(2);
+    assert_eq!(std::fs::read_to_string(&taken).unwrap(), "keep me");
 }
 
 // ───────────────────────────────────────────────────────────── the serving path
