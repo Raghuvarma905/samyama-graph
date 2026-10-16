@@ -196,6 +196,8 @@ fn parse_clause_pipeline(input: &str) -> ParseResult<Query> {
                                             pattern: parse_pattern(p)?,
                                             optional,
                                         }));
+                                    } else if p.as_rule() == Rule::using_hint {
+                                        query.hints.push(parse_using_hint(p)?);
                                     }
                                 }
                             }
@@ -787,6 +789,39 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> Pars
     Ok(())
 }
 
+/// `USING INDEX n:L(p)`, `USING SCAN n:L` or `USING JOIN ON n, m` (#1675).
+fn parse_using_hint(pair: pest::iterators::Pair<Rule>) -> ParseResult<PlanHint> {
+    let hint = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| ParseError::SemanticError("empty USING hint".to_string()))?;
+    let rule = hint.as_rule();
+    let mut variables = Vec::new();
+    let mut label = None;
+    let mut properties = Vec::new();
+    for part in hint.into_inner() {
+        match part.as_rule() {
+            Rule::variable => variables.push(unescape_name(part.as_str())),
+            Rule::label => label = Some(Label::new(unescape_name(part.as_str()))),
+            Rule::property_key => properties.push(unescape_name(part.as_str())),
+            _ => {}
+        }
+    }
+    let one = |vs: &mut Vec<String>| vs.drain(..).next().unwrap_or_default();
+    Ok(match rule {
+        Rule::using_index_hint => PlanHint::Index {
+            variable: one(&mut variables),
+            label: label.ok_or_else(|| ParseError::SemanticError("USING INDEX needs a label".into()))?,
+            properties,
+        },
+        Rule::using_scan_hint => PlanHint::Scan {
+            variable: one(&mut variables),
+            label: label.ok_or_else(|| ParseError::SemanticError("USING SCAN needs a label".into()))?,
+        },
+        _ => PlanHint::Join { variables },
+    })
+}
+
 fn parse_create_index_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> ParseResult<()> {
     let mut label = None;
     let mut properties: Vec<String> = Vec::new();
@@ -1275,6 +1310,8 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
                             pattern: parse_pattern(mc_inner)?,
                             optional: false,
                         });
+                    } else if mc_inner.as_rule() == Rule::using_hint {
+                        query.hints.push(parse_using_hint(mc_inner)?);
                     }
                 }
             }
@@ -1285,6 +1322,8 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
                             pattern: parse_pattern(mc_inner)?,
                             optional: true,
                         });
+                    } else if mc_inner.as_rule() == Rule::using_hint {
+                        query.hints.push(parse_using_hint(mc_inner)?);
                     }
                 }
                 after_optional = query.match_clauses.last().map(|m| m.pattern.clone());
