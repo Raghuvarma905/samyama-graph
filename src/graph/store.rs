@@ -1442,6 +1442,29 @@ impl GraphStore {
     /// Heap only. The `Arc`-held index managers report their own sizes if they can;
     /// what is not attributed here is named in `unattributed_note` rather than
     /// silently folded into another line.
+    /// Resident bytes of every index the store holds, one row each, largest
+    /// first (COST-06, NDS-14).
+    ///
+    /// All four kinds: property indexes and unique constraints, full-text,
+    /// vector (with its HNSW graph) and hierarchy. The property kinds alone
+    /// were reported before, so an index overhead figure left out the two
+    /// structures most likely to be the largest.
+    pub fn index_memory(&self) -> Vec<crate::index::IndexMemory> {
+        let mut out = self.property_index.index_memory();
+        out.extend(self.fulltext.index_memory());
+        out.extend(self.vector_index.index_memory());
+        out.extend(self.hierarchy_index.list().into_iter().map(|h| crate::index::IndexMemory {
+            kind: "hierarchy",
+            entries: h.nodes,
+            label: String::new(),
+            property: h.edge_types.join("|"),
+            name: Some(h.name),
+            bytes: h.bytes,
+        }));
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.label.cmp(&b.label)));
+        out
+    }
+
     pub fn memory_report(&self) -> MemoryReport {
         let node_versions: usize = self
             .nodes
