@@ -81,4 +81,4 @@ itself correctly survives a restart and a snapshot without further work.
 - [ADR-022](./ADR/ADR-022-snapshot-format.md) — the `.sgsnap` format.
 - [ADR-035](./ADR/ADR-035-oeh-hierarchy-index.md) — the hierarchy index.
 - [FULL-TEXT-SEARCH.md](./FULL-TEXT-SEARCH.md) — the full-text index.
-- [ACID_GUARANTEES.md](./ACID_GUARANTEES.md) — the transaction model the maintain clause rests on.
+- [ACID-GUARANTEES.md](./ACID-GUARANTEES.md) — the transaction model the maintain clause rests on.
