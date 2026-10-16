@@ -15767,6 +15767,13 @@ impl PhysicalOperator for ShowIndexesOperator {
                         (label, property, format!("FULLTEXT[{name}]"))
                     }),
             );
+            rows.extend(
+                store
+                    .point_index
+                    .listing()
+                    .into_iter()
+                    .map(|(name, label, property)| (label, property, format!("POINT[{name}]"))),
+            );
             // Both registries are hash maps, so the listing order is otherwise
             // arbitrary and differs run to run.
             rows.sort();
