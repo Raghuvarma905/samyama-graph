@@ -1515,6 +1515,10 @@ fn repeated_sigkills_always_recover_a_prefix_of_the_acknowledged_writes() {
 
     let mut recovered: i64 = 0; // highest statement present after the last restart
     let mut rto = Vec::new();
+    // Every statement whose SET was acknowledged, across rounds. Not "every
+    // multiple of three up to the last acknowledged statement": a statement
+    // in flight at a kill can survive without its SET ever being sent.
+    let acked_sets = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<i64>::new()));
     for round in 0..kills {
         let spawned = Instant::now();
         let mut server = spawn_server(data, port);
@@ -1526,7 +1530,7 @@ fn repeated_sigkills_always_recover_a_prefix_of_the_acknowledged_writes() {
         let issued = Arc::new(AtomicI64::new(recovered));
         let start_at = recovered + 1;
         let writer = {
-            let (acked, issued) = (acked.clone(), issued.clone());
+            let (acked, issued, sets) = (acked.clone(), issued.clone(), acked_sets.clone());
             std::thread::spawn(move || -> String {
                 for seq in start_at.. {
                     issued.store(seq, Ordering::SeqCst);
@@ -1542,7 +1546,9 @@ fn repeated_sigkills_always_recover_a_prefix_of_the_acknowledged_writes() {
                     if seq % 3 == 0 {
                         let q = format!("MATCH (h:Head {{seq: {seq}}}) SET h.v = {seq}");
                         match conn.query(&q) {
-                            Ok(Reply::Array(_)) => {}
+                            Ok(Reply::Array(_)) => {
+                                sets.lock().unwrap().insert(seq);
+                            }
                             Ok(other) => return format!("SET {seq} was refused: {other:?}"),
                             Err(_) => return String::new(),
                         }
@@ -1618,10 +1624,11 @@ fn repeated_sigkills_always_recover_a_prefix_of_the_acknowledged_writes() {
         // A prefix: exactly 1..=k, each once.
         assert_eq!(seqs, (1..=k).collect::<Vec<_>>(), "{ctx}: not a prefix");
         // Atomic: every head with its edge and tail, and no stray tail.
+        let sets = acked_sets.lock().unwrap().clone();
         for r in &heads {
             assert_eq!((r[1], r[2]), (r[0], r[0]), "{ctx}: a statement half-recovered: {r:?}");
             let seq = r[0].unwrap();
-            if seq % 3 == 0 && seq <= acked {
+            if sets.contains(&seq) {
                 assert_eq!(r[3], Some(seq), "{ctx}: acknowledged SET on {seq} lost");
             }
         }
