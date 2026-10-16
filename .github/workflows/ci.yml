@@ -73,6 +73,14 @@ jobs:
       # for both would run an eleven-minute suite on every Rust edit, or skip it
       # on the ones that can actually move it.
       conformance: ${{ steps.filter.outputs.conformance }}
+      # A third question, and the one #1860 proved was missing. `*.md` is on the
+      # SKIPPABLE allowlist below, and CH-DOC-EXEC exists to parse the Cypher in
+      # `*.md` -- so the one gate a documentation change can break was the one
+      # gate a documentation change skipped. #1860 shortened the README, skipped
+      # the whole matrix, merged green, and broke `test` on every open PR on both
+      # architectures. `ci-ok` passed and was right to: skipped is success by
+      # design. The filter was what was wrong (#1854).
+      docs: ${{ steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,6 +101,7 @@ jobs:
             echo "event $EVENT: running the full suite"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "conformance=true" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -100,6 +109,7 @@ jobs:
             echo "::warning::base commit unavailable; running the full suite"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "conformance=true" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -151,6 +161,60 @@ jobs:
             echo "no path-pattern surface touched; the conformance suite will be skipped"
           fi
           echo "conformance=$CONFORMANCE" >> "$GITHUB_OUTPUT"
+
+          # Markdown, which CH-DOC-EXEC parses. Deliberately overlapping with
+          # SKIPPABLE rather than carved out of it: a docs-only PR should still
+          # skip the two-architecture matrix -- that part of #1851 was right --
+          # it just must not skip the gate that reads documentation. So `docs`
+          # answers "run CH-DOC-EXEC", not "run everything".
+          DOCS_PATHS='\.md$'
+
+          DOCS=false
+          for f in $CHANGED; do
+            if printf '%s' "$f" | grep -qE "$DOCS_PATHS"; then
+              echo "requires the documentation gate: $f"
+              DOCS=true
+              break
+            fi
+          done
+          if [ "$DOCS" = "false" ]; then
+            echo "no markdown touched; the documentation gate will be skipped"
+          fi
+          echo "docs=$DOCS" >> "$GITHUB_OUTPUT"
+
+  docs-gate:
+    # CH-DOC-EXEC for a PR that changes documentation and no code (#1854).
+    #
+    # The same gate runs as a step inside `test`, which is where it belongs when
+    # there is code to test. This job is only for the case `test` does not run at
+    # all, so the condition excludes `code == 'true'` rather than duplicating a
+    # release build on every PR.
+    #
+    # One architecture, because `doc_check` only calls `parse_query` -- no store,
+    # no execution, nothing that differs on ARM.
+    name: docs-gate (CH-DOC-EXEC)
+    needs: changes
+    if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
+    runs-on: ubuntu-latest
+    # A warm `ci-test` cache makes this a link step. A cold one is a full release
+    # build, hence the headroom.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config libssl-dev clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The same key the `test` job uses, so this restores that cache
+          # instead of building the workspace from scratch.
+          shared-key: ci-test
+      - name: CH-DOC-EXEC -- the Cypher in our documentation parses
+        # Byte-identical to the step inside `test`, so the two cannot drift into
+        # disagreeing about what the gate is.
+        run: cargo run --release --example doc_check
 
   supply-chain:
     # REL-14 / TRUST-08 (#1042). Known advisories, licences outside the allow
@@ -863,6 +927,7 @@ jobs:
       - changes
       - supply-chain
       - test
+      - docs-gate
       - sdks
       - snapshot-portability
       - snapshot-portability-read
