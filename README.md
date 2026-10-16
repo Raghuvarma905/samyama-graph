@@ -619,8 +619,8 @@ the suite that will answer this, and the figure returns here when it does.
 
 ## Examples
 
-**Run them all in one command:** `./scripts/run_all_examples.sh --batch` builds
-every example, starts a server, and runs each in turn with a pass/fail summary
+**Run the curated demos:** `./scripts/run_all_examples.sh --batch` builds
+the Rust examples, starts a server, and runs the selected demos with a pass/fail summary
 (the orchestrator for the `examples/` directory).
 
 ### Domain Knowledge Graphs
