@@ -39,13 +39,24 @@ jobs:
   # 40% of recent PRs (12 of the last 30: 7 docs-only, 5 workflow-only) changed
   # no Rust at all and still ran the full nine-check, two-architecture matrix.
   #
-  # The filter is a JOB CONDITION, deliberately, not `paths:` on the trigger.
-  # `test (ubuntu-latest)`, `test (ubuntu-24.04-arm)` and
-  # `supply-chain (cargo-deny)` are required status checks: a job that GitHub
-  # SKIPS satisfies the requirement, while a workflow that `paths:` filters out
-  # never reports at all and leaves the check pending, so the PR can never
-  # merge. Same intent as conformance.yml's `paths:`, which is safe there only
-  # because none of its checks are required.
+  # The filter is a JOB CONDITION, deliberately, not `paths:` on the trigger. A
+  # workflow that `paths:` filters out does not report its checks as skipped --
+  # it does not report them at all -- so a required context there can never be
+  # satisfied and the pull request can never merge. That is why the conformance
+  # job moved into this file rather than keeping its own `paths:`-filtered
+  # workflow (#1865).
+  #
+  # A job condition is necessary and was NOT sufficient on its own, which this
+  # comment used to get wrong. It claimed a job GitHub skips satisfies its
+  # requirement. That holds for a job with a FIXED name -- `supply-chain
+  # (cargo-deny)` reported, skipped, under exactly its required name -- and
+  # fails for a MATRIX job, because an `if:`-skipped matrix is never expanded
+  # and reports as `test (${{ matrix.os }})`, so the required
+  # `test (ubuntu-latest)` never appeared at all. #1860 was MERGEABLE and
+  # permanently BLOCKED for five days on precisely that.
+  #
+  # The single required context is now `ci-ok`, which has a fixed name and
+  # `if: always()`, so it reports on every run whatever these jobs did.
   #
   # The list below is an ALLOWLIST of paths that cannot affect a build, and
   # anything unrecognised runs the full suite. Erring towards running is the
@@ -56,6 +67,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # A separate question from `code`. A storage-layer change runs the test
+      # matrix and cannot move a path-pattern verdict; a change under
+      # `tools/conformance/` cannot affect the test matrix. Asking one question
+      # for both would run an eleven-minute suite on every Rust edit, or skip it
+      # on the ones that can actually move it.
+      conformance: ${{ steps.filter.outputs.conformance }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,12 +92,14 @@ jobs:
           if [ "$EVENT" != "pull_request" ]; then
             echo "event $EVENT: running the full suite"
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "conformance=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [ -z "${BASE:-}" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             echo "::warning::base commit unavailable; running the full suite"
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "conformance=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -110,6 +129,28 @@ jobs:
             echo "no code paths touched; the suites below will be skipped"
           fi
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+          # What the conformance suite measures. This replaces the workflow-level
+          # `paths:` filter that `conformance.yml` carried, and that is the point
+          # of folding it in: a `paths:`-filtered workflow does not report its
+          # checks as skipped, it does not report them at all, so a required
+          # context there can never be satisfied (#1854 item 3, #1860). As a job
+          # condition the check always reports, and `ci-ok` can gate it the day
+          # anyone decides it should.
+          CONFORMANCE_PATHS='(^src/query/|^src/http/|^tools/conformance/|^\.github/workflows/ci\.yml$)'
+
+          CONFORMANCE=false
+          for f in $CHANGED; do
+            if printf '%s' "$f" | grep -qE "$CONFORMANCE_PATHS"; then
+              echo "requires the conformance suite: $f"
+              CONFORMANCE=true
+              break
+            fi
+          done
+          if [ "$CONFORMANCE" = "false" ]; then
+            echo "no path-pattern surface touched; the conformance suite will be skipped"
+          fi
+          echo "conformance=$CONFORMANCE" >> "$GITHUB_OUTPUT"
 
   supply-chain:
     # REL-14 / TRUST-08 (#1042). Known advisories, licences outside the allow
@@ -426,6 +467,28 @@ jobs:
           echo
           echo "all gates ran and passed"
 
+      # The release binary the conformance job needs, so it does not spend ten
+      # minutes building the same thing. `conformance.yml` used to run its own
+      # `cargo build --release --bin samyama`, averaging 10m 49s over 61 runs,
+      # and a separate workflow cannot reuse this job's output -- which is the
+      # reason that job is now in this file rather than its own (#1865).
+      #
+      # `if: always()` and `continue-on-error`, because the build happens inside
+      # the CH-API-STABILITY gate step above, which is itself
+      # `continue-on-error`: a failure there before the build leaves no binary.
+      # `if-no-files-found: warn` for the same reason. The conformance job treats
+      # a missing artifact as "build it yourself", which is exactly what it did
+      # before, so the degraded path is the old behaviour rather than a new one.
+      - name: Keep the release binary for the conformance job
+        if: always() && matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: samyama-release
+          path: target/release/samyama
+          retention-days: 1
+          if-no-files-found: warn
+
   # One job for both SDKs.
   #
   # These were two check runs for two directories that share a trigger, a runner
@@ -641,6 +704,129 @@ jobs:
           set -euo pipefail
           cargo run --release --example snapshot_portability -- \
             --verify snap.sgsnap --against wrote.json
+
+  # What this job asserts, and what it does not.
+  #
+  # It asserts that this checkout still computes what the committed baseline says
+  # it computes for the ISO/IEC 39075 path patterns -- every construct, in both
+  # directions. A cell that gets worse is a semantics regression. A cell that gets
+  # better also fails, because a baseline that no longer describes the engine
+  # cannot catch the next regression: the stale line hides it.
+  #
+  # It does not assert conformance. Ten cells in the baseline are DIVERGES today,
+  # and they are the open dialect questions in #1646, not regressions. Turning
+  # them green is work; keeping them from moving silently is this job.
+  #
+  # #1140 was found by an external suite rather than by our tests, and #1142
+  # existed to fix that and was closed without anything in the repository running
+  # the suite. This is that, actually wired up.
+  #
+  # It lived in `conformance.yml` until #1865. Folding it here does two things a
+  # separate workflow could not:
+  #
+  #   It takes the release binary from `test` instead of building its own. Two
+  #   workflows cannot share an artifact -- a workflow cannot `needs:` a job in
+  #   another one -- and that duplicate build averaged 10m 49s over 61 runs.
+  #
+  #   It replaces a workflow-level `paths:` filter with a job condition. A
+  #   `paths:`-filtered workflow does not report its checks as skipped; it does
+  #   not report them at all, so a required context there could never be
+  #   satisfied. That trap is #1860, and the old file carried a comment warning
+  #   not to require it. Now the check always reports, and `ci-ok` can gate it
+  #   whenever anyone decides it should -- which is a policy decision, not this
+  #   change, so `ci-ok` does NOT list it in `needs` yet. See
+  #   tests/ci_gate_enumeration.rs, where that exemption has to be stated
+  #   explicitly rather than simply omitted.
+  gpml:
+    name: GPML path-pattern conformance
+    needs: [changes, test]
+    if: needs.changes.outputs.conformance == 'true'
+    runs-on: ubuntu-latest
+    # Was 45 while a dead Grafeo adapter burned 60s per case on 84 cases (#1858).
+    # With that fixed the whole of run.sh is about a minute, and the build is the
+    # only slow part -- and it is now usually downloaded rather than built.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git describe` below needs the tags, and needs enough history to reach
+          # them. checkout fetches neither by default: `fetch-tags` is false, and a
+          # depth-1 clone cannot walk back to a tag that is not on HEAD.
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Which build this run is measuring.
+      #
+      # The suite defaults this to a hardcoded `v1.10.0`
+      # (`SamyamaAdapter(build=os.environ.get("SAMYAMA_BUILD", "v1.10.0"))`), so
+      # until #1866 every run labelled its measurement with a release it was not
+      # measuring. `SamyamaAdapter._version` treats the label as authoritative and
+      # the engine's own `engine_version` as the cross-check, printing a
+      # disagreement rather than swallowing it -- a mechanism that fires on every
+      # run is a warning nobody reads.
+      #
+      # The nearest TAG is the right source and the two obvious alternatives are
+      # both wrong. `--always` yields `v1.11.0-25-gc24f8ad` after the tag, and the
+      # comparison is a string compare, so it would never match. Cargo.toml's
+      # version makes the cross-check vacuous: the binary reports
+      # `env!("CARGO_PKG_VERSION")`, so both sides would come from one file and
+      # agree by construction.
+      - name: Which build is being measured
+        run: |
+          set -euo pipefail
+          label=$(git describe --tags --abbrev=0 2>/dev/null || echo unspecified)
+          echo "SAMYAMA_BUILD=$label" >> "$GITHUB_ENV"
+          echo "build label for this run: $label"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+
+      # The binary `test` already built. `continue-on-error` because a missing
+      # artifact is not a failure here: `run.sh` builds the engine itself when
+      # `$SAMYAMA_BIN` is absent, which is what this job did on every run before
+      # #1865. The fallback is the old behaviour, not a new one.
+      - name: Take the release binary from the test job
+        id: fetch_binary
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: samyama-release
+          path: target/release
+
+      - name: Use it if it arrived, otherwise say so
+        run: |
+          set -euo pipefail
+          if [ -f target/release/samyama ]; then
+            # run.sh tests `[ ! -x "$SAMYAMA_BIN" ]`, and an artifact download
+            # does not preserve the executable bit. Without this the binary is
+            # present, not executable, and the suite silently rebuilds it.
+            chmod +x target/release/samyama
+            # Do NOT run the binary to identify it. `samyama` dispatches a fixed
+            # list of subcommands (main.rs) and anything else -- `--version`
+            # included -- falls through to start_server(), which never returns.
+            # A command substitution around it hangs until the job timeout.
+            echo "using the binary built by the test job: $(ls -l target/release/samyama | awk '{print $1, $5}') bytes"
+          else
+            echo "::notice::no release artifact; run.sh will build the engine itself"
+          fi
+
+      - name: Run the suite against the baseline
+        # Keep the suite checkout out of the Rust target cache.
+        env:
+          WORK: ${{ runner.temp }}/gpml-conformance
+        run: ./tools/conformance/run.sh
+
+      - name: Keep the map, whatever the verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-map
+          path: |
+            ${{ runner.temp }}/gpml-conformance/suite/results/map.json
+            ${{ runner.temp }}/gpml-conformance/suite/results/summary.json
+          if-no-files-found: warn
 
   # The one check branch protection should require.
   #

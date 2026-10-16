@@ -23,6 +23,25 @@ fn ci_yml() -> serde_yaml::Value {
 
 const AGGREGATOR: &str = "ci-ok";
 
+/// Jobs deliberately outside the aggregator, each with the reason it is outside.
+///
+/// This exists because the alternative is worse. `gpml` has to be a job in this
+/// workflow to reuse `test`'s release binary and to stop being a `paths:`-filtered
+/// workflow whose checks never report (#1865), but putting it in `ci-ok`'s `needs`
+/// would make conformance block a merge for the first time -- a policy change, and
+/// not one a refactor should make on its way past.
+///
+/// The list fails BOTH ways, in the manner of `KNOWN_GAPS` in
+/// `tests/anchor_coverage.rs`: an entry that is also in `needs` fails, and a job
+/// that is in neither fails. So an entry cannot outlive the decision it records,
+/// and a new suite cannot quietly escape the gate -- escaping it means adding a
+/// line here, with a reason, in a diff someone reads.
+const UNGATED: &[(&str, &str)] = &[(
+    "gpml",
+    "conformance has never gated a merge; requiring it is a policy decision, \
+     separate from folding it into this workflow (#1865)",
+)];
+
 fn jobs(doc: &serde_yaml::Value) -> Vec<String> {
     doc["jobs"]
         .as_mapping()
@@ -74,23 +93,48 @@ fn the_aggregator_waits_for_every_suite() {
     let all = jobs(&doc);
     let needs = needs_of(&doc, AGGREGATOR);
 
+    let exempt: Vec<&str> = UNGATED.iter().map(|(j, _)| *j).collect();
+
     let unguarded: Vec<&String> = all
         .iter()
-        .filter(|j| j.as_str() != AGGREGATOR && !needs.contains(j))
+        .filter(|j| {
+            j.as_str() != AGGREGATOR && !needs.contains(j) && !exempt.contains(&j.as_str())
+        })
         .collect();
     let phantom: Vec<&String> = needs.iter().filter(|n| !all.contains(n)).collect();
 
-    // Both lists in one message. Renaming a job produces both faults at once -- the
+    // An exemption that is also in `needs` is a contradiction: the comment says
+    // this job does not gate a merge and the workflow says it does. Whichever is
+    // stale, a reader is being misled.
+    let contradictory: Vec<&str> = exempt
+        .iter()
+        .copied()
+        .filter(|j| needs.iter().any(|n| n == j))
+        .collect();
+
+    // An exemption naming no job is a decision that outlived the thing it was
+    // about -- the usual way an allowlist rots into permission for anything.
+    let stale: Vec<&str> = exempt
+        .iter()
+        .copied()
+        .filter(|j| !all.iter().any(|a| a == j))
+        .collect();
+
+    // Every list in one message. Renaming a job produces two faults at once -- the
     // new name unguarded, the old one phantom -- and asserting them separately
     // reports the first, hides the second, and converges over two runs. A gate that
     // tells you half of what is wrong is a gate you run twice.
     assert!(
-        unguarded.is_empty() && phantom.is_empty(),
+        unguarded.is_empty() && phantom.is_empty() && contradictory.is_empty()
+            && stale.is_empty(),
         "{AGGREGATOR}'s `needs:` does not match the jobs in this workflow.\n  \
          these jobs run but {AGGREGATOR} does not wait for them, so a failure in \
          them cannot block a merge: {unguarded:?}\n  \
-         these `needs:` entries name no job in this workflow: {phantom:?}\n\
-         Both are edited in .github/workflows/ci.yml."
+         these `needs:` entries name no job in this workflow: {phantom:?}\n  \
+         these are listed in UNGATED yet ARE in `needs`, so the stated reason is \
+         false: {contradictory:?}\n  \
+         these are listed in UNGATED but name no job at all: {stale:?}\n\
+         `needs:` is edited in .github/workflows/ci.yml; UNGATED in this file."
     );
 }
 
