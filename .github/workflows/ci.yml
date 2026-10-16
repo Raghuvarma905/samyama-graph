@@ -803,7 +803,11 @@ jobs:
             # does not preserve the executable bit. Without this the binary is
             # present, not executable, and the suite silently rebuilds it.
             chmod +x target/release/samyama
-            echo "using the binary built by the test job: $(./target/release/samyama --version 2>/dev/null || echo 'version not reported')"
+            # Do NOT run the binary to identify it. `samyama` dispatches a fixed
+            # list of subcommands (main.rs) and anything else -- `--version`
+            # included -- falls through to start_server(), which never returns.
+            # A command substitution around it hangs until the job timeout.
+            echo "using the binary built by the test job: $(ls -l target/release/samyama | awk '{print $1, $5}') bytes"
           else
             echo "::notice::no release artifact; run.sh will build the engine itself"
           fi
