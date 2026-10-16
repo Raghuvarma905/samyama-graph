@@ -39,13 +39,24 @@ jobs:
   # 40% of recent PRs (12 of the last 30: 7 docs-only, 5 workflow-only) changed
   # no Rust at all and still ran the full nine-check, two-architecture matrix.
   #
-  # The filter is a JOB CONDITION, deliberately, not `paths:` on the trigger.
-  # `test (ubuntu-latest)`, `test (ubuntu-24.04-arm)` and
-  # `supply-chain (cargo-deny)` are required status checks: a job that GitHub
-  # SKIPS satisfies the requirement, while a workflow that `paths:` filters out
-  # never reports at all and leaves the check pending, so the PR can never
-  # merge. Same intent as conformance.yml's `paths:`, which is safe there only
-  # because none of its checks are required.
+  # The filter is a JOB CONDITION, deliberately, not `paths:` on the trigger. A
+  # workflow that `paths:` filters out does not report its checks as skipped --
+  # it does not report them at all -- so a required context there can never be
+  # satisfied and the pull request can never merge. That is why the conformance
+  # job moved into this file rather than keeping its own `paths:`-filtered
+  # workflow (#1865).
+  #
+  # A job condition is necessary and was NOT sufficient on its own, which this
+  # comment used to get wrong. It claimed a job GitHub skips satisfies its
+  # requirement. That holds for a job with a FIXED name -- `supply-chain
+  # (cargo-deny)` reported, skipped, under exactly its required name -- and
+  # fails for a MATRIX job, because an `if:`-skipped matrix is never expanded
+  # and reports as `test (${{ matrix.os }})`, so the required
+  # `test (ubuntu-latest)` never appeared at all. #1860 was MERGEABLE and
+  # permanently BLOCKED for five days on precisely that.
+  #
+  # The single required context is now `ci-ok`, which has a fixed name and
+  # `if: always()`, so it reports on every run whatever these jobs did.
   #
   # The list below is an ALLOWLIST of paths that cannot affect a build, and
   # anything unrecognised runs the full suite. Erring towards running is the
