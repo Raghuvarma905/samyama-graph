@@ -647,3 +647,34 @@ fn a_statement_larger_than_one_commit_lands_whole() {
     }
     assert!(m.storage().get_node("default", nodes[3].as_u64()).unwrap().is_some());
 }
+
+/// With the WAL in sync mode, a statement costs one durability barrier per
+/// commit, not one per row (#1666).
+///
+/// Each row's record was appended with its own `sync_data`, so a 1,000-row
+/// statement under `SAMYAMA_FSYNC=1` was 1,000 fsyncs -- 50 rows a second on
+/// the host that measured it. The records are still one per row; the barrier
+/// is once per commit, before the rows it covers are committed, and every row
+/// is on disk when the statement returns.
+#[test]
+fn a_synced_statement_pays_one_wal_barrier_per_commit() {
+    const N: usize = 1_000;
+    let (_dir, m) = manager();
+    m.set_wal_sync_for_test(true);
+
+    let mut store = GraphStore::new();
+    store.enable_write_log();
+    let nodes: Vec<NodeId> = (0..N).map(|_| store.create_node("P")).collect();
+    let log = store.take_write_log();
+
+    let syncs_before = wal::WAL_SYNCS.with(|c| c.get());
+    let (result, ops) = apply_counted(&m, "default", &store, &log);
+    let syncs = wal::WAL_SYNCS.with(|c| c.get()) - syncs_before;
+
+    assert_eq!(result.unwrap(), N);
+    assert_eq!(ops.wal_appends, N as u64, "still one WAL record per row");
+    assert_eq!(syncs, 1, "one barrier for a statement that fits in one commit");
+    for n in [nodes[0], nodes[N / 2], nodes[N - 1]] {
+        assert!(m.storage().get_node("default", n.as_u64()).unwrap().is_some());
+    }
+}
