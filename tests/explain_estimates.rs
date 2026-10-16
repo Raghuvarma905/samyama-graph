@@ -38,7 +38,7 @@ fn explain(s: &GraphStore, q: &str) -> Vec<String> {
 fn rows_on(line: &str) -> Option<f64> {
     let at = line.find("[estimated rows=")? + "[estimated rows=".len();
     let rest = &line[at..];
-    let end = rest.find(|c: char| c == ' ' || c == ']')?;
+    let end = rest.find([' ', ']'])?;
     rest[..end].parse().ok()
 }
 
