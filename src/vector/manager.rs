@@ -272,6 +272,27 @@ impl VectorIndexManager {
         indices.keys().cloned().collect()
     }
 
+    /// Per-index memory, one row per vector index, counting the HNSW graph as
+    /// well as the vectors (NDS-14).
+    pub fn index_memory(&self) -> Vec<crate::index::IndexMemory> {
+        let names = self.names.read().unwrap();
+        let indices = self.indices.read().unwrap();
+        indices
+            .iter()
+            .map(|(key, lock)| {
+                let index = lock.read().unwrap();
+                crate::index::IndexMemory {
+                    kind: "vector",
+                    name: names.iter().find(|(_, k)| *k == key).map(|(n, _)| n.clone()),
+                    label: key.label.clone(),
+                    property: key.property_key.clone(),
+                    bytes: index.resident_bytes(),
+                    entries: index.len(),
+                }
+            })
+            .collect()
+    }
+
     /// Search across ALL indices (every label + property), merge the per-index
     /// hits, and return the global top-k by distance.
     ///
