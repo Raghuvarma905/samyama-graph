@@ -284,7 +284,7 @@ impl Wal {
     /// `SAMYAMA_FSYNC=1` turns it on. **Off by default**, which is what the
     /// engine has always done, and the default is the honest one to keep: this
     /// is a change of what users can choose, not a change of what they get
-    /// without asking. `docs/ACID_GUARANTEES.md` §4 states both costs.
+    /// without asking. `docs/ACID-GUARANTEES.md` §4 states both costs.
     ///
     /// Read once, at construction. A durability level that could change under
     /// a running process would make "was this write durable?" unanswerable for

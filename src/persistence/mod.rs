@@ -26,7 +26,7 @@
 //! Both are written *after* the in-memory mutation, from the statement's write
 //! log ([`PersistenceManager::apply_mutations`]): this is write-behind, not
 //! write-ahead, and a crash between the mutation and that call loses the write
-//! (`docs/ACID_GUARANTEES.md` §1).
+//! (`docs/ACID-GUARANTEES.md` §1).
 //!
 //! ## RocksDB
 //!
