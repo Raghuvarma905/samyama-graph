@@ -408,14 +408,14 @@ into a public-health trifecta.* [Browse the catalogue →](case_studies)
 | **Four algorithms scale with cores** | PageRank, LCC, CDLP and triangle counting are Rayon-parallel, as are scan, filter and compaction. Measured at 16 cores: 3 of 7 frontier algorithms reach ≥0.6 efficiency, and `wcc`, `betweenness` and `closeness` are sequential at 0.06 — one thread on sixteen (`CH-ALGO-PARALLEL`, ALGO-09) |
 | **LDBC suites run in-tree** | SNB Interactive 21/21 and SNB BI 20/20 at SF1, no timeouts; Graphalytics 12/12 against the LDBC reference answers |
 | **200 resident bytes per edge** | Measured on LDBC SNB SF10 (176M edges) by `CH-MEM-01`, against a 256 B/edge target |
-| **Transactions with a published isolation table** | `BEGIN` / `COMMIT` / `ROLLBACK` over RESP and HTTP; every anomaly mapped to the test that pins it in [`docs/ACID_GUARANTEES.md`](docs/ACID_GUARANTEES.md) |
+| **Transactions with a published isolation table** | `BEGIN` / `COMMIT` / `ROLLBACK` over RESP and HTTP; every anomaly mapped to the test that pins it in [`docs/ACID-GUARANTEES.md`](docs/ACID-GUARANTEES.md) |
 | **Every headline number re-measured on a schedule** | A conformance harness publishes `SCORECARD.json`, and a regression gate blocks the release tag on a stale or red verdict |
 
 ---
 
 ## The 30-Second Tour
 
-**Cypher queries** — MATCH, CREATE, MERGE, aggregations, path finding, 30+ functions. **99.9% of the openCypher TCK's evaluated scenarios pass** (3,845 of 3,847, at 98.7% coverage of the 3,897-scenario corpus, measured 2026-09-15), and **neither of the two remaining failures is a wrong answer** — both raise; on the same corpus and comparator Neo4j 5 scores 79.5%. That is conformance only — not performance or scale — and the competitor figure is a fixed baseline from one run. See [`docs/CYPHER_COMPATIBILITY.md`](docs/CYPHER_COMPATIBILITY.md) for a per-feature matrix verified by an executable probe, and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full accounting.
+**Cypher queries** — MATCH, CREATE, MERGE, aggregations, path finding, 30+ functions. **99.9% of the openCypher TCK's evaluated scenarios pass** (3,845 of 3,847, at 98.7% coverage of the 3,897-scenario corpus, measured 2026-09-15), and **neither of the two remaining failures is a wrong answer** — both raise; on the same corpus and comparator Neo4j 5 scores 79.5%. That is conformance only — not performance or scale — and the competitor figure is a fixed baseline from one run. See [`docs/CYPHER-COMPATIBILITY.md`](docs/CYPHER-COMPATIBILITY.md) for a per-feature matrix verified by an executable probe, and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full accounting.
 
 ```cypher
 MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person))
@@ -619,8 +619,8 @@ the suite that will answer this, and the figure returns here when it does.
 
 ## Examples
 
-**Run them all in one command:** `./scripts/run_all_examples.sh --batch` builds
-every example, starts a server, and runs each in turn with a pass/fail summary
+**Run the curated demos:** `./scripts/run_all_examples.sh --batch` builds
+the Rust examples, starts a server, and runs the selected demos with a pass/fail summary
 (the orchestrator for the `examples/` directory).
 
 ### Domain Knowledge Graphs
@@ -635,13 +635,13 @@ every example, starts a server, and runs each in turn with a pass/fail summary
 | Enterprise SOC | `cargo run --example enterprise_soc_demo` | MITRE ATT&CK, attack paths, threat intel |
 | Knowledge Graph | `cargo run --example knowledge_graph_demo` | Enterprise RAG + semantic search |
 | Agentic (GAK) | `cargo run --example agentic_enrichment_demo` | Generation-augmented enrichment (needs `claude` CLI) |
-| Raft Cluster | `cargo run --example cluster_demo` | Cluster configuration and membership API. Writes apply to the local node only; there is no replication or quorum ([ACID_GUARANTEES §2](docs/ACID_GUARANTEES.md)) |
+| Raft Cluster | `cargo run --example cluster_demo` | Cluster configuration and membership API. Writes apply to the local node only; there is no replication or quorum ([ACID-GUARANTEES §2](docs/ACID-GUARANTEES.md)) |
 
 *19 demo examples + 15 data loaders in [`examples/`](examples); optimization/use-case
 demos: `grid_dispatch_demo`, `amr_stewardship_demo`, `healthcare_allocation_demo`,
 `wildfire_evac_demo`, `pca_demo`, `sdk_demo`, …*
 
-**Guide to all 122 programs:** [`examples/README.md`](examples/README.md) — demos, loaders, tools, and which ones are internal probes.
+**Guide to all 127 programs:** [`examples/README.md`](examples/README.md) — 125 Rust examples, a Python client, and an ESP32 sketch; demos, loaders, tools, and internal probes.
 
 ### Data Loaders
 
@@ -720,7 +720,7 @@ samyama/
 |----------|------|
 | **The Book** | [graph.samyama.cloud/book](https://graph.samyama.cloud/book/) |
 | Biomedical Benchmark | [**96 of 100 queries return real data**, measured 2026-04-02](https://graph.samyama.cloud/book/biomedical_benchmark.html) |
-| Cypher Compatibility | [docs/CYPHER_COMPATIBILITY.md](docs/CYPHER_COMPATIBILITY.md) |
+| Cypher Compatibility | [docs/CYPHER-COMPATIBILITY.md](docs/CYPHER-COMPATIBILITY.md) |
 | LDBC Results | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
 | Algorithm Conventions | [docs/ALGORITHM-CONVENTIONS.md](docs/ALGORITHM-CONVENTIONS.md) — directedness, weights, self-loops, disconnected components, tie-breaking and normalisation, per algorithm |
 | Failure Modes | [docs/FAILURE-MODES.md](docs/FAILURE-MODES.md) — what happens when something goes wrong, each row naming the test that observed it |
