@@ -234,6 +234,7 @@ RETURN nodeId, score ORDER BY score DESC LIMIT 10
 
 ```cypher
 CREATE VECTOR INDEX paper_idx FOR (p:Paper) ON (p.embedding) OPTIONS {dimensions: 384, similarity: 'cosine'}
+
 CALL vector.search('Paper', 'embedding', [0.1, 0.2, 0.3], 10) YIELD node, score
 ```
 
