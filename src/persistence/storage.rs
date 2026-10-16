@@ -124,7 +124,7 @@ pub struct PersistentStorage {
     ///
     /// RocksDB was opened with no `WriteOptions` at all, so every write used
     /// the default — unsynced. With the WAL also unsynced that made the whole
-    /// write path unsynced, which is what `docs/ACID_GUARANTEES.md` §4 had to
+    /// write path unsynced, which is what `docs/ACID-GUARANTEES.md` §4 had to
     /// say and what #1309 is about. `SAMYAMA_FSYNC=1` turns both on together;
     /// turning on one and not the other would be a durability level nobody
     /// asked for.
