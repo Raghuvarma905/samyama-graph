@@ -208,14 +208,14 @@ Plus surveillance, health-determinants, health-systems and football — [browse 
 | **Four algorithms scale with cores** | PageRank, LCC, CDLP and triangle counting are Rayon-parallel; WCC, betweenness and closeness run on one thread (`CH-ALGO-PARALLEL`, ALGO-09) |
 | **LDBC suites run in-tree** | SNB Interactive 21/21 and SNB BI 20/20 at SF1, no timeouts; Graphalytics 12/12 against the LDBC reference answers |
 | **200 resident bytes per edge** | Measured on LDBC SNB SF10 (176M edges) by `CH-MEM-01`, against a 256 B/edge target |
-| **Transactions with a published isolation table** | `BEGIN` / `COMMIT` / `ROLLBACK` over RESP and HTTP — [`docs/ACID_GUARANTEES.md`](docs/ACID_GUARANTEES.md) |
+| **Transactions with a published isolation table** | `BEGIN` / `COMMIT` / `ROLLBACK` over RESP and HTTP — [`docs/ACID-GUARANTEES.md`](docs/ACID-GUARANTEES.md) |
 | **Every headline number re-measured on a schedule** | A conformance harness publishes `SCORECARD.json`, and a regression gate blocks the release tag on a stale or red verdict |
 
 ## The 30-Second Tour
 
 **Cypher** — MATCH, CREATE, MERGE, aggregations, path finding, 30+ functions.
 99.9% of the openCypher TCK's evaluated scenarios pass (3,845 of 3,847, at 98.7%
-coverage of the corpus, measured 2026-09-15) — see [`docs/CYPHER_COMPATIBILITY.md`](docs/CYPHER_COMPATIBILITY.md).
+coverage of the corpus, measured 2026-09-15) — see [`docs/CYPHER-COMPATIBILITY.md`](docs/CYPHER-COMPATIBILITY.md).
 
 ```cypher
 MATCH p = shortestPath((a:Person)-[:KNOWS*1..3]->(b:Person))
@@ -274,9 +274,10 @@ These run in-tree; LDBC certification is a formal third-party process we have no
 
 ## Examples and loaders
 
-[`examples/`](examples) holds 124 programs, among them 19 domain demos and 15 data
-loaders — banking fraud, clinical trials, supply chain, manufacturing, SOC,
-LDBC, FinBench, cricket, IMDB and more. Run them all with
+[`examples/`](examples) holds 127 programs: 125 Rust examples, a Python client
+and an ESP32 sketch. Among them are 19 domain demos and 15 data loaders —
+banking fraud, clinical trials, supply chain, manufacturing, SOC, LDBC,
+FinBench, cricket, IMDB and more. Run the curated demos with
 `./scripts/run_all_examples.sh --batch`, or one with `cargo run --example banking_demo`.
 **Guide:** [`examples/README.md`](examples/README.md).
 
@@ -292,7 +293,7 @@ LDBC, FinBench, cricket, IMDB and more. Run them all with
 |----------|------|
 | **The Book** | [graph.samyama.cloud/book](https://graph.samyama.cloud/book/) |
 | All documentation | [docs/README.md](docs/README.md) |
-| Cypher compatibility | [docs/CYPHER_COMPATIBILITY.md](docs/CYPHER_COMPATIBILITY.md) |
+| Cypher compatibility | [docs/CYPHER-COMPATIBILITY.md](docs/CYPHER-COMPATIBILITY.md) |
 | Benchmarks | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
 | Security, auth, TLS and data handling | [docs/DATA-HANDLING.md](docs/DATA-HANDLING.md) |
 | Migrating from Neo4j | [docs/MIGRATING-FROM-NEO4J.md](docs/MIGRATING-FROM-NEO4J.md) |
