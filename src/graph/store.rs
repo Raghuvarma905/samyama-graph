@@ -1982,6 +1982,20 @@ NodeDeleted { .. } => {
         //
         // A property-less node indexes nothing, so the local call is skipped
         // rather than allocating to feed a loop that iterates zero times (#491).
+        // Full-text, which neither branch below reaches: it is fed on the
+        // property-set path only, so a node created with its properties
+        // through this call was never findable by a full-text search on a
+        // store that already had the index. Found while counting the index's
+        // bytes (#1673), where 500 such documents indexed as zero.
+        if !self.fulltext.is_empty() {
+            for (key, value) in &indexed_properties {
+                if let PropertyValue::String(text) = value {
+                    for label in &labels {
+                        self.fulltext.on_property_set(label.as_str(), key, node_id, text);
+                    }
+                }
+            }
+        }
         if !indexed_properties.is_empty() {
             if self.index_sender.is_some() {
                 for (key, value) in &indexed_properties {

@@ -74,6 +74,17 @@ fn the_byte_counts_grow_with_what_is_indexed() {
     }
 }
 
+/// A node created with its properties through `create_node_with_properties`
+/// is in the full-text index. It was not: the full-text index was fed on the
+/// property-set path only, which this call does not take, so these 500
+/// documents counted zero bytes because they were never indexed.
+#[test]
+fn a_node_created_with_its_properties_is_full_text_searchable() {
+    let s = store_with(20);
+    let hits = s.fulltext.search("docs", "number", 50).expect("the index exists");
+    assert_eq!(hits.len(), 20, "{hits:?}");
+}
+
 #[test]
 fn the_vector_index_counts_its_hnsw_graph_not_only_its_vectors() {
     let s = store_with(300);
