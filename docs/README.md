@@ -35,7 +35,7 @@ eight of eighteen documents (#1450).
 
 ### The query language
 
-- **[CYPHER_COMPATIBILITY.md](./CYPHER_COMPATIBILITY.md)** — OpenCypher coverage against the TCK, with the pass rate quoted beside its coverage.
+- **[CYPHER-COMPATIBILITY.md](./CYPHER-COMPATIBILITY.md)** — OpenCypher coverage against the TCK, with the pass rate quoted beside its coverage.
 - **[FULL-TEXT-SEARCH.md](./FULL-TEXT-SEARCH.md)** — the full-text index and how it is queried.
 - **[INDEX-CONTRACT.md](./INDEX-CONTRACT.md)** — the six clauses every index structure implements (build, maintain under MVCC, cost, plan, persist, snapshot), and how to add one.
 - **[GDS-COMPATIBILITY.md](./GDS-COMPATIBILITY.md)** — which `gds.*` names resolve here, and which deliberately do not.
@@ -43,7 +43,7 @@ eight of eighteen documents (#1450).
 
 ### Guarantees and behaviour under stress
 
-- **[ACID_GUARANTEES.md](./ACID_GUARANTEES.md)** — the transaction model: MVCC, the logical WAL, what durability `SAMYAMA_FSYNC` does and does not buy, and why there is no Raft replication to rely on.
+- **[ACID-GUARANTEES.md](./ACID-GUARANTEES.md)** — the transaction model: MVCC, the logical WAL, what durability `SAMYAMA_FSYNC` does and does not buy, and why there is no Raft replication to rely on.
 - **[FAILURE-MODES.md](./FAILURE-MODES.md)** — how the engine behaves when things go wrong.
 - **[BI-CONNECTIVITY.md](./BI-CONNECTIVITY.md)** — connecting BI tools.
 
@@ -55,12 +55,12 @@ eight of eighteen documents (#1450).
 
 ### Interfaces and operations
 
-- **[SDK_API_CLI_ARCHITECTURE.md](./SDK_API_CLI_ARCHITECTURE.md)** — how the Python / TypeScript SDKs, the CLI, and the HTTP / RESP surfaces connect.
+- **[SDK-API-CLI-ARCHITECTURE.md](./SDK-API-CLI-ARCHITECTURE.md)** — how the Python / TypeScript SDKs, the CLI, and the HTTP / RESP surfaces connect.
 - **[AGENT-CONTRACT.md](./AGENT-CONTRACT.md)** — the versioned MCP tool contract: schemas, error format, pagination, result envelopes, idempotency.
 - **[API-PARITY.md](./API-PARITY.md)** — generated capability-by-surface matrix (HTTP, RESP, Rust / Python / TypeScript SDKs, MCP); regenerate with `cargo run --release --example feature_matrix`.
 - **[CONSTRAINED-CLIENTS.md](./CONSTRAINED-CLIENTS.md)** — writing to an Edge node from an ESP32 or Arduino-class device over RESP, and why that surface has no authentication.
 - **[BENCHMARKS.md](./BENCHMARKS.md)** — LDBC SNB Interactive results (SF1 and SF10).
-- **[SUPPLY_CHAIN_GUARDIAN_DEMO.md](./SUPPLY_CHAIN_GUARDIAN_DEMO.md)** — walkthrough of `supply_chain_demo`: disruption analysis, PageRank, Jaya rerouting and vector search on built-in data, and which of its results are artefacts of that data.
+- **[SUPPLY-CHAIN-GUARDIAN-DEMO.md](./SUPPLY-CHAIN-GUARDIAN-DEMO.md)** — walkthrough of `supply_chain_demo`: disruption analysis, PageRank, Jaya rerouting and vector search on built-in data, and which of its results are artefacts of that data.
 
 ### Sub-directories
 
