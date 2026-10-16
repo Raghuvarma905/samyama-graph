@@ -132,7 +132,8 @@ pub fn spatial_region(var: &str, pred: &Expression, store: &GraphStore) -> Optio
             };
             let (cx, cy, geographic) = constant_point(centre)?;
             let r = constant_number(bound)?;
-            if !(r >= 0.0) {
+            // NaN or negative: no region to search.
+            if r.is_nan() || r < 0.0 {
                 return None;
             }
             let rect = if geographic {
@@ -249,15 +250,9 @@ impl PhysicalOperator for PointNearestOperator {
             let fetch = if geographic { self.k.saturating_mul(4).max(self.k) } else { self.k };
             let found = store
                 .point_index
-                .with(&self.label, &self.property, |i| {
-                    let cands = i.nearest(cx, cy, fetch);
-                    // Planar distance is what the tree orders by; a geographic
-                    // index reports metres, from the stored coordinates.
-                    cands
-                        .into_iter()
-                        .map(|(id, d)| (id, d))
-                        .collect::<Vec<_>>()
-                })
+                // Planar distance is what the tree orders by; a geographic
+                // index reports metres, from the stored coordinates, below.
+                .with(&self.label, &self.property, |i| i.nearest(cx, cy, fetch))
                 .ok_or_else(|| {
                     ExecutionError::RuntimeError(format!(
                         "no point index on :{}({}). CREATE POINT INDEX FOR (n:{}) ON (n.{}) creates one.",
