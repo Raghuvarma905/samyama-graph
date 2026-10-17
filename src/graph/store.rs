@@ -1446,6 +1446,39 @@ impl GraphStore {
     /// Heap only. The `Arc`-held index managers report their own sizes if they can;
     /// what is not attributed here is named in `unattributed_note` rather than
     /// silently folded into another line.
+    /// Resident bytes of every index the store holds, one row each, largest
+    /// first (COST-06, NDS-14).
+    ///
+    /// All five kinds: property indexes and unique constraints, full-text,
+    /// vector (with its HNSW graph), hierarchy and point. The property kinds alone
+    /// were reported before, so an index overhead figure left out the two
+    /// structures most likely to be the largest.
+    pub fn index_memory(&self) -> Vec<crate::index::IndexMemory> {
+        let mut out = self.property_index.index_memory();
+        out.extend(self.fulltext.index_memory());
+        out.extend(self.vector_index.index_memory());
+        out.extend(self.hierarchy_index.list().into_iter().map(|h| crate::index::IndexMemory {
+            kind: "hierarchy",
+            entries: h.nodes,
+            label: String::new(),
+            property: h.edge_types.join("|"),
+            name: Some(h.name),
+            bytes: h.bytes,
+        }));
+        out.extend(self.point_index.index_memory().into_iter().map(
+            |(name, label, property, bytes, entries)| crate::index::IndexMemory {
+                kind: "point",
+                entries,
+                label,
+                property,
+                name: Some(name),
+                bytes,
+            },
+        ));
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.label.cmp(&b.label)));
+        out
+    }
+
     pub fn memory_report(&self) -> MemoryReport {
         let node_versions: usize = self
             .nodes
@@ -1967,6 +2000,20 @@ NodeDeleted { .. } => {
             for (key, value) in &indexed_properties {
                 for label in &labels {
                     self.point_index.on_property_set(label.as_str(), key, node_id, Some(value));
+                }
+            }
+        }
+        // Full-text, which neither branch below reaches: it is fed on the
+        // property-set path only, so a node created with its properties
+        // through this call was never findable by a full-text search on a
+        // store that already had the index. Found while counting the index's
+        // bytes (#1673), where 500 such documents indexed as zero.
+        if !self.fulltext.is_empty() {
+            for (key, value) in &indexed_properties {
+                if let PropertyValue::String(text) = value {
+                    for label in &labels {
+                        self.fulltext.on_property_set(label.as_str(), key, node_id, text);
+                    }
                 }
             }
         }

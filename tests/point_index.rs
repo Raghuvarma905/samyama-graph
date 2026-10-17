@@ -177,3 +177,17 @@ fn nearest_without_an_index_is_an_error() {
     assert!(err.contains("no point index on :Site(loc)"), "{err}");
     let _ = Label::new("unused");
 }
+
+#[test]
+fn index_memory_reports_each_point_index() {
+    // The index memory report covers every index kind (#1673); the point
+    // index was added after it and has to appear there too.
+    let s = store(true);
+    let points: Vec<_> = s.index_memory().into_iter().filter(|m| m.kind == "point").collect();
+    assert_eq!(points.len(), 2, "{points:?}");
+    let site = points.iter().find(|m| m.name.as_deref() == Some("site_loc")).expect("site_loc");
+    assert_eq!((site.label.as_str(), site.property.as_str(), site.entries), ("Site", "loc", 900));
+    assert!(site.bytes > 0);
+    let city = points.iter().find(|m| m.label == "City").expect("City index");
+    assert_eq!((city.property.as_str(), city.entries), ("at", 200));
+}
