@@ -830,6 +830,10 @@ pub struct QueryPlanner {
     /// them would touch far more code than the decision is worth; an atomic
     /// keeps `&self` and stays `Sync` (#710).
     trail_enumeration: std::sync::atomic::AtomicBool,
+    /// The query's `USING` hints and which of them a scan choice has honoured
+    /// (#1675). Set per `plan` call, like `trail_enumeration`, because the scan
+    /// choices sit in builders that never see the `Query`.
+    hints: std::sync::Mutex<(Vec<PlanHint>, HashSet<String>)>,
 }
 
 /// Project a `RETURN` list, building an aggregation when any item aggregates.
@@ -887,6 +891,7 @@ impl QueryPlanner {
             _optimize: true,
             config: PlannerConfig::default(),
             trail_enumeration: std::sync::atomic::AtomicBool::new(false),
+            hints: std::sync::Mutex::new((Vec::new(), HashSet::new())),
         }
     }
 
@@ -896,6 +901,7 @@ impl QueryPlanner {
             _optimize: true,
             config,
             trail_enumeration: std::sync::atomic::AtomicBool::new(false),
+            hints: std::sync::Mutex::new((Vec::new(), HashSet::new())),
         }
     }
 
@@ -1249,6 +1255,158 @@ impl QueryPlanner {
     }
 
     pub fn plan(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
+        if query.hints.is_empty() {
+            self.hints.lock().unwrap().0.clear();
+            return self.plan_unhinted(query, store);
+        }
+        self.check_hints(query, store)?;
+        *self.hints.lock().unwrap() = (query.hints.clone(), HashSet::new());
+        let plan = self.plan_unhinted(query, store);
+        let (hints, honoured) = std::mem::take(&mut *self.hints.lock().unwrap());
+        let plan = plan?;
+        // Mandatory: a hint no scan choice took is an error, as in Neo4j. A
+        // hint quietly dropped reads exactly like one that worked.
+        for h in &hints {
+            if let PlanHint::Index { variable, .. } | PlanHint::Scan { variable, .. } = h {
+                if !honoured.contains(variable) {
+                    return Err(ExecutionError::PlanningError(format!(
+                        "cannot honour the planner hint on `{variable}`: it is not the start \
+                         of a pattern this planner chooses a scan for (it may be bound by an \
+                         earlier clause, or sit inside a shortestPath)"
+                    )));
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// The hints are well-formed against this query and store: each names a
+    /// variable some MATCH binds with that label, and an INDEX hint names an
+    /// index that exists. Checked before planning so the error names the hint.
+    fn check_hints(&self, query: &Query, store: &GraphStore) -> ExecutionResult<()> {
+        let mut bound: HashMap<String, Vec<Label>> = HashMap::new();
+        let clauses = query.match_clauses.iter().chain(query.clauses.iter().filter_map(|c| match c {
+            crate::query::ast::Clause::Match(m) => Some(m),
+            _ => None,
+        }));
+        for mc in clauses {
+            for path in &mc.pattern.paths {
+                let nodes = std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node));
+                for n in nodes {
+                    if let Some(v) = &n.variable {
+                        bound.entry(v.clone()).or_default().extend(n.labels.iter().cloned());
+                    }
+                }
+            }
+        }
+        for h in &query.hints {
+            let (vars, label): (Vec<&String>, Option<&Label>) = match h {
+                PlanHint::Index { variable, label, .. } | PlanHint::Scan { variable, label } => {
+                    (vec![variable], Some(label))
+                }
+                PlanHint::Join { variables } => (variables.iter().collect(), None),
+            };
+            for v in vars {
+                let Some(labels) = bound.get(v) else {
+                    return Err(ExecutionError::PlanningError(format!(
+                        "the planner hint names `{v}`, which no MATCH pattern binds"
+                    )));
+                };
+                if let Some(l) = label {
+                    if !labels.contains(l) {
+                        return Err(ExecutionError::PlanningError(format!(
+                            "the planner hint names `{v}:{}`, but the pattern does not give `{v}` that label",
+                            l.as_str()
+                        )));
+                    }
+                }
+            }
+            if let PlanHint::Index { label, properties, .. } = h {
+                for p in properties {
+                    if !store.property_index.has_index(label, p) {
+                        return Err(ExecutionError::PlanningError(format!(
+                            "USING INDEX names :{}({p}), and there is no such index. \
+                             CREATE INDEX ON :{}({p}) creates it.",
+                            label.as_str(),
+                            label.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The hinted position in a path to start from, if a hint names one of its
+    /// nodes. `None` leaves the cost-based choice alone.
+    fn hinted_anchor(&self, nodes: &[PathNodeRef], anchor_eligible: bool) -> ExecutionResult<Option<usize>> {
+        let g = self.hints.lock().unwrap();
+        for h in &g.0 {
+            if let PlanHint::Index { variable, .. } | PlanHint::Scan { variable, .. } = h {
+                if let Some(i) = nodes.iter().position(|n| &n.var == variable) {
+                    if i > 0 && !anchor_eligible {
+                        return Err(ExecutionError::PlanningError(format!(
+                            "cannot start from `{variable}` as the hint asks: a named path or \
+                             shortestPath is walked from its first node"
+                        )));
+                    }
+                    return Ok(Some(i));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The scan a hint fixes for `var`, or `None` when no hint names it.
+    ///
+    /// `USING SCAN` is a label scan, bypassing `id()` and every index.
+    /// `USING INDEX` is an index scan over the hinted property, taken from a
+    /// predicate the index can answer; with none, the hint cannot be honoured
+    /// and that is an error. The predicate stays in the filter above, so the
+    /// forced scan can only narrow, never change, the answer.
+    fn hinted_scan(
+        &self,
+        var: &str,
+        labels: &[Label],
+        preds: &[Expression],
+        store: &GraphStore,
+    ) -> ExecutionResult<Option<OperatorBox>> {
+        let mut g = self.hints.lock().unwrap();
+        let hint = g.0.iter().find(|h| matches!(h,
+            PlanHint::Index { variable, .. } | PlanHint::Scan { variable, .. } if variable == var)).cloned();
+        let op: OperatorBox = match hint {
+            None => return Ok(None),
+            Some(PlanHint::Scan { label, .. }) => {
+                let mut ls = labels.to_vec();
+                if !ls.contains(&label) {
+                    ls.push(label);
+                }
+                Box::new(NodeScanOperator::new(var.to_string(), ls))
+            }
+            Some(PlanHint::Index { label, properties, .. }) => {
+                let found = preds.iter().find_map(|p| {
+                    let (_, l, prop, op, val) =
+                        find_index_predicate(var, std::slice::from_ref(&label), std::slice::from_ref(p), store)?;
+                    properties.contains(&prop).then_some((l, prop, op, val))
+                });
+                let Some((l, prop, op, val)) = found else {
+                    return Err(ExecutionError::PlanningError(format!(
+                        "USING INDEX {var}:{}({}) needs a predicate on {var}.{} the index can \
+                         answer -- an equality or a range in WHERE or in the pattern",
+                        label.as_str(),
+                        properties.join(", "),
+                        properties.first().map(String::as_str).unwrap_or("?"),
+                    )));
+                };
+                Box::new(IndexScanOperator::new(var.to_string(), l, prop, op, val))
+            }
+            Some(PlanHint::Join { .. }) => return Ok(None),
+        };
+        g.1.insert(var.to_string());
+        Ok(Some(op))
+    }
+
+    fn plan_unhinted(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
         // Decide once, here, whether a var-length walk must enumerate trails.
         // See `multiplicity_is_observable`: the BFS answers `b, c` where
         // openCypher answers `b, b, c, c`, and enumerating is only affordable
@@ -4280,15 +4438,18 @@ impl QueryPlanner {
             // reverses those segments, so the restriction is no longer needed.
             let anchor_eligible = path.path_variable.is_none()
                 && !matches!(path.path_type, PathType::Shortest | PathType::AllShortest);
-            let anchor_idx = if anchor_eligible {
-                choose_anchor_index(path, &path_nodes, &per_path_preds[path_idx], store)
-            } else {
-                0
+            let anchor_idx = match self.hinted_anchor(&path_nodes, anchor_eligible)? {
+                // A `USING` hint names where to start (#1675).
+                Some(i) => i,
+                None if anchor_eligible => {
+                    choose_anchor_index(path, &path_nodes, &per_path_preds[path_idx], store)
+                }
+                None => 0,
             };
 
             let (mut path_operator, deferred_predicates): (OperatorBox, Vec<Expression>) =
                 if anchor_eligible && anchor_idx > 0 {
-                    self.build_path_from_anchor(path, &path_nodes, anchor_idx, &per_path_preds[path_idx], store)
+                    self.build_path_from_anchor(path, &path_nodes, anchor_idx, &per_path_preds[path_idx], store)?
                 } else {
             // Merge inline start node properties into predicates for index selection.
             // Without this, {prop: val} in MATCH patterns falls back to NodeScan + Filter
@@ -4309,7 +4470,10 @@ impl QueryPlanner {
             // Optimization: Check for index usage (using this path's assigned predicates).
             // Recognizes both `n.prop OP literal` and `literal OP n.prop` operand orders.
             let mut remaining_predicates: Vec<Expression> = per_path_preds[path_idx].clone();
-            let mut path_operator: OperatorBox = if let Some((idx, ids)) =
+            let hinted = self.hinted_scan(&start_var, &path.start.labels, &remaining_predicates, store)?;
+            let mut path_operator: OperatorBox = if let Some(op) = hinted {
+                op
+            } else if let Some((idx, ids)) =
                 find_id_predicate(&start_var, &remaining_predicates)
             {
                 // `id()` before any index: it is unique by construction, so
@@ -5250,7 +5414,7 @@ impl QueryPlanner {
         anchor_idx: usize,
         path_preds: &[Expression],
         store: &GraphStore,
-    ) -> (OperatorBox, Vec<Expression>) {
+    ) -> ExecutionResult<(OperatorBox, Vec<Expression>)> {
         let anchor = &nodes[anchor_idx];
         let anchor_var = anchor.var.clone();
 
@@ -5294,7 +5458,10 @@ impl QueryPlanner {
 
         // `id()` first: it is unique by construction, so it beats any index
         // and needs no statistics to know that (#538).
-        let mut path_operator: OperatorBox = if let Some((idx, ids)) =
+        let hinted = self.hinted_scan(&anchor_var, &anchor.labels, &candidates, store)?;
+        let mut path_operator: OperatorBox = if let Some(op) = hinted {
+            op
+        } else if let Some((idx, ids)) =
             find_id_predicate(&anchor_var, &candidates)
         {
             candidates.remove(idx);
@@ -5735,7 +5902,7 @@ impl QueryPlanner {
             current_var = target.var.clone();
         }
 
-        (path_operator, deferred_predicates)
+        Ok((path_operator, deferred_predicates))
     }
 
     /// Build a filter expression from node properties.
@@ -10669,6 +10836,7 @@ mod tests {
             show_constraints: false,
             profile: false,
             analyze: false,
+            hints: Vec::new(),
             params: std::collections::HashMap::new(),
             foreach_clause: None,
             unwind_clause: None,
