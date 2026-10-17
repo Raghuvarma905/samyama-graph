@@ -50,11 +50,13 @@ Treat the report as a ceiling and run your queries before you count them.
 | `GRAPH.EXPLAIN`, `GRAPH.PROFILE` | commands | `unknown command`; write `EXPLAIN …` or `PROFILE …` **inside** `GRAPH.QUERY` instead, which returns the plan as a `plan` column |
 | `GRAPH.CONFIG`, `GRAPH.CONSTRAINT`, `GRAPH.SLOWLOG`, `GRAPH.COPY`, `GRAPH.INFO`, `GRAPH.MEMORY` | commands | `unknown command`. Constraints are Cypher here: `CREATE CONSTRAINT … REQUIRE p.name IS UNIQUE` |
 | `GRAPH.LIST` | every graph key | `["default"]` |
-| `AUTH` | Redis `AUTH <password>` | `AUTH <user> <secret>`, two arguments, once `--auth-file` is set; see [DATA-HANDLING.md](DATA-HANDLING.md) |
+| `AUTH` | Redis `AUTH <password>` or `AUTH <user> <password>` | only `AUTH <user> <secret>`, once `--auth-file` is set; the one-argument form is refused. See [DATA-HANDLING.md](DATA-HANDLING.md) |
 | Several statements as one unit | Redis `MULTI` … `EXEC` queues them | `MULTI` is an unknown command; use `GRAPH.BEGIN`, then `GRAPH.COMMIT` or `GRAPH.ROLLBACK` on the same connection. See [ACID-GUARANTEES.md](ACID-GUARANTEES.md) |
 
-**Client libraries.** FalkorDB's client libraries send `--compact` and parse
-the three-part reply, so they do not work against Samyama unchanged. Use a plain
+**Client libraries.** FalkorDB's Python client appends `--compact` to every
+query (`falkordb` 1.8.0, `graph.py`) and parses the three-part reply, so it
+does not work against Samyama unchanged. Assume the same of FalkorDB's other
+clients until you have checked them. Use a plain
 Redis client and send `GRAPH.QUERY default <query> [name value …]` yourself, or
 use the Python, TypeScript or Rust SDK over HTTP (see the [README](../README.md#clients)).
 
