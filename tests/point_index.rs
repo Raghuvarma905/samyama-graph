@@ -191,3 +191,88 @@ fn index_memory_reports_each_point_index() {
     let city = points.iter().find(|m| m.label == "City").expect("City index");
     assert_eq!((city.property.as_str(), city.entries), ("at", 200));
 }
+
+/// Rows just inside a geographic radius, on every bearing, at the equator and
+/// at 60 degrees. Each probe is placed from the constants `point.distance`
+/// measures with, so the test keeps checking that the index box and the
+/// predicate agree, not one latitude. Due north of the centre is the band a
+/// box sized at 111,320 m per degree clipped: those rows were in the scan's
+/// answer and missing from the index's (review of #1886).
+#[test]
+fn rows_just_inside_a_geographic_radius_are_found_through_the_index() {
+    use samyama::index::point::{haversine_m, EARTH_RADIUS_M, METRES_PER_DEGREE};
+    let r = 100_000.0;
+    let mut stores = [GraphStore::new(), GraphStore::new()];
+    let mut expected = Vec::new();
+    let mut id = 0i64;
+    for (clon, clat) in [(0.0f64, 0.0f64), (25.0, 60.0)] {
+        for step in 0..72 {
+            let bearing = (step as f64 * 5.0).to_radians();
+            let d = r * 0.9995 / EARTH_RADIUS_M;
+            let (p1, l1) = (clat.to_radians(), clon.to_radians());
+            let p2 = (p1.sin() * d.cos() + p1.cos() * d.sin() * bearing.cos()).asin();
+            let l2 = l1 + (bearing.sin() * d.sin() * p1.cos()).atan2(d.cos() - p1.sin() * p2.sin());
+            let (lon, lat) = (l2.to_degrees(), p2.to_degrees());
+            assert!(haversine_m((clon, clat), (lon, lat)) < r);
+            for s in stores.iter_mut() {
+                run(s, &format!("CREATE (:City {{id: {id}, at: point({{latitude: {lat}, longitude: {lon}}})}})"));
+            }
+            if clon == 0.0 {
+                expected.push(id);
+            }
+            id += 1;
+        }
+    }
+    // Due north at the equator is in the band the old constant clipped.
+    assert!(r * 0.9995 / METRES_PER_DEGREE > r / 111_320.0);
+    run(&mut stores[1], "CREATE POINT INDEX ON :City(at)");
+    let q = format!("MATCH (n:City) WHERE point.distance(n.at, point({{latitude: 0, longitude: 0}})) < {r} RETURN n.id AS id");
+    assert!(plan(&stores[1], &q).contains("PointIndexScan"), "{}", plan(&stores[1], &q));
+    assert_eq!(ids(&stores[0], &q), expected);
+    assert_eq!(ids(&stores[1], &q), expected);
+    let q = format!("MATCH (n:City) WHERE point.distance(n.at, point({{latitude: 60, longitude: 25}})) < {r} RETURN n.id AS id");
+    assert_eq!(ids(&stores[1], &q), ids(&stores[0], &q));
+    assert_eq!(ids(&stores[1], &q).len(), 72);
+
+    // Across the antimeridian: rows on both sides of 180 are inside r.
+    let mut s = [GraphStore::new(), GraphStore::new()];
+    for (k, lon) in [179.5f64, 179.9, -179.9, -179.5, 178.0, -178.0].into_iter().enumerate() {
+        for st in s.iter_mut() {
+            run(st, &format!("CREATE (:City {{id: {k}, at: point({{latitude: 0, longitude: {lon}}})}})"));
+        }
+    }
+    run(&mut s[1], "CREATE POINT INDEX ON :City(at)");
+    let q = "MATCH (n:City) WHERE point.distance(n.at, point({latitude: 0, longitude: 179.9})) < 100000 RETURN n.id AS id";
+    assert_eq!(ids(&s[0], q), vec![0, 1, 2, 3]);
+    assert_eq!(ids(&s[1], q), vec![0, 1, 2, 3]);
+}
+
+/// `db.index.point.nearest` on a geographic index is the k nearest by the
+/// distance `point.distance` reports, even where rows are spread east-west at
+/// high latitude and an order by degrees would pick the wrong ones.
+#[test]
+fn geographic_nearest_matches_a_sort_by_point_distance() {
+    let mut s = GraphStore::new();
+    for k in 0..400i64 {
+        let lon = 10.0 + ((k * 37) % 400) as f64 * 0.05 - 10.0;
+        let lat = 79.0 + ((k * 91) % 400) as f64 * 0.005;
+        run(&mut s, &format!("CREATE (:Hut {{id: {k}, at: point({{latitude: {lat}, longitude: {lon}}})}})"));
+    }
+    run(&mut s, "CREATE POINT INDEX ON :Hut(at)");
+    let want = |k: usize| {
+        let q = format!(
+            "MATCH (n:Hut) WITH n, point.distance(n.at, point({{latitude: 80, longitude: 10}})) AS d \
+             RETURN n.id AS id ORDER BY d, id LIMIT {k}"
+        );
+        let mut v = ids(&s, &q);
+        v.sort();
+        v
+    };
+    for k in [1usize, 7, 50] {
+        let q = format!(
+            "CALL db.index.point.nearest('Hut', 'at', point({{latitude: 80, longitude: 10}}), {k}) \
+             YIELD node RETURN node.id AS id"
+        );
+        assert_eq!(ids(&s, &q), want(k), "k={k}");
+    }
+}

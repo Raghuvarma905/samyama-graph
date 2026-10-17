@@ -213,11 +213,9 @@ impl PhysicalOperator for PointIndexScanOperator {
 
 /// `CALL db.index.point.nearest(label, property, point, k) YIELD node, distance`.
 ///
-/// Nearest by the index's planar order, then re-ranked by the distance
-/// `point.distance` reports -- metres for a geographic point. For a geographic
-/// index the planar candidates are widened to `4k` first, because degrees of
-/// longitude shrink with latitude and the planar `k` nearest need not be the
-/// great-circle `k` nearest.
+/// Nearest by the distance `point.distance` reports: planar for a cartesian
+/// index, great-circle metres for a geographic one. Both are exact k-NN; see
+/// `PointIndex::nearest_geographic` for how the descent bounds metres.
 pub struct PointNearestOperator {
     label: String,
     property: String,
@@ -234,45 +232,27 @@ impl PointNearestOperator {
     }
 }
 
-fn haversine(a: (f64, f64), b: (f64, f64)) -> f64 {
-    const EARTH_RADIUS_M: f64 = 6_371_008.8;
-    let (lon1, lat1, lon2, lat2) = (a.0.to_radians(), a.1.to_radians(), b.0.to_radians(), b.1.to_radians());
-    let h = ((lat2 - lat1) / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * ((lon2 - lon1) / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
-}
-
 impl PhysicalOperator for PointNearestOperator {
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if self.results.is_none() {
             let (cx, cy, geographic) = point_coords(&self.centre).ok_or_else(|| {
                 ExecutionError::TypeError("db.index.point.nearest: the third argument must be a point".to_string())
             })?;
-            let fetch = if geographic { self.k.saturating_mul(4).max(self.k) } else { self.k };
-            let found = store
+            let ranked = store
                 .point_index
-                // Planar distance is what the tree orders by; a geographic
-                // index reports metres, from the stored coordinates, below.
-                .with(&self.label, &self.property, |i| i.nearest(cx, cy, fetch))
+                .with(&self.label, &self.property, |i| {
+                    if geographic {
+                        i.nearest_geographic(cx, cy, self.k)
+                    } else {
+                        i.nearest(cx, cy, self.k)
+                    }
+                })
                 .ok_or_else(|| {
                     ExecutionError::RuntimeError(format!(
                         "no point index on :{}({}). CREATE POINT INDEX FOR (n:{}) ON (n.{}) creates one.",
                         self.label, self.property, self.label, self.property
                     ))
                 })?;
-            let mut ranked: Vec<(NodeId, f64)> = if geographic {
-                found
-                    .into_iter()
-                    .filter_map(|(id, _)| {
-                        let v = store.node_properties_merged(id).get(&self.property).cloned()?;
-                        let (x, y, _) = point_coords(&v)?;
-                        Some((id, haversine((cx, cy), (x, y))))
-                    })
-                    .collect()
-            } else {
-                found
-            };
-            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            ranked.truncate(self.k);
             self.results = Some(ranked.into_iter());
         }
         Ok(self.results.as_mut().unwrap().next().map(|(id, d)| {

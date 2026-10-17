@@ -12,8 +12,10 @@
 //! - **within a box** -- every point inside `[lo, hi]`, for
 //!   `point.withinBBox(n.p, lo, hi)` and as the candidate set of
 //!   `point.distance(n.p, c) < r` (a distance bound is a box around `c`);
-//! - **nearest k** -- best-first descent ordered by the box's distance to the
-//!   query point, for `db.index.point.nearest`.
+//! - **nearest k** -- best-first descent ordered by a lower bound on the
+//!   distance from the query point to each box, for `db.index.point.nearest`.
+//!   Exact for both kinds: a geographic index bounds great-circle distance,
+//!   not distance in degrees.
 //!
 //! Candidates are a superset: the box around a geographic distance bound is
 //! conservative, and the predicate that asked stays in the filter above the
@@ -29,6 +31,25 @@ use std::collections::{BinaryHeap, HashMap};
 
 /// Entries per node before it splits.
 const MAX_ENTRIES: usize = 16;
+
+/// Mean earth radius, metres: the sphere `point.distance` measures on. The
+/// index sizes its boxes and bounds its k-NN from this same constant, so the
+/// candidate set and the predicate above it cannot disagree about where a
+/// radius reaches.
+pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
+
+/// Metres per degree of latitude on that sphere (111,195.08 m).
+pub const METRES_PER_DEGREE: f64 = std::f64::consts::TAU * EARTH_RADIUS_M / 360.0;
+
+/// Great-circle distance in metres between two `(longitude, latitude)` points,
+/// by haversine. The one `point.distance` reports for geographic points.
+pub fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (lat1, lat2) = (a.1.to_radians(), b.1.to_radians());
+    let dlat = (b.1 - a.1).to_radians();
+    let dlon = (b.0 - a.0).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * h.min(1.0).sqrt().asin()
+}
 
 /// An axis-aligned box. A point is a box with no area.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,11 +86,41 @@ impl Rect {
         self.min_x <= x && x <= self.max_x && self.min_y <= y && y <= self.max_y
     }
 
-    /// Squared planar distance from `(x, y)` to the nearest point of the box.
-    fn min_dist2(&self, x: f64, y: f64) -> f64 {
+    /// Planar distance from `(x, y)` to the nearest point of the box.
+    fn min_dist(&self, x: f64, y: f64) -> f64 {
         let dx = if x < self.min_x { self.min_x - x } else if x > self.max_x { x - self.max_x } else { 0.0 };
         let dy = if y < self.min_y { self.min_y - y } else if y > self.max_y { y - self.max_y } else { 0.0 };
-        dx * dx + dy * dy
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// A lower bound, in metres, on the great-circle distance from
+    /// `(lon, lat)` to any point of the box, which holds `(longitude,
+    /// latitude)`.
+    ///
+    /// Haversine is `hav(d) = hav(dlat) + cos(lat1) cos(lat2) hav(dlon)`, and
+    /// each term is bounded below on its own: `dlat` and `dlon` by the gap
+    /// between the point and the box on that axis (longitude wrapping at the
+    /// antimeridian), and `cos(lat2)` by its least value over the box's
+    /// latitudes, which is at one of the two edges. Scaling degrees of
+    /// longitude by the cosine of one latitude would not be a bound: the
+    /// parallel is longer than the great circle between two points on it.
+    fn min_haversine(&self, lon: f64, lat: f64) -> f64 {
+        let dlat = if lat < self.min_y { self.min_y - lat } else if lat > self.max_y { lat - self.max_y } else { 0.0 };
+        let dlon = if self.min_x <= lon && lon <= self.max_x {
+            0.0
+        } else {
+            let wrap = |d: f64| {
+                let d = d.abs() % 360.0;
+                d.min(360.0 - d)
+            };
+            wrap(lon - self.min_x).min(wrap(lon - self.max_x))
+        };
+        let cos_box = self.min_y.to_radians().cos().min(self.max_y.to_radians().cos()).max(0.0);
+        let h = (dlat.to_radians() / 2.0).sin().powi(2)
+            + lat.to_radians().cos().max(0.0) * cos_box * (dlon.to_radians() / 2.0).sin().powi(2);
+        // Rounding must not lift a bound above the exact distance of a point
+        // inside the box, or the descent could return a farther one first.
+        2.0 * EARTH_RADIUS_M * h.min(1.0).sqrt().asin() * (1.0 - 1e-12)
     }
 }
 
@@ -254,9 +305,25 @@ impl PointIndex {
     }
 
     /// The `k` nodes nearest `(x, y)` by planar distance in the index's own
-    /// coordinates, nearest first. For a geographic index the caller re-ranks
-    /// by great-circle distance; see `nearest_geographic`.
+    /// coordinates, nearest first, with that distance. For a cartesian index.
     pub fn nearest(&self, x: f64, y: f64, k: usize) -> Vec<(NodeId, f64)> {
+        self.nearest_by(k, |r| r.min_dist(x, y), |px, py| ((px - x).powi(2) + (py - y).powi(2)).sqrt())
+    }
+
+    /// The `k` nodes nearest `(lon, lat)` by great-circle distance, nearest
+    /// first, in metres -- the distance `point.distance` reports. For a
+    /// geographic index. Exact, not a planar order re-ranked: the descent is
+    /// ordered by a lower bound on metres (`Rect::min_haversine`), so a point
+    /// east or west of the centre at high latitude is reached in its turn.
+    pub fn nearest_geographic(&self, lon: f64, lat: f64, k: usize) -> Vec<(NodeId, f64)> {
+        self.nearest_by(k, |r| r.min_haversine(lon, lat), |px, py| haversine_m((lon, lat), (px, py)))
+    }
+
+    /// Best-first descent: a subtree is keyed by `bound`, a lower bound on the
+    /// distance to anything in it, and an entry by its exact `distance`. An
+    /// entry popped from the heap is therefore no farther than anything still
+    /// in it, so the first `k` popped are the `k` nearest.
+    fn nearest_by(&self, k: usize, bound: impl Fn(&Rect) -> f64, distance: impl Fn(f64, f64) -> f64) -> Vec<(NodeId, f64)> {
         struct Item<'a>(f64, Option<NodeId>, Option<&'a Node>);
         impl PartialEq for Item<'_> {
             fn eq(&self, o: &Self) -> bool {
@@ -283,15 +350,15 @@ impl PointIndex {
                 break;
             }
             match (id, node) {
-                (Some(id), _) => out.push((id, d.sqrt())),
+                (Some(id), _) => out.push((id, d)),
                 (None, Some(Node::Leaf(e))) => {
                     for (r, n) in e {
-                        heap.push(Item(r.min_dist2(x, y), Some(*n), None));
+                        heap.push(Item(distance(r.min_x, r.min_y), Some(*n), None));
                     }
                 }
                 (None, Some(Node::Inner(c))) => {
                     for (r, n) in c {
-                        heap.push(Item(r.min_dist2(x, y), None, Some(n.as_ref())));
+                        heap.push(Item(bound(r), None, Some(n.as_ref())));
                     }
                 }
                 (None, None) => {}
@@ -316,13 +383,19 @@ impl PointIndex {
     }
 }
 
-/// A box that contains every point within `metres` of `(lon, lat)`.
+/// A box that contains every point within `metres` of `(lon, lat)`, measured
+/// as `point.distance` measures it.
 ///
-/// Conservative: degrees of longitude shrink towards the poles, so the box is
-/// sized at the latitude farther from the equator, and a box reaching a pole
-/// spans every longitude. The distance predicate filters the candidates.
+/// Conservative: degrees are converted on the same sphere `haversine_m` uses
+/// and then widened by a millionth, so rounding at the boundary cannot clip a
+/// point the predicate admits; degrees of longitude shrink towards the poles,
+/// so the box is sized at the latitude farther from the equator; and a box
+/// reaching a pole or crossing the antimeridian spans every longitude, since
+/// the tree holds longitudes in [-180, 180] and a box past either end would
+/// miss the rows just across the line. The distance predicate filters the
+/// candidates, so widening costs only candidates it then drops.
 pub fn geographic_box(lon: f64, lat: f64, metres: f64) -> Rect {
-    const METRES_PER_DEGREE: f64 = 111_320.0;
+    let metres = metres * (1.0 + 1e-6);
     let dlat = metres / METRES_PER_DEGREE;
     let (lo_lat, hi_lat) = (lat - dlat, lat + dlat);
     if lo_lat <= -90.0 || hi_lat >= 90.0 {
@@ -330,7 +403,7 @@ pub fn geographic_box(lon: f64, lat: f64, metres: f64) -> Rect {
     }
     let worst = lo_lat.abs().max(hi_lat.abs()).to_radians().cos();
     let dlon = metres / (METRES_PER_DEGREE * worst);
-    if dlon >= 180.0 {
+    if dlon >= 180.0 || lon - dlon < -180.0 || lon + dlon > 180.0 {
         return Rect { min_x: -180.0, min_y: lo_lat, max_x: 180.0, max_y: hi_lat };
     }
     Rect { min_x: lon - dlon, min_y: lo_lat, max_x: lon + dlon, max_y: hi_lat }
@@ -485,6 +558,80 @@ mod tests {
         assert!(idx.within(&area).is_empty());
     }
 
+    /// A tiny deterministic generator, so the property tests below need no
+    /// seed plumbing and fail the same way every time.
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*state >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// The point `metres` from `(lon, lat)` on `bearing` (radians), on the
+    /// sphere `haversine_m` measures on.
+    fn destination(lon: f64, lat: f64, bearing: f64, metres: f64) -> (f64, f64) {
+        let d = metres / EARTH_RADIUS_M;
+        let (p1, l1) = (lat.to_radians(), lon.to_radians());
+        let p2 = (p1.sin() * d.cos() + p1.cos() * d.sin() * bearing.cos()).asin();
+        let l2 = l1 + (bearing.sin() * d.sin() * p1.cos()).atan2(d.cos() - p1.sin() * p2.sin());
+        (l2.to_degrees(), p2.to_degrees())
+    }
+
+    #[test]
+    fn a_geographic_box_holds_every_point_the_distance_admits() {
+        // The review's counterexample: due north of (0, 0) at r = 100 km, a
+        // point at 99.94 km fell outside a box sized at 111,320 m per degree.
+        let r = 100_000.0;
+        let probe_lat = r / METRES_PER_DEGREE * (1.0 - 1e-4);
+        assert!(haversine_m((0.0, 0.0), (0.0, probe_lat)) < r);
+        assert!(geographic_box(0.0, 0.0, r).contains_point(0.0, probe_lat));
+        assert!(probe_lat > r / 111_320.0, "the probe sits in the band the old constant clipped");
+
+        // Every bearing, every longitude including either side of the
+        // antimeridian, latitudes up to 85, radii from metres to 500 km, at
+        // 99.99% of the radius.
+        let mut st = 7u64;
+        for _ in 0..20_000 {
+            let lon = lcg(&mut st) * 360.0 - 180.0;
+            let lat = lcg(&mut st) * 170.0 - 85.0;
+            let r = 10f64.powf(lcg(&mut st) * 4.7 + 1.0);
+            let bearing = lcg(&mut st) * std::f64::consts::TAU;
+            let (plon, plat) = destination(lon, lat, bearing, r * 0.9999);
+            let plon = (plon + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(haversine_m((lon, lat), (plon, plat)) < r);
+            let b = geographic_box(lon, lat, r);
+            assert!(b.contains_point(plon, plat), "centre ({lon}, {lat}) r={r} bearing={bearing}: ({plon}, {plat}) outside {b:?}");
+        }
+    }
+
+    #[test]
+    fn geographic_nearest_is_exact_at_high_latitude() {
+        // Rows clustered east-west of a centre at 80 degrees, where a degree
+        // of longitude is 0.17 of a degree of latitude: the planar order puts
+        // the north-south rows first and is wrong. Compared with a full sort
+        // by the distance `point.distance` reports.
+        let mut idx = PointIndex::new("C", "at");
+        let mut all = Vec::new();
+        let mut st = 11u64;
+        for i in 0..3000u64 {
+            let lon = 10.0 + (lcg(&mut st) - 0.5) * 20.0;
+            let lat = 80.0 + (lcg(&mut st) - 0.5) * 4.0;
+            let mut m = HashMap::new();
+            m.insert("longitude".to_string(), PropertyValue::Float(lon));
+            m.insert("latitude".to_string(), PropertyValue::Float(lat));
+            idx.set(NodeId::new(i), &PropertyValue::Map(m));
+            all.push((NodeId::new(i), lon, lat));
+        }
+        for (qlon, qlat, k) in [(10.0, 80.0, 1), (10.0, 80.0, 40), (0.5, 81.5, 25), (-170.0, 79.0, 10), (10.0, 80.0, 3000)] {
+            let got = idx.nearest_geographic(qlon, qlat, k);
+            let mut want: Vec<f64> = all.iter().map(|(_, x, y)| haversine_m((qlon, qlat), (*x, *y))).collect();
+            want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            want.truncate(k);
+            assert_eq!(got.len(), want.len());
+            for ((_, g), w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-6, "({qlon}, {qlat}) k={k}: {g} vs {w}");
+            }
+        }
+    }
+
     #[test]
     fn a_geographic_box_contains_its_radius() {
         let b = geographic_box(77.6, 12.9, 5_000.0);
@@ -492,5 +639,7 @@ mod tests {
         assert!(!b.contains_point(77.6, 12.9 + 0.06));
         let polar = geographic_box(0.0, 89.99, 5_000.0);
         assert_eq!((polar.min_x, polar.max_x), (-180.0, 180.0));
+        let dateline = geographic_box(179.99, 10.0, 5_000.0);
+        assert_eq!((dateline.min_x, dateline.max_x), (-180.0, 180.0));
     }
 }
