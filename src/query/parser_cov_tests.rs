@@ -522,12 +522,12 @@ fn with_clause_carries_its_own_filter_and_row_counts() {
 fn set_items_of_every_form() {
     let q = ok("MATCH (n) SET n.a = 1, n = {b: 2}, n += {c: 3}, n:L1:L2");
     let s = &q.set_clauses[0];
-    assert_eq!(s.items.len(), 1);
-    assert_eq!(s.entity_items.len(), 2);
-    assert!(!s.entity_items[0].merge);
-    assert!(s.entity_items[1].merge);
-    assert_eq!(s.label_items.len(), 1);
-    assert_eq!(s.label_items[0].labels.len(), 2);
+    assert_eq!(s.items().count(), 1);
+    assert_eq!(s.entity_items().count(), 2);
+    assert!(!s.entity_items().next().unwrap().merge);
+    assert!(s.entity_items().nth(1).unwrap().merge);
+    assert_eq!(s.label_items().count(), 1);
+    assert_eq!(s.label_items().next().unwrap().labels.len(), 2);
 }
 
 #[test]
