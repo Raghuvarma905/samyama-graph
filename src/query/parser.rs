@@ -1727,17 +1727,16 @@ fn parse_set_label_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetLab
 }
 
 fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause> {
-    let mut items = Vec::new();
-    let mut label_items: Vec<SetLabelItem> = Vec::new();
-    let mut entity_items: Vec<crate::query::ast::SetEntityItem> = Vec::new();
+    use crate::query::ast::SetOp;
+    let mut ops = Vec::new();
 
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::set_label_item {
-            label_items.push(parse_set_label_item(inner)?);
+            ops.push(SetOp::Labels(parse_set_label_item(inner)?));
             continue;
         }
         if inner.as_rule() == Rule::set_entity_item {
-            entity_items.push(parse_set_entity_item(inner)?);
+            ops.push(SetOp::Entity(parse_set_entity_item(inner)?));
             continue;
         }
         if inner.as_rule() == Rule::set_item {
@@ -1763,15 +1762,15 @@ fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause>
                 }
             }
 
-            items.push(SetItem {
+            ops.push(SetOp::Property(SetItem {
                 variable,
                 property,
                 value: value.ok_or_else(|| ParseError::SemanticError("SET item missing value".to_string()))?,
-            });
+            }));
         }
     }
 
-    Ok(SetClause { items, label_items, entity_items })
+    Ok(SetClause { ops })
 }
 
 fn parse_remove_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<RemoveClause> {
@@ -3667,8 +3666,8 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse SET: {:?}", result.err());
         let ast = result.unwrap();
         assert_eq!(ast.set_clauses.len(), 1);
-        assert_eq!(ast.set_clauses[0].items[0].variable, "n");
-        assert_eq!(ast.set_clauses[0].items[0].property, "name");
+        assert_eq!(ast.set_clauses[0].items().next().unwrap().variable, "n");
+        assert_eq!(ast.set_clauses[0].items().next().unwrap().property, "name");
     }
 
     #[test]
@@ -4769,7 +4768,7 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse SET clause: {:?}", result.err());
         let ast = result.unwrap();
         assert!(!ast.set_clauses.is_empty());
-        let item = &ast.set_clauses[0].items[0];
+        let item = ast.set_clauses[0].items().next().unwrap();
         assert_eq!(item.variable, "n");
         assert_eq!(item.property, "age");
     }
@@ -4800,7 +4799,7 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse multiple SET items: {:?}", result.err());
         let ast = result.unwrap();
         assert!(!ast.set_clauses.is_empty());
-        assert!(ast.set_clauses[0].items.len() >= 2);
+        assert!(ast.set_clauses[0].items().count() >= 2);
     }
 
     #[test]
