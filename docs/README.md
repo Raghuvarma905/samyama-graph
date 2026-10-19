@@ -1,6 +1,6 @@
 # Samyama Graph — Documentation Index
 
-**Last updated:** 2026-10-14 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
+**Last updated:** 2026-10-19 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
 
 ## Primary sources
 
@@ -47,6 +47,9 @@ eight of eighteen documents (#1450).
 - **[ACID-GUARANTEES.md](./ACID-GUARANTEES.md)** — the transaction model: MVCC, the logical WAL, what durability `SAMYAMA_FSYNC` does and does not buy, and why there is no Raft replication to rely on.
 - **[FAILURE-MODES.md](./FAILURE-MODES.md)** — how the engine behaves when things go wrong.
 - **[BI-CONNECTIVITY.md](./BI-CONNECTIVITY.md)** — connecting BI tools.
+- **[ORCHESTRATION.md](./ORCHESTRATION.md)** — loading the graph from a scheduled pipeline: a retry-safe, parameter-bound load with validation, as reference pipelines for Airflow and Dagster that the test suite runs against a real server.
+- **[ORCHESTRATION-AIRFLOW.md](./ORCHESTRATION-AIRFLOW.md)** — how to run the reference DAG in Airflow 3: credential, Connection, params, what a failure means.
+- **[ORCHESTRATION-DAGSTER.md](./ORCHESTRATION-DAGSTER.md)** — how to run the reference assets and checks in Dagster.
 
 ### Data, provenance and privacy
 

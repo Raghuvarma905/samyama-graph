@@ -897,6 +897,73 @@ jobs:
             ${{ runner.temp }}/gpml-conformance/suite/results/summary.json
           if-no-files-found: warn
 
+  # INT-10 asks for an orchestration integration that is documented AND tested:
+  # one reference pipeline per tool, run against a server. This runs both --
+  # the Airflow DAG through `dag.test()` and the Dagster assets through
+  # `materialize` -- against the release binary `test` built, each test on its
+  # own server with a fresh data directory (examples/orchestration/tests/).
+  #
+  # A reference pipeline that is not run rots exactly like documentation does,
+  # only later: it keeps importing cleanly long after the HTTP API it calls has
+  # moved, and the first person to find out is the one who copied it.
+  #
+  # Not in `ci-ok`'s `needs`, for the reason `gpml` is not: making a new suite
+  # block every merge -- here, one that installs Airflow from PyPI -- is a policy
+  # decision, separate from adding the suite. tests/ci_gate_enumeration.rs
+  # records the exemption so it cannot be forgotten.
+  orchestration:
+    name: orchestration (Airflow and Dagster reference pipelines)
+    needs: [changes, test]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The binary `test` already built. A missing artifact is not a failure:
+      # the next step builds the engine instead, as the gpml job does.
+      - name: Take the release binary from the test job
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: samyama-release
+          path: target/release
+
+      - name: Use it if it arrived, otherwise build it
+        run: |
+          set -euo pipefail
+          if [ -f target/release/samyama ]; then
+            # An artifact download does not preserve the executable bit.
+            chmod +x target/release/samyama
+            echo "using the binary built by the test job"
+          else
+            echo "::notice::no release artifact; building the engine"
+            cargo build --release --bin samyama
+          fi
+
+      - name: Install Airflow and Dagster at the tested versions
+        working-directory: examples/orchestration
+        # Airflow's constraints file is per Airflow version and per Python
+        # version; both are read rather than restated, so bumping the pin in
+        # requirements.txt cannot leave this step installing against the old
+        # constraints.
+        run: |
+          set -euo pipefail
+          airflow=$(sed -n 's/^apache-airflow==//p' requirements.txt)
+          py=$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+          pip install -r requirements.txt \
+            -c "https://raw.githubusercontent.com/apache/airflow/constraints-${airflow}/constraints-${py}.txt"
+
+      - name: Run both pipelines against the engine
+        working-directory: examples/orchestration
+        env:
+          SAMYAMA_BIN: ${{ github.workspace }}/target/release/samyama
+        run: python -m pytest -v tests/
+
   # The one check branch protection should require.
   #
   # `test` and the two snapshot jobs take their check names from a matrix. When an
