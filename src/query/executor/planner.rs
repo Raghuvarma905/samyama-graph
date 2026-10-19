@@ -1832,16 +1832,12 @@ impl QueryPlanner {
                 // A bare `SET` after MERGE applies on both branches, unlike ON CREATE /
                 // ON MATCH. It parsed but was dropped here, so `MERGE (m) SET m.x = 1`
                 // silently left the property unset.
+                //
+                // Through `attach_set` like every other SET: this path used to
+                // keep only the `n.prop = v` items, so `MERGE (m) SET m = {…}`
+                // and `SET m:Label` were dropped without a word.
                 if !query.set_clauses.is_empty() {
-                    let items: Vec<(String, String, Expression)> = query
-                        .set_clauses
-                        .iter()
-                        .flat_map(|sc| sc.items.iter())
-                        .map(|item| {
-                            (item.variable.clone(), item.property.clone(), item.value.clone())
-                        })
-                        .collect();
-                    operator = Box::new(SetPropertyOperator::new(operator, items));
+                    operator = Self::attach_set(operator, &query.set_clauses);
                 }
 
                 let mut output_columns = Vec::new();
@@ -8800,29 +8796,7 @@ impl QueryPlanner {
                     bound.insert(u.variable.clone());
                 }
                 Clause::Set(sc) => {
-                    let items: Vec<(String, String, Expression)> = sc
-                        .items
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let entity_items: Vec<(String, bool, Expression)> = sc
-                        .entity_items
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect();
-                    if !items.is_empty() || !entity_items.is_empty() {
-                        operator = Box::new(SetPropertyOperator::with_entity_items(
-                            operator, items, entity_items,
-                        ));
-                    }
-                    let adds: Vec<(String, Label)> = sc
-                        .label_items
-                        .iter()
-                        .flat_map(|i| i.labels.iter().map(|l| (i.variable.clone(), l.clone())))
-                        .collect();
-                    if !adds.is_empty() {
-                        operator = Box::new(LabelMutationOperator::new(operator, adds, Vec::new()));
-                    }
+                    operator = Self::attach_set(operator, std::slice::from_ref(sc));
                 }
                 Clause::Remove(rc) => {
                     let mut props = Vec::new();
@@ -9336,31 +9310,38 @@ impl QueryPlanner {
         operator
     }
 
-    /// `SET` over `operator`: property and whole-entity items, then labels.
+    /// `SET` over `operator`, one clause after another.
+    ///
+    /// Each clause gets its own operators, so a later clause's writes land
+    /// after an earlier clause's. Flattening every clause into one list lost
+    /// that, and `SET n = {…} SET n.k = 7` dropped `k` (#1896). Within a
+    /// clause the property and whole-entity writes keep the order they were
+    /// written in; labels follow, which no property write can disturb.
     fn attach_set(mut operator: OperatorBox, set_clauses: &[SetClause]) -> OperatorBox {
-        let mut items = Vec::new();
-        let mut label_adds = Vec::new();
-        let mut entity_items = Vec::new();
+        use crate::query::executor::operator::SetWrite;
         for set_clause in set_clauses {
-            for item in &set_clause.items {
-                items.push((item.variable.clone(), item.property.clone(), item.value.clone()));
-            }
-            for item in &set_clause.label_items {
-                for label in &item.labels {
-                    label_adds.push((item.variable.clone(), label.clone()));
+            let mut writes = Vec::new();
+            let mut label_adds = Vec::new();
+            for op in &set_clause.ops {
+                match op {
+                    SetOp::Property(i) => writes.push(SetWrite::Property(
+                        i.variable.clone(),
+                        i.property.clone(),
+                        i.value.clone(),
+                    )),
+                    SetOp::Entity(i) => {
+                        writes.push(SetWrite::Entity(i.variable.clone(), i.merge, i.value.clone()))
+                    }
+                    SetOp::Labels(i) => label_adds
+                        .extend(i.labels.iter().map(|l| (i.variable.clone(), l.clone()))),
                 }
             }
-            for item in &set_clause.entity_items {
-                entity_items.push((item.variable.clone(), item.merge, item.value.clone()));
+            if !writes.is_empty() {
+                operator = Box::new(SetPropertyOperator::from_writes(operator, writes));
             }
-        }
-        if !items.is_empty() || !entity_items.is_empty() {
-            operator = Box::new(SetPropertyOperator::with_entity_items(
-                operator, items, entity_items,
-            ));
-        }
-        if !label_adds.is_empty() {
-            operator = Box::new(LabelMutationOperator::new(operator, label_adds, Vec::new()));
+            if !label_adds.is_empty() {
+                operator = Box::new(LabelMutationOperator::new(operator, label_adds, Vec::new()));
+            }
         }
         operator
     }
