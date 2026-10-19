@@ -60,7 +60,7 @@ pub use mapping::{
     MappingConfig, MappingError, MappingResult,
 };
 
-pub use mapping_impl::{SyncReport, IRI_PROPERTY};
+pub use mapping_impl::{RdfImportReport, SyncReport, IRI_PROPERTY};
 
 pub use namespace::{
     NamespaceManager, Namespace,

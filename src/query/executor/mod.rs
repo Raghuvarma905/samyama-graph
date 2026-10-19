@@ -620,12 +620,17 @@ impl<'a> QueryExecutor<'a> {
         if let Some(diag) = diagnostics {
             plan_text.push_str("\n--- Planner Diagnostics ---\n");
             plan_text.push_str(&format!(
-                "Candidates evaluated: {}\nChosen plan cost: {:.2}\n",
-                diag.candidates_evaluated, diag.chosen_plan_cost
+                "Candidates evaluated: {}\nChosen plan cost: {:.2}\nChosen plan: #{}{}\n",
+                diag.candidates_evaluated,
+                diag.chosen_plan_cost,
+                diag.chosen + 1,
+                if diag.chosen == 0 { "" } else { ", forced by CYPHER plan=N" }
             ));
             if diag.candidate_costs.len() > 1 {
+                // Numbered as `CYPHER plan=N` takes them, so a reader can run
+                // any of them (#1616).
                 plan_text.push_str("Alternative plans:\n");
-                for (i, (desc, cost)) in diag.candidate_costs.iter().enumerate().skip(1).take(5) {
+                for (i, (desc, cost)) in diag.candidate_costs.iter().enumerate().filter(|(i, _)| *i != diag.chosen).take(5) {
                     plan_text.push_str(&format!(
                         "  #{} (cost {:.2}):\n", i + 1, cost
                     ));
@@ -1084,11 +1089,12 @@ fn substitute_set(
     sc: &mut crate::query::ast::SetClause,
     p: &HashMap<String, crate::graph::PropertyValue>,
 ) -> ExecutionResult<()> {
-    for item in &mut sc.items {
-        substitute_expr(&mut item.value, p)?;
-    }
-    for item in &mut sc.entity_items {
-        substitute_expr(&mut item.value, p)?;
+    for op in &mut sc.ops {
+        match op {
+            crate::query::ast::SetOp::Property(item) => substitute_expr(&mut item.value, p)?,
+            crate::query::ast::SetOp::Entity(item) => substitute_expr(&mut item.value, p)?,
+            crate::query::ast::SetOp::Labels(_) => {}
+        }
     }
     Ok(())
 }

@@ -1837,10 +1837,10 @@ fn validate_variables_are_bound(query: &Query) -> Result<(), ValidationError> {
     }
 
     fn note_set(sc: &SetClause, bound: &mut HashSet<String>) {
-        for item in &sc.items {
+        for item in sc.items() {
             binders(&item.value, bound);
         }
-        for item in &sc.entity_items {
+        for item in sc.entity_items() {
             binders(&item.value, bound);
         }
     }
@@ -2035,15 +2035,15 @@ fn validate_variables_are_bound(query: &Query) -> Result<(), ValidationError> {
         note_expr(e, &mut used);
     }
     let mut note_set_use = |sc: &SetClause, used: &mut Vec<String>| {
-        for item in &sc.items {
+        for item in sc.items() {
             used.push(item.variable.clone());
             collect_all_vars(&item.value, used);
         }
-        for item in &sc.entity_items {
+        for item in sc.entity_items() {
             used.push(item.variable.clone());
             collect_all_vars(&item.value, used);
         }
-        for item in &sc.label_items {
+        for item in sc.label_items() {
             used.push(item.variable.clone());
         }
     };
@@ -2513,8 +2513,8 @@ fn write_expressions(query: &Query) -> Vec<&Expression> {
     use crate::query::ast::{Clause, ForeachBody, ForeachClause, MergeClause, SetClause};
 
     fn from_set<'a>(sc: &'a SetClause, out: &mut Vec<&'a Expression>) {
-        out.extend(sc.items.iter().map(|i| &i.value));
-        out.extend(sc.entity_items.iter().map(|i| &i.value));
+        out.extend(sc.items().map(|i| &i.value));
+        out.extend(sc.entity_items().map(|i| &i.value));
     }
     fn from_merge<'a>(mc: &'a MergeClause, out: &mut Vec<&'a Expression>) {
         out.extend(mc.on_create_set.iter().chain(&mc.on_match_set).map(|i| &i.value));
@@ -3155,8 +3155,8 @@ pub fn validate(query: &Query) -> Result<(), ValidationError> {
             }
         }
         fn set_values_of(sc: &crate::query::ast::SetClause) -> Vec<&Expression> {
-            let mut out: Vec<&Expression> = sc.items.iter().map(|i| &i.value).collect();
-            out.extend(sc.entity_items.iter().map(|i| &i.value));
+            let mut out: Vec<&Expression> = sc.items().map(|i| &i.value).collect();
+            out.extend(sc.entity_items().map(|i| &i.value));
             out
         }
         let mut set_values: Vec<&Expression> = Vec::new();

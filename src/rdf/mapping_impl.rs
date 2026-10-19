@@ -324,13 +324,99 @@ pub fn sync_to_rdf(
     Ok(report)
 }
 
+/// What an import read, made, and left behind.
+///
+/// `map_to_graph` returned `()`, so importing a third-party vocabulary -- SKOS,
+/// OWL, anything not written by Samyama -- reported success while every
+/// predicate outside Samyama's own namespace was skipped: no properties, no
+/// edges, and nothing to say so (#1906). The same failure shape #1043 fixed
+/// for the empty mapping. This counts the loss; it does not change what is
+/// imported, which is #1910's job.
+///
+/// Every count is taken by the import as it goes, not re-derived from the
+/// graph afterwards, for the reason `migrate::neo4j_json::ImportReport` gives:
+/// a count read from the destination cannot see what failed to arrive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RdfImportReport {
+    /// Triples in the store, every one of them, including the ones skipped.
+    pub triples_read: usize,
+    pub nodes_created: usize,
+    pub edges_created: usize,
+    /// `rdf:type` triples turned into labels.
+    pub labels_applied: usize,
+    /// Node and edge properties written.
+    pub properties_set: usize,
+    /// Predicate IRI -> how many triples using it were dropped.
+    ///
+    /// A predicate outside `{base}prop/`, `{base}rel/` and `rdf:type` lands
+    /// here, and so does one of ours whose object is the wrong kind (a
+    /// relationship pointing at a literal, say), or a triple whose subject is
+    /// a blank node, which this mapping cannot give a node to.
+    pub predicates_skipped: std::collections::BTreeMap<String, u64>,
+    /// Literals that carried a language tag (`"Datenbank"@de`), stored as a
+    /// plain string without it.
+    pub language_tags_dropped: usize,
+    /// Literals whose datatype this mapping does not read -- `xsd:date`,
+    /// `xsd:dateTime`, `xsd:decimal` and the rest -- or whose text did not
+    /// parse as its datatype, stored as their lexical form.
+    pub literals_typed_as_string: usize,
+}
+
+impl RdfImportReport {
+    /// True when every triple turned into graph data with its type intact.
+    ///
+    /// Strict on purpose, as `ImportReport::lossless` is: a skipped predicate
+    /// or an untyped literal makes this false even though the import produced
+    /// a usable graph, because a migration that quietly lost data is the one
+    /// worth catching.
+    pub fn lossless(&self) -> bool {
+        self.predicates_skipped.is_empty()
+            && self.language_tags_dropped == 0
+            && self.literals_typed_as_string == 0
+    }
+
+    fn skip(&mut self, predicate: &str) {
+        *self.predicates_skipped.entry(predicate.to_string()).or_insert(0) += 1;
+    }
+
+    /// Count what [`value_for`] loses when it reads `lit`.
+    fn note_literal(&mut self, lit: &Literal) {
+        if lit.language().is_some() {
+            self.language_tags_dropped += 1;
+            return;
+        }
+        let datatype = lit.datatype();
+        let datatype = datatype.as_str();
+        let text = lit.value();
+        let kept = match datatype.strip_prefix(XSD) {
+            Some("string") => true,
+            Some("integer") => text.parse::<i64>().is_ok(),
+            Some("double") => text.parse::<f64>().is_ok(),
+            Some("boolean") => text.parse::<bool>().is_ok(),
+            Some(_) => false,
+            None => {
+                datatype == "https://samyama.ai/rdf/PropertyValue"
+                    && serde_json::from_str::<PropertyValue>(text).is_ok()
+            }
+        };
+        if !kept {
+            self.literals_typed_as_string += 1;
+        }
+    }
+}
+
 /// Read an RDF store into a property graph.
 ///
 /// Two passes. The first creates a node per subject IRI so an edge can be
 /// written the moment it is seen; the second fills in labels, properties and
 /// edges. One pass would have had to buffer every forward reference, which is
 /// the same work with somewhere else to get it wrong.
-pub fn map_to_graph(config: &MappingConfig, rdf: &RdfStore, graph: &mut GraphStore) -> MappingResult<()> {
+pub fn map_to_graph(
+    config: &MappingConfig,
+    rdf: &RdfStore,
+    graph: &mut GraphStore,
+) -> MappingResult<RdfImportReport> {
+    let mut report = RdfImportReport::default();
     let class_prefix = format!("{}class/", config.base_iri);
     let prop_prefix = format!("{}prop/", config.base_iri);
     let rel_prefix = format!("{}rel/", config.base_iri);
@@ -391,46 +477,71 @@ pub fn map_to_graph(config: &MappingConfig, rdf: &RdfStore, graph: &mut GraphSto
             .set_node_property("default", id, IRI_PROPERTY, s.clone())
             .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
         ids.insert(s.clone(), id);
+        report.nodes_created += 1;
     }
 
     // Pass 2.
+    let statement_prefix = format!("{}statement/", config.base_iri);
     for triple in rdf.iter() {
+        report.triples_read += 1;
+        let predicate = triple.predicate.as_named_node().as_str().to_string();
         let RdfSubject::NamedNode(subject) = &triple.subject else {
+            report.skip(&predicate);
             continue;
         };
         let Some(&node_id) = ids.get(subject.as_str()) else {
+            // Reification bookkeeping, read by pass 3. Anything else without
+            // a node was dropped.
+            if !subject.as_str().starts_with(&statement_prefix) {
+                report.skip(&predicate);
+            }
             continue;
         };
-        let predicate = triple.predicate.as_named_node().as_str().to_string();
 
         if predicate == RDF_TYPE {
-            if let RdfObject::NamedNode(class) = &triple.object {
-                let name = class
-                    .as_str()
-                    .strip_prefix(&class_prefix)
-                    .map(decode_segment)
-                    // A type IRI from someone else's vocabulary is still a
-                    // label; using the whole IRI keeps it distinguishable from
-                    // one of ours and keeps the round trip honest.
-                    .unwrap_or_else(|| class.as_str().to_string());
-                graph
-                    .add_label_to_node("default", node_id, name)
-                    .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
-            }
+            let RdfObject::NamedNode(class) = &triple.object else {
+                report.skip(&predicate);
+                continue;
+            };
+            let name = class
+                .as_str()
+                .strip_prefix(&class_prefix)
+                .map(decode_segment)
+                // A type IRI from someone else's vocabulary is still a
+                // label; using the whole IRI keeps it distinguishable from
+                // one of ours and keeps the round trip honest.
+                .unwrap_or_else(|| class.as_str().to_string());
+            graph
+                .add_label_to_node("default", node_id, name)
+                .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
+            report.labels_applied += 1;
         } else if let Some(key) = predicate.strip_prefix(&prop_prefix) {
-            if let RdfObject::Literal(lit) = &triple.object {
-                graph
-                    .set_node_property("default", node_id, decode_segment(key), value_for(lit))
-                    .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
-            }
+            let RdfObject::Literal(lit) = &triple.object else {
+                report.skip(&predicate);
+                continue;
+            };
+            report.note_literal(lit);
+            graph
+                .set_node_property("default", node_id, decode_segment(key), value_for(lit))
+                .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
+            report.properties_set += 1;
         } else if let Some(edge_type) = predicate.strip_prefix(&rel_prefix) {
-            if let RdfObject::NamedNode(target) = &triple.object {
-                if let Some(&target_id) = ids.get(target.as_str()) {
-                    graph
-                        .create_edge(node_id, target_id, decode_segment(edge_type))
-                        .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
-                }
-            }
+            let target_id = match &triple.object {
+                RdfObject::NamedNode(target) => ids.get(target.as_str()).copied(),
+                _ => None,
+            };
+            let Some(target_id) = target_id else {
+                report.skip(&predicate);
+                continue;
+            };
+            graph
+                .create_edge(node_id, target_id, decode_segment(edge_type))
+                .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
+            report.edges_created += 1;
+        } else {
+            // Someone else's vocabulary: `skos:prefLabel`, `rdfs:subClassOf`,
+            // `owl:sameAs`. Not mapped yet (#1910), and now not silent either.
+            report.skip(&predicate);
         }
     }
 
@@ -440,8 +551,8 @@ pub fn map_to_graph(config: &MappingConfig, rdf: &RdfStore, graph: &mut GraphSto
     // edge property survives being written and not being read — which is the
     // shape of a round trip that looks like it works. Left until last because
     // it needs the edges pass 2 created.
-    restore_reified_edge_properties(config, rdf, graph, &ids, &rel_prefix, &prop_prefix)?;
-    Ok(())
+    restore_reified_edge_properties(config, rdf, graph, &ids, &rel_prefix, &prop_prefix, &mut report)?;
+    Ok(report)
 }
 
 /// Read `rdf:Statement` resources back onto the edges they describe.
@@ -452,6 +563,7 @@ fn restore_reified_edge_properties(
     ids: &HashMap<String, NodeId>,
     rel_prefix: &str,
     prop_prefix: &str,
+    report: &mut RdfImportReport,
 ) -> MappingResult<()> {
     let statement_prefix = format!("{}statement/", config.base_iri);
 
@@ -483,6 +595,7 @@ fn restore_reified_edge_properties(
             (RDF_OBJECT, RdfObject::NamedNode(n)) => entry.object = Some(n.as_str().to_string()),
             (p, RdfObject::Literal(lit)) => {
                 if let Some(key) = p.strip_prefix(prop_prefix) {
+                    report.note_literal(lit);
                     entry.properties.push((decode_segment(key), value_for(lit)));
                 }
             }
@@ -513,6 +626,7 @@ fn restore_reified_edge_properties(
             graph
                 .set_edge_property(edge_id, key.clone(), value.clone())
                 .map_err(|e| MappingError::UnsupportedPropertyType(e.to_string()))?;
+            report.properties_set += 1;
         }
     }
     Ok(())

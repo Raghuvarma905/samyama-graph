@@ -136,6 +136,8 @@ pub struct Query {
     /// Planner hints from every MATCH in the query (#1675). Keyed by variable,
     /// which names one node across the whole query.
     pub hints: Vec<PlanHint>,
+    /// `CYPHER planner=… plan=N` options before the query (LANG-06, #1616).
+    pub plan_options: PlanOptions,
     /// SHOW CONSTRAINTS flag
     pub show_constraints: bool,
     /// PROFILE flag
@@ -336,6 +338,35 @@ pub enum PlanHint {
     /// `USING JOIN ON n` -- accepted; this planner joins comma-separated
     /// patterns on their shared variables already, so it is checked and kept.
     Join { variables: Vec<String> },
+}
+
+/// Options written as `CYPHER key=value …` before a query (LANG-06, #1616):
+/// which planner plans it, and which of its candidate plans runs.
+///
+/// Like the `USING` hints, these are mandatory. An option this engine does
+/// not have, or a plan number a pattern does not have, is an error: a plan
+/// forced in name and not in fact is the one thing plan-equivalence testing
+/// cannot survive, because the comparison would pass by comparing a plan
+/// with itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanOptions {
+    /// `planner=cost` plans every MATCH with the cost-based enumerator
+    /// (ADR-015), `planner=legacy` with the default planner. `None` keeps
+    /// the server's setting.
+    pub planner: Option<PlannerChoice>,
+    /// `plan=N`: run the N-th cheapest candidate the enumerator produces for
+    /// each MATCH, counting from 1 -- the numbers EXPLAIN prints beside
+    /// `Alternative plans`. Implies `planner=cost`.
+    pub plan: Option<usize>,
+}
+
+/// The planners a query can name with `CYPHER planner=…`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerChoice {
+    /// The cost-based enumerator (`planner=cost`).
+    Cost,
+    /// The default planner (`planner=legacy`).
+    Legacy,
 }
 
 /// MATCH clause: `MATCH (n:Person)-[:KNOWS]->(m)`
@@ -1014,16 +1045,52 @@ pub struct DeleteClause {
 /// SET clause
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetClause {
-    /// Items to set
-    pub items: Vec<SetItem>,
-    /// Labels to add: `SET n:Admin`, `SET n:A:B`.
+    /// The items, in the order they were written.
     ///
-    /// Kept beside `items` rather than folded into it because `SetItem` is a
-    /// struct read by field in several places, and an enum would touch all of
-    /// them for no gain. `RemoveItem` is an enum because it always was.
-    pub label_items: Vec<SetLabelItem>,
-    /// Whole-entity assignment: `SET n = {…}` and `SET n += {…}`.
-    pub entity_items: Vec<SetEntityItem>,
+    /// One sequence rather than a vector per kind, because the order between
+    /// kinds is part of the meaning: `SET n = {a: 1}, n.k = 7` keeps `k` and
+    /// `SET n.k = 7, n = {a: 1}` does not. Three vectors kept each kind's own
+    /// order and lost the order between them, so the executor had to pick one
+    /// -- and whichever it picked, the other way round was silently wrong
+    /// (#1896).
+    pub ops: Vec<SetOp>,
+}
+
+impl SetClause {
+    /// `n.prop = value` items, in order.
+    pub fn items(&self) -> impl Iterator<Item = &SetItem> {
+        self.ops.iter().filter_map(|op| match op {
+            SetOp::Property(i) => Some(i),
+            _ => None,
+        })
+    }
+
+    /// `n:Label` items, in order.
+    pub fn label_items(&self) -> impl Iterator<Item = &SetLabelItem> {
+        self.ops.iter().filter_map(|op| match op {
+            SetOp::Labels(i) => Some(i),
+            _ => None,
+        })
+    }
+
+    /// `n = …` and `n += …` items, in order.
+    pub fn entity_items(&self) -> impl Iterator<Item = &SetEntityItem> {
+        self.ops.iter().filter_map(|op| match op {
+            SetOp::Entity(i) => Some(i),
+            _ => None,
+        })
+    }
+}
+
+/// One item of a `SET` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOp {
+    /// `n.prop = value`
+    Property(SetItem),
+    /// `n:Admin`, `n:A:B`
+    Labels(SetLabelItem),
+    /// `n = {…}` (replace) or `n += {…}` (merge)
+    Entity(SetEntityItem),
 }
 
 /// `SET n = <expr>` (replace every property) or `SET n += <expr>` (merge).
@@ -1336,6 +1403,7 @@ impl Query {
             show_indexes: false,
             analyze: false,
             hints: Vec::new(),
+            plan_options: PlanOptions::default(),
             show_constraints: false,
             profile: false,
             params: HashMap::new(),

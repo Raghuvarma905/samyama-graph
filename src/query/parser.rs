@@ -185,6 +185,7 @@ fn parse_clause_pipeline(input: &str) -> ParseResult<Query> {
                     query.explain = true;
                     query.profile = inner.as_str().eq_ignore_ascii_case("PROFILE");
                 }
+                Rule::cypher_options => parse_cypher_options(inner, &mut query.plan_options)?,
                 Rule::pipeline_stmt => {
                     for c in inner.into_inner() {
                         match c.as_rule() {
@@ -575,6 +576,7 @@ pub fn parse_query(input: &str) -> ParseResult<Query> {
                 let mut first = true;
                 for inner in pair.into_inner() {
                     match inner.as_rule() {
+                        Rule::cypher_options => parse_cypher_options(inner, &mut query.plan_options)?,
                         Rule::explain_clause => {
                             let text = inner.as_str().to_uppercase();
                             if text.starts_with("PROFILE") {
@@ -809,6 +811,81 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> Pars
 }
 
 /// `USING INDEX n:L(p)`, `USING SCAN n:L` or `USING JOIN ON n, m` (#1675).
+/// `CYPHER key=value …` (LANG-06, #1616). Every key and value is checked
+/// here: one this engine does not have is refused by name, because an option
+/// accepted and ignored reads exactly like one that took effect.
+fn parse_cypher_options(pair: pest::iterators::Pair<Rule>, options: &mut crate::query::ast::PlanOptions) -> ParseResult<()> {
+    use crate::query::ast::PlannerChoice;
+    use crate::query::error_code as c;
+    let mut seen = std::collections::HashSet::new();
+    for opt in pair.into_inner().filter(|p| p.as_rule() == Rule::cypher_option) {
+        let mut kv = opt.into_inner();
+        let key = kv.next().map(|p| p.as_str().to_string()).unwrap_or_default();
+        let value = kv.next().map(|p| p.as_str().to_string()).unwrap_or_default();
+        let lower = key.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            return Err(ParseError::Coded { code: c::BAD_ARGUMENT, message: format!("CYPHER option `{key}` is given twice") });
+        }
+        match lower.as_str() {
+            "planner" => {
+                options.planner = Some(match value.to_ascii_lowercase().as_str() {
+                    "cost" => PlannerChoice::Cost,
+                    "legacy" => PlannerChoice::Legacy,
+                    _ => {
+                        return Err(ParseError::Coded {
+                            code: c::UNSUPPORTED,
+                            message: format!(
+                                "CYPHER planner={value}: this engine has two planners, \
+                                 `planner=cost` (the cost-based enumerator) and `planner=legacy`"
+                            ),
+                        })
+                    }
+                });
+            }
+            "plan" => match value.parse::<usize>() {
+                Ok(n) if n >= 1 => options.plan = Some(n),
+                _ => {
+                    return Err(ParseError::Coded {
+                        code: c::BAD_ARGUMENT,
+                        message: format!(
+                            "CYPHER plan={value}: a plan is numbered from 1, as EXPLAIN \
+                             numbers the candidates under `CYPHER planner=cost`"
+                        ),
+                    })
+                }
+            },
+            "runtime" => {
+                // One runtime exists, the Volcano iterator (ADR-007). Naming
+                // it is honoured; naming another is refused, not ignored.
+                if !matches!(value.to_ascii_lowercase().as_str(), "volcano" | "interpreted") {
+                    return Err(ParseError::Coded {
+                        code: c::UNSUPPORTED,
+                        message: format!(
+                            "CYPHER runtime={value}: this engine has one runtime, the Volcano \
+                             iterator (`runtime=volcano`, or `interpreted`)"
+                        ),
+                    });
+                }
+            }
+            _ => {
+                return Err(ParseError::Coded {
+                    code: c::UNSUPPORTED,
+                    message: format!("unknown CYPHER option `{key}`; the options are planner, plan and runtime"),
+                })
+            }
+        }
+    }
+    if options.plan.is_some() && options.planner == Some(PlannerChoice::Legacy) {
+        return Err(ParseError::Coded {
+            code: c::CLAUSE_CONFLICT,
+            message: "CYPHER plan=N picks a candidate of the cost-based enumerator, which \
+                      planner=legacy turns off"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn parse_using_hint(pair: pest::iterators::Pair<Rule>) -> ParseResult<PlanHint> {
     let hint = pair
         .into_inner()
@@ -1650,17 +1727,16 @@ fn parse_set_label_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetLab
 }
 
 fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause> {
-    let mut items = Vec::new();
-    let mut label_items: Vec<SetLabelItem> = Vec::new();
-    let mut entity_items: Vec<crate::query::ast::SetEntityItem> = Vec::new();
+    use crate::query::ast::SetOp;
+    let mut ops = Vec::new();
 
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::set_label_item {
-            label_items.push(parse_set_label_item(inner)?);
+            ops.push(SetOp::Labels(parse_set_label_item(inner)?));
             continue;
         }
         if inner.as_rule() == Rule::set_entity_item {
-            entity_items.push(parse_set_entity_item(inner)?);
+            ops.push(SetOp::Entity(parse_set_entity_item(inner)?));
             continue;
         }
         if inner.as_rule() == Rule::set_item {
@@ -1686,15 +1762,15 @@ fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause>
                 }
             }
 
-            items.push(SetItem {
+            ops.push(SetOp::Property(SetItem {
                 variable,
                 property,
                 value: value.ok_or_else(|| ParseError::SemanticError("SET item missing value".to_string()))?,
-            });
+            }));
         }
     }
 
-    Ok(SetClause { items, label_items, entity_items })
+    Ok(SetClause { ops })
 }
 
 fn parse_remove_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<RemoveClause> {
@@ -3590,8 +3666,8 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse SET: {:?}", result.err());
         let ast = result.unwrap();
         assert_eq!(ast.set_clauses.len(), 1);
-        assert_eq!(ast.set_clauses[0].items[0].variable, "n");
-        assert_eq!(ast.set_clauses[0].items[0].property, "name");
+        assert_eq!(ast.set_clauses[0].items().next().unwrap().variable, "n");
+        assert_eq!(ast.set_clauses[0].items().next().unwrap().property, "name");
     }
 
     #[test]
@@ -4692,7 +4768,7 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse SET clause: {:?}", result.err());
         let ast = result.unwrap();
         assert!(!ast.set_clauses.is_empty());
-        let item = &ast.set_clauses[0].items[0];
+        let item = ast.set_clauses[0].items().next().unwrap();
         assert_eq!(item.variable, "n");
         assert_eq!(item.property, "age");
     }
@@ -4723,7 +4799,7 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse multiple SET items: {:?}", result.err());
         let ast = result.unwrap();
         assert!(!ast.set_clauses.is_empty());
-        assert!(ast.set_clauses[0].items.len() >= 2);
+        assert!(ast.set_clauses[0].items().count() >= 2);
     }
 
     #[test]

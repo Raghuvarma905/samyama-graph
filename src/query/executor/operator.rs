@@ -20611,25 +20611,50 @@ fn apply_entity_assignment(
     Ok(())
 }
 
+/// One write of a `SET` clause, as `SetPropertyOperator` applies it.
+#[derive(Debug, Clone)]
+pub enum SetWrite {
+    /// `variable.property = value`
+    Property(String, String, Expression),
+    /// `variable = value` or, when the flag is set, `variable += value`.
+    Entity(String, bool, Expression),
+}
+
 pub struct SetPropertyOperator {
     input: OperatorBox,
-    items: Vec<(String, String, Expression)>, // (variable, property, value_expr)
-    /// Whole-entity assignments: `(variable, merge, value)`. `merge` is `+=`.
-    entity_items: Vec<(String, bool, Expression)>,
+    /// The writes, in the order the query wrote them.
+    ///
+    /// Applied in that order because the order between a property and a
+    /// whole-entity write decides the result: `SET n = {a: 1}, n.k = 7` keeps
+    /// `k`, and `SET n.k = 7, n = {a: 1}` replaces it. Applying every
+    /// property write first and every entity write after made the second form
+    /// right and the first silently lose `k` (#1896).
+    writes: Vec<SetWrite>,
 }
 
 impl SetPropertyOperator {
     pub fn new(input: OperatorBox, items: Vec<(String, String, Expression)>) -> Self {
-        Self { input, items, entity_items: Vec::new() }
+        let writes = items.into_iter().map(|(v, p, e)| SetWrite::Property(v, p, e)).collect();
+        Self { input, writes }
     }
 
-    /// With whole-entity assignments (`SET n = {…}`, `SET n += {…}`).
+    /// The property writes, then the whole-entity ones (`SET n = {…}`,
+    /// `SET n += {…}`). For writes in the order a query gave them, use
+    /// [`SetPropertyOperator::from_writes`].
     pub fn with_entity_items(
         input: OperatorBox,
         items: Vec<(String, String, Expression)>,
         entity_items: Vec<(String, bool, Expression)>,
     ) -> Self {
-        Self { input, items, entity_items }
+        let mut writes: Vec<SetWrite> =
+            items.into_iter().map(|(v, p, e)| SetWrite::Property(v, p, e)).collect();
+        writes.extend(entity_items.into_iter().map(|(v, m, e)| SetWrite::Entity(v, m, e)));
+        Self { input, writes }
+    }
+
+    /// Writes applied in exactly this order.
+    pub fn from_writes(input: OperatorBox, writes: Vec<SetWrite>) -> Self {
+        Self { input, writes }
     }
 
     /// The properties a right-hand side contributes.
@@ -20697,12 +20722,15 @@ impl PhysicalOperator for SetPropertyOperator {
 
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
         if let Some(record) = self.input.next_mut(store, tenant_id)? {
-            // Evaluate all SET expressions first (immutable borrow of store).
+            // Evaluate every property write's value first, before anything is
+            // written, so `SET a.x = a.y, a.y = a.x` swaps. A whole-entity
+            // write is evaluated where it stands, as it always was.
             //
             // An evaluation error is the statement's error. It used to become
             // `Null`, and a null SET *removes* the property: a call that failed
             // reported success and deleted what was there (#1897).
-            let evaluated: Vec<_> = self.items.iter().map(|(var, prop, expr)| {
+            let evaluated: Vec<Option<PropertyValue>> = self.writes.iter().map(|w| {
+                let SetWrite::Property(_, _, expr) = w else { return Ok(None) };
                 let val = match eval_expression(expr, &record, store) {
                     Ok(v) => match v {
                         Value::Property(pv) => pv,
@@ -20752,7 +20780,7 @@ impl PhysicalOperator for SetPropertyOperator {
                     },
                     Err(e) => return Err(e),
                 };
-                Ok((var.clone(), prop.clone(), val))
+                Ok(Some(val))
             }).collect::<ExecutionResult<_>>()?;
 
             // A property is a scalar or a list of scalars. `SET a.maplist =
@@ -20762,7 +20790,8 @@ impl PhysicalOperator for SetPropertyOperator {
             // logic, so the shared `storable_property` never saw it; the check
             // is applied to the result instead, which covers whichever
             // converter produced it.
-            for (_, prop, val) in &evaluated {
+            for (w, val) in self.writes.iter().zip(&evaluated) {
+                let (SetWrite::Property(_, prop, _), Some(val)) = (w, val) else { continue };
                 if !property_is_storable(val) {
                     return Err(ExecutionError::TypeError(format!(
                         "InvalidPropertyType: `{prop}` cannot hold a map inside a list. \
@@ -20771,8 +20800,19 @@ impl PhysicalOperator for SetPropertyOperator {
                 }
             }
 
-            // Apply mutations via store methods (syncs columnar + row + index)
-            for (var, prop, val) in &evaluated {
+            // Apply mutations via store methods (syncs columnar + row + index),
+            // in the order the query wrote them.
+            for (w, val) in self.writes.iter().zip(&evaluated) {
+                let (var, prop, val) = match (w, val) {
+                    (SetWrite::Property(var, prop, _), Some(val)) => (var, prop, val),
+                    (SetWrite::Entity(var, merge, expr), _) => {
+                        let Some(target) = record.get(var).cloned() else { continue };
+                        let value = eval_expression(expr, &record, store)?;
+                        apply_entity_assignment(&target, &value, *merge, store, tenant_id)?;
+                        continue;
+                    }
+                    _ => continue,
+                };
 
                 if let Some(node_val) = record.get(var) {
                     // `SET n.prop = null` **removes** the property. Storing a
@@ -20804,14 +20844,6 @@ impl PhysicalOperator for SetPropertyOperator {
                 }
             }
 
-            // Whole-entity assignment. Evaluated after the per-property items
-            // so that `SET n.a = 1, n = {b: 2}` behaves as written rather than
-            // as ordered by implementation detail.
-            for (var, merge, expr) in &self.entity_items {
-                let Some(target) = record.get(var).cloned() else { continue };
-                let value = eval_expression(expr, &record, store)?;
-                apply_entity_assignment(&target, &value, *merge, store, tenant_id)?;
-            }
 
             Ok(Some(record))
         } else {
@@ -20828,10 +20860,16 @@ impl PhysicalOperator for SetPropertyOperator {
     }
 
     fn describe(&self) -> OperatorDescription {
-        let mut sets: Vec<String> = self.items.iter().map(|(v, p, e)| format!("{}.{} = {}", v, p, format_expression(e))).collect();
-        sets.extend(self.entity_items.iter().map(|(v, merge, e)| {
-            format!("{} {} {}", v, if *merge { "+=" } else { "=" }, format_expression(e))
-        }));
+        let sets: Vec<String> = self
+            .writes
+            .iter()
+            .map(|w| match w {
+                SetWrite::Property(v, p, e) => format!("{}.{} = {}", v, p, format_expression(e)),
+                SetWrite::Entity(v, merge, e) => {
+                    format!("{} {} {}", v, if *merge { "+=" } else { "=" }, format_expression(e))
+                }
+            })
+            .collect();
         OperatorDescription {
             name: "SetProperty".to_string(),
             details: sets.join(", "),
@@ -23344,17 +23382,21 @@ impl PhysicalOperator for WithBarrierOperator {
 /// ExpandInto operator: checks whether an edge exists between two already-bound endpoints.
 ///
 /// Unlike ExpandOperator (which fans out from one bound node to discover new neighbors),
-/// ExpandInto takes a record where BOTH source and target are already bound, and checks
-/// whether a connecting edge exists. If it does, the record passes through (with the edge
-/// optionally bound); if not, the record is filtered out.
+/// ExpandInto takes a record where BOTH source and target are already bound, and emits
+/// it once per connecting edge (with the edge optionally bound); with none, the record is
+/// filtered out.
 ///
-/// This is semantically a filter (fan-in), not an expansion (fan-out).
+/// Once per edge, not once: two parallel `KNOWS` between `a` and `b` are two matches of
+/// `(a)-[r:KNOWS]->(b)`, and an enumerated plan that closed a pattern with this operator
+/// returned one row where every other plan returned two (#1616).
 pub struct ExpandIntoOperator {
     input: OperatorBox,
     source_binding: String,
     target_binding: String,
     edge_type: Option<String>,
     edge_binding: Option<String>,
+    /// The current input record and the edges still to emit it with.
+    pending: Option<(Record, std::vec::IntoIter<crate::graph::EdgeId>)>,
 }
 
 impl ExpandIntoOperator {
@@ -23371,6 +23413,7 @@ impl ExpandIntoOperator {
             target_binding,
             edge_type,
             edge_binding,
+            pending: None,
         }
     }
 }
@@ -23391,6 +23434,31 @@ impl PhysicalOperator for ExpandIntoOperator {
 
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         loop {
+            if let Some((record, edges)) = &mut self.pending {
+                if let Some(edge_id) = edges.next() {
+                    let mut new_record = record.clone();
+                    if let Some(ref edge_var) = self.edge_binding {
+                        // Try full Edge first, fall back to edge_type_ids for stubs
+                        if let Some(edge) = store.get_edge(edge_id) {
+                            new_record.bind(
+                                edge_var.clone(),
+                                Value::EdgeRef(edge_id, edge.source, edge.target, edge.edge_type.clone()),
+                            );
+                        } else if let Some(edge_type) = store.get_edge_type(edge_id) {
+                            let (s, t) = (
+                                record.get(&self.source_binding).and_then(|v| v.node_id()),
+                                record.get(&self.target_binding).and_then(|v| v.node_id()),
+                            );
+                            if let (Some(s), Some(t)) = (s, t) {
+                                new_record.bind(edge_var.clone(), Value::EdgeRef(edge_id, s, t, edge_type));
+                            }
+                        }
+                    }
+                    return Ok(Some(new_record));
+                }
+                self.pending = None;
+            }
+
             let record = match self.input.next(store)? {
                 Some(r) => r,
                 None => return Ok(None),
@@ -23405,27 +23473,11 @@ impl PhysicalOperator for ExpandIntoOperator {
                 .ok_or_else(|| ExecutionError::VariableNotFound(self.target_binding.clone()))?;
 
             let et = self.edge_type.as_ref().map(|t| EdgeType::new(t.as_str()));
-            let et_ref = et.as_ref();
-
-            if let Some(edge_id) = store.edge_between(source_id, target_id, et_ref) {
-                let mut new_record = record;
-                if let Some(ref edge_var) = self.edge_binding {
-                    // Try full Edge first, fall back to edge_type_ids for stubs
-                    if let Some(edge) = store.get_edge(edge_id) {
-                        new_record.bind(
-                            edge_var.clone(),
-                            Value::EdgeRef(edge_id, edge.source, edge.target, edge.edge_type.clone()),
-                        );
-                    } else if let Some(edge_type) = store.get_edge_type(edge_id) {
-                        new_record.bind(
-                            edge_var.clone(),
-                            Value::EdgeRef(edge_id, source_id, target_id, edge_type),
-                        );
-                    }
-                }
-                return Ok(Some(new_record));
+            let edges = store.edges_between(source_id, target_id, et.as_ref());
+            // None -- the record is filtered out, and the next one tried.
+            if !edges.is_empty() {
+                self.pending = Some((record, edges.into_iter()));
             }
-            // No edge found — skip this record, try next
         }
     }
 
@@ -23449,6 +23501,7 @@ impl PhysicalOperator for ExpandIntoOperator {
     }
 
     fn reset(&mut self) {
+        self.pending = None;
         self.input.reset();
     }
 
@@ -26084,6 +26137,32 @@ mod tests {
         // Edge should be bound
         let edge_val = result.get("r").unwrap();
         assert_eq!(edge_val.edge_id(), Some(eid));
+    }
+
+    #[test]
+    fn test_expand_into_emits_once_per_parallel_edge() {
+        // Two parallel KNOWS are two matches of (a)-[r:KNOWS]->(b) (#1616).
+        let mut store = GraphStore::new();
+        let n1 = store.create_node("Person");
+        let n2 = store.create_node("Person");
+        let e1 = store.create_edge(n1, n2, "KNOWS").unwrap();
+        let e2 = store.create_edge(n1, n2, "KNOWS").unwrap();
+        store.create_edge(n1, n2, "LIKES").unwrap();
+
+        let mut r = Record::new();
+        r.bind("a".to_string(), Value::NodeRef(n1));
+        r.bind("b".to_string(), Value::NodeRef(n2));
+        let input = Box::new(StaticInputOperator { records: vec![r], index: 0 });
+        let mut op = ExpandIntoOperator::new(input, "a".to_string(), "b".to_string(), Some("KNOWS".to_string()), Some("r".to_string()));
+
+        let mut got = Vec::new();
+        while let Some(rec) = op.next(&store).unwrap() {
+            got.push(rec.get("r").unwrap().edge_id().unwrap());
+        }
+        got.sort();
+        let mut want = vec![e1, e2];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
