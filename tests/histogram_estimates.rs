@@ -159,8 +159,13 @@ fn the_planner_anchors_on_the_range_that_keeps_fewer_rows() {
 
 #[test]
 fn histograms_order_temporal_values_and_text_on_their_own_axes() {
+    // 2020-01-01 onwards, one day per node, as `Date` -- days since the epoch.
     let mut s = GraphStore::new();
-    run(&mut s, "UNWIND range(0, 399) AS i CREATE (:E {d: date('2020-01-01') + duration({days: i}), name: 'n' + toString(1000 + i)})");
+    for i in 0..400i32 {
+        let n = s.create_node_with_labels([Label::new("E")]);
+        s.set_node_property("default", n, "d", PropertyValue::Date(18_262 + i)).unwrap();
+        s.set_node_property("default", n, "name", PropertyValue::String(format!("n{}", 1000 + i))).unwrap();
+    }
     let stats = s.statistics();
     let label = Label::new("E");
     let d = |iso: &str| {
@@ -170,6 +175,7 @@ fn histograms_order_temporal_values_and_text_on_their_own_axes() {
             other => panic!("{other:?}"),
         }
     };
+    assert_eq!(d("2020-01-01"), PropertyValue::Date(18_262));
     let sel = stats.estimate_comparison_selectivity(&label, "d", &BinaryOp::Lt, &d("2020-02-10")).unwrap();
     assert!(within_2x(sel * 400.0, 40.0), "{sel}");
     // A number is not on a date's axis: no estimate, and the caller keeps its guess.
