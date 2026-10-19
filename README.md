@@ -5,7 +5,7 @@
     <strong>99.9% of the openCypher TCK's evaluated scenarios pass · SNB Interactive 21/21 and SNB BI 20/20, no timeouts · 1B edges on one machine</strong>
   </p>
   <p align="center">
-    <a href="https://github.com/samyama-ai/samyama-graph/releases"><img src="https://img.shields.io/badge/version-1.11.0-blue" alt="Version"></a>
+    <a href="https://github.com/samyama-ai/samyama-graph/releases"><img src="https://img.shields.io/badge/version-1.12.0-blue" alt="Version"></a>
     <a href="https://github.com/samyama-ai/samyama-graph/actions/workflows/ci.yml"><img src="https://github.com/samyama-ai/samyama-graph/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-blue" alt="License"></a>
     <a href="https://graph.samyama.cloud/book/"><img src="https://img.shields.io/badge/book-read_the_docs-orange" alt="Book"></a>
@@ -26,7 +26,7 @@ It brings together graph traversal, OpenCypher-style querying, vector search, gr
 ### Option 1 — Docker
 
 Pulling the image needs no registry account: it is public on GitHub Container
-Registry. `latest` is the newest release; pin a version such as `:1.11.0` for a
+Registry. `latest` is the newest release; pin a version such as `:1.12.0` for a
 reproducible setup.
 
 **Step 1 — Write `docker-compose.yml`** in an empty folder:
@@ -129,7 +129,7 @@ GRAPH.QUERY mydb "MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.name"
 |----------|---------|---------|
 | Python | `pip install samyama` | `SamyamaClient.connect("http://localhost:8080")`, or `SamyamaClient.embedded()` to run the engine in-process |
 | TypeScript | `npm install samyama-sdk` | `SamyamaClient.connectHttp("http://localhost:8080")` (ESM, Node 18+) |
-| Rust | `samyama-sdk = { git = "https://github.com/samyama-ai/samyama-graph", tag = "v1.11.0" }` — not on crates.io yet | `RemoteClient` over HTTP, or `EmbeddedClient::new()` in-process |
+| Rust | `samyama-sdk = { git = "https://github.com/samyama-ai/samyama-graph", tag = "v1.12.0" }` — not on crates.io yet | `RemoteClient` over HTTP, or `EmbeddedClient::new()` in-process |
 
 Any Redis client also works over RESP on port 6379. Details:
 [Python](sdk/python/README.md) · [TypeScript](sdk/typescript/README.md) · [Rust](crates/samyama-sdk/README.md).
@@ -235,7 +235,7 @@ RETURN nodeId, score ORDER BY score DESC LIMIT 10
 ```cypher
 CREATE VECTOR INDEX paper_idx FOR (p:Paper) ON (p.embedding) OPTIONS {dimensions: 384, similarity: 'cosine'}
 
-CALL vector.search('Paper', 'embedding', [0.1, 0.2, 0.3], 10) YIELD node, score
+CALL db.index.vector.queryNodes('Paper', 'embedding', [0.1, 0.2, 0.3], 10) YIELD node, score
 ```
 
 **Natural language** — ask in English; an LLM translates to Cypher.
@@ -298,6 +298,7 @@ FinBench, cricket, IMDB and more. Run the curated demos with
 | Benchmarks | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
 | Security, auth, TLS and data handling | [docs/DATA-HANDLING.md](docs/DATA-HANDLING.md) |
 | Migrating from Neo4j | [docs/MIGRATING-FROM-NEO4J.md](docs/MIGRATING-FROM-NEO4J.md) |
+| Migrating from FalkorDB or RedisGraph | [docs/MIGRATING-FROM-FALKORDB.md](docs/MIGRATING-FROM-FALKORDB.md) |
 | Failure modes | [docs/FAILURE-MODES.md](docs/FAILURE-MODES.md) |
 | Project layout | [CONTRIBUTING.md](CONTRIBUTING.md#project-layout) |
 | API spec | [openapi/openapi.yaml](openapi/openapi.yaml) |

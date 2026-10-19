@@ -137,7 +137,16 @@ impl RdfToGraphMapper {
     ///
     /// Each subject IRI becomes a node and is kept in `IRI_PROPERTY`, so
     /// exporting the result reproduces the IRIs that came in.
-    pub fn map_to_graph(&self, rdf: &RdfStore, graph: &mut GraphStore) -> MappingResult<()> {
+    ///
+    /// The report says what was skipped. `Ok` means the store was read, not
+    /// that everything in it arrived: check [`RdfImportReport::lossless`].
+    ///
+    /// [`RdfImportReport::lossless`]: super::RdfImportReport::lossless
+    pub fn map_to_graph(
+        &self,
+        rdf: &RdfStore,
+        graph: &mut GraphStore,
+    ) -> MappingResult<super::RdfImportReport> {
         super::mapping_impl::map_to_graph(&self.config, rdf, graph)
     }
 }

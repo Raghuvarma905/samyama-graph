@@ -48,8 +48,10 @@ fn main() {
         .sync_to_rdf(&source, &mut rdf)
         .expect("export");
 
+    // The import says what it could not read (#1906). Samyama's own RDF is the
+    // case the mapping exists for, so anything skipped here is a lost value.
     let mut out = GraphStore::new();
-    RdfToGraphMapper::new(BASE)
+    let imported = RdfToGraphMapper::new(BASE)
         .map_to_graph(&rdf, &mut out)
         .expect("import");
 
@@ -73,7 +75,8 @@ fn main() {
     let types_kept = typed_properties_survive(&out);
     let iris_stable = !iris_first.is_empty() && iris_first == iris_second;
 
-    let ok = nodes_in == nodes_out && edges_in == edges_out && types_kept && iris_stable;
+    let lossless = imported.lossless();
+    let ok = nodes_in == nodes_out && edges_in == edges_out && types_kept && iris_stable && lossless;
 
     println!("RDF round trip (NDS-15)");
     println!("  triples written      {}", report.triples_written);
@@ -82,6 +85,13 @@ fn main() {
     println!("  edges    {edges_in} -> {edges_out}");
     println!("  property types kept  {types_kept}");
     println!("  IRIs stable on a second trip  {iris_stable}");
+    println!(
+        "  import: {} triples read, {} skipped, {} language tags dropped, {} literals read as strings -> lossless {lossless}",
+        imported.triples_read,
+        imported.predicates_skipped.values().sum::<u64>(),
+        imported.language_tags_dropped,
+        imported.literals_typed_as_string,
+    );
     println!("  {}", if ok { "round trip preserved the graph" } else { "ROUND TRIP LOST SOMETHING" });
 
     if let Some(path) = json_out {
@@ -89,7 +99,8 @@ fn main() {
             "{{\n  \"round_trip_preserves_graph\": {ok},\n  \"nodes_in\": {nodes_in},\n  \
              \"nodes_out\": {nodes_out},\n  \"edges_in\": {edges_in},\n  \"edges_out\": {edges_out},\n  \
              \"triples_written\": {},\n  \"duplicates_collapsed\": {},\n  \
-             \"property_types_preserved\": {types_kept},\n  \"iris_stable\": {iris_stable}\n}}\n",
+             \"property_types_preserved\": {types_kept},\n  \"iris_stable\": {iris_stable},\n  \
+             \"import_lossless\": {lossless}\n}}\n",
             report.triples_written, report.duplicates_collapsed
         );
         std::fs::write(&path, json).expect("write json");
