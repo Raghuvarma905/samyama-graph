@@ -1780,9 +1780,17 @@ impl QueryPlanner {
         // is still row-driven, and planning it here runs the MERGE once with
         // nothing bound. It falls through to the general path, where the
         // Unwind feeds the merge.
+        //
+        // `LOAD CSV` and `LOAD PARQUET` are row sources too, and the CREATE-only
+        // branch below already excludes them. This one did not, so
+        // `LOAD CSV ... AS row MERGE (:N {name: row.name})` -- the standard
+        // idempotent bulk load -- planned the MERGE alone, never opened the
+        // file, and failed with "Variable not found: row" (#1895).
         if query.match_clauses.is_empty()
             && query.call_clause.is_none()
             && !Self::has_any_unwind(query)
+            && query.load_csv_clause.is_none()
+            && query.load_parquet_clause.is_none()
         {
             if let Some(merge_clause) = &query.merge_clause {
                 let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
