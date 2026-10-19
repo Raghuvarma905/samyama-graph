@@ -20697,7 +20697,11 @@ impl PhysicalOperator for SetPropertyOperator {
 
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
         if let Some(record) = self.input.next_mut(store, tenant_id)? {
-            // Evaluate all SET expressions first (immutable borrow of store)
+            // Evaluate all SET expressions first (immutable borrow of store).
+            //
+            // An evaluation error is the statement's error. It used to become
+            // `Null`, and a null SET *removes* the property: a call that failed
+            // reported success and deleted what was there (#1897).
             let evaluated: Vec<_> = self.items.iter().map(|(var, prop, expr)| {
                 let val = match eval_expression(expr, &record, store) {
                     Ok(v) => match v {
@@ -20746,10 +20750,10 @@ impl PhysicalOperator for SetPropertyOperator {
                         Value::Edge(id, _) => PropertyValue::Integer(id.as_u64() as i64),
                         Value::Path { .. } => PropertyValue::Null,
                     },
-                    Err(_) => PropertyValue::Null,
+                    Err(e) => return Err(e),
                 };
-                (var.clone(), prop.clone(), val)
-            }).collect();
+                Ok((var.clone(), prop.clone(), val))
+            }).collect::<ExecutionResult<_>>()?;
 
             // A property is a scalar or a list of scalars. `SET a.maplist =
             // [{num: 1}]` stored an `Array([Map(..)])` -- something

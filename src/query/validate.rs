@@ -2491,10 +2491,71 @@ fn validate_function_names(query: &Query) -> Result<(), ValidationError> {
         Ok(())
     }
 
-    for e in all_expressions(query) {
+    for e in all_expressions(query)
+        .into_iter()
+        .chain(write_expressions(query))
+        .chain(pattern_property_expressions(query))
+    {
         check(e)?;
     }
     Ok(())
+}
+
+/// Every expression an updating clause evaluates: SET values, `ON CREATE` /
+/// `ON MATCH` values, DELETE targets and FOREACH lists and bodies.
+///
+/// `all_expressions` covers the reading clauses only, so a function check
+/// built on it passed `SET p.x = noSuchFunction(1)`. The statement then ran,
+/// failed to evaluate the call, and reported success having written nothing
+/// (#1897). Kept apart from `all_expressions` because the other checks built
+/// on that were written and measured against reading clauses alone.
+fn write_expressions(query: &Query) -> Vec<&Expression> {
+    use crate::query::ast::{Clause, ForeachBody, ForeachClause, MergeClause, SetClause};
+
+    fn from_set<'a>(sc: &'a SetClause, out: &mut Vec<&'a Expression>) {
+        out.extend(sc.items.iter().map(|i| &i.value));
+        out.extend(sc.entity_items.iter().map(|i| &i.value));
+    }
+    fn from_merge<'a>(mc: &'a MergeClause, out: &mut Vec<&'a Expression>) {
+        out.extend(mc.on_create_set.iter().chain(&mc.on_match_set).map(|i| &i.value));
+        out.extend(mc.on_create_entity_set.iter().chain(&mc.on_match_entity_set).map(|i| &i.value));
+    }
+    fn from_foreach<'a>(f: &'a ForeachClause, out: &mut Vec<&'a Expression>) {
+        out.push(&f.expression);
+        for body in &f.body {
+            match body {
+                ForeachBody::Set(sc) => from_set(sc, out),
+                ForeachBody::Merge(mc) => from_merge(mc, out),
+                ForeachBody::Delete(dc) => out.extend(&dc.expressions),
+                ForeachBody::Foreach(inner) => from_foreach(inner, out),
+                ForeachBody::Create(_) | ForeachBody::Remove(_) => {}
+            }
+        }
+    }
+
+    let mut out: Vec<&Expression> = Vec::new();
+    for sc in &query.set_clauses {
+        from_set(sc, &mut out);
+    }
+    if let Some(mc) = &query.merge_clause {
+        from_merge(mc, &mut out);
+    }
+    if let Some(dc) = &query.delete_clause {
+        out.extend(&dc.expressions);
+    }
+    if let Some(f) = &query.foreach_clause {
+        from_foreach(f, &mut out);
+    }
+    for c in &query.clauses {
+        match c {
+            Clause::Set(sc) => from_set(sc, &mut out),
+            Clause::Merge(mc) => from_merge(mc, &mut out),
+            Clause::Delete(dc) => out.extend(&dc.expressions),
+            Clause::Foreach(f) => from_foreach(f, &mut out),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A projection that aggregates may only combine the aggregate with a
