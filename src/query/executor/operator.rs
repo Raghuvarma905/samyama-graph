@@ -16962,6 +16962,14 @@ pub struct MatchMergeEdgeOperator {
     /// `source -> target` and MERGE created a duplicate beside an existing
     /// `target -> source` (#938).
     edges_to_merge: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>, bool)>,
+    /// The non-literal half of each relationship's property map, by position
+    /// in `edges_to_merge`: `{id: r.id}` from an UNWIND, `{k: a.name}` from a
+    /// bound node. `edges_to_merge` carries only the literals, and these were
+    /// never handed over, so `UNWIND $rows AS r MATCH (a), (b) MERGE
+    /// (a)-[:T {id: r.id}]->(b)` matched any `:T` between the pair and created
+    /// edges without the property -- two rows for one pair wrote one edge,
+    /// with no `id`, and reported success. #642 fixed the node half.
+    property_exprs: Vec<Option<HashMap<String, Expression>>>,
     on_create_set: Vec<(String, String, Expression)>,
     on_match_set: Vec<(String, String, Expression)>,
     /// Whole-entity `ON CREATE`/`ON MATCH SET`; see `MergeOperator` (#874).
@@ -16982,6 +16990,7 @@ impl MatchMergeEdgeOperator {
         Self {
             input,
             edges_to_merge,
+            property_exprs: Vec::new(),
             on_create_set,
             on_match_set,
             on_create_entity_set: Vec::new(),
@@ -17002,6 +17011,13 @@ impl MatchMergeEdgeOperator {
         self.on_match_entity_set = on_match;
         self
     }
+
+    /// Attach each relationship's non-literal properties, in the order of
+    /// `edges_to_merge`. A missing entry means the pattern has none.
+    pub fn with_property_exprs(mut self, exprs: Vec<Option<HashMap<String, Expression>>>) -> Self {
+        self.property_exprs = exprs;
+        self
+    }
 }
 
 impl PhysicalOperator for MatchMergeEdgeOperator {
@@ -17016,9 +17032,22 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
         if !self.done {
             while let Some(record) = self.input.next_mut(store, tenant_id)? {
-                for (source_var, target_var, edge_type, properties, edge_var, undirected) in
-                    &self.edges_to_merge
+                for (i, (source_var, target_var, edge_type, literal_properties, edge_var, undirected)) in
+                    self.edges_to_merge.iter().enumerate()
                 {
+                    // Resolved against this row, and the one map used both to
+                    // match and to create -- the property #642 holds to for
+                    // nodes: a MERGE that searched on one set of values and
+                    // wrote another would create an edge its own pattern
+                    // could not find, and running it twice would make two.
+                    let resolved = MergeOperator::resolved_props(
+                        Some(literal_properties),
+                        self.property_exprs.get(i).and_then(|e| e.as_ref()),
+                        &record,
+                        store,
+                    )?
+                    .unwrap_or_default();
+                    let properties = &resolved;
                     let source_id = match record.get(source_var).and_then(|v| v.node_id()) {
                         Some(id) => id,
                         None => continue,
@@ -17183,12 +17212,16 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
         let mut parts: Vec<String> = self
             .edges_to_merge
             .iter()
-            .map(|(source, target, edge_type, properties, edge_var, undirected)| {
+            .enumerate()
+            .map(|(i, (source, target, edge_type, properties, edge_var, undirected))| {
                 let edge = format!(
                     "[{}:{}{}]",
                     edge_var.as_deref().unwrap_or(""),
                     edge_type.as_str(),
-                    format_properties(Some(properties), None)
+                    format_properties(
+                        Some(properties),
+                        self.property_exprs.get(i).and_then(|e| e.as_ref())
+                    )
                 );
                 if *undirected {
                     format!("({})-{}-({})", source, edge, target)
