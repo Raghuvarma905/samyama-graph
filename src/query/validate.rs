@@ -2059,15 +2059,11 @@ fn validate_variables_are_bound(query: &Query) -> Result<(), ValidationError> {
         }
     }
     let mut note_merge_use = |mc: &crate::query::ast::MergeClause, used: &mut Vec<String>| {
-        for item in mc.on_create_set.iter().chain(mc.on_match_set.iter()) {
+        for item in mc.on_create_set().chain(mc.on_match_set()) {
             used.push(item.variable.clone());
             collect_all_vars(&item.value, used);
         }
-        for item in mc
-            .on_create_entity_set
-            .iter()
-            .chain(mc.on_match_entity_set.iter())
-        {
+        for item in mc.on_create_entity_set().chain(mc.on_match_entity_set()) {
             used.push(item.variable.clone());
             collect_all_vars(&item.value, used);
         }
