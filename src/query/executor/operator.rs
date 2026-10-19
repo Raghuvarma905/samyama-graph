@@ -20725,8 +20725,12 @@ impl PhysicalOperator for SetPropertyOperator {
             // Evaluate every property write's value first, before anything is
             // written, so `SET a.x = a.y, a.y = a.x` swaps. A whole-entity
             // write is evaluated where it stands, as it always was.
+            //
+            // An evaluation error is the statement's error. It used to become
+            // `Null`, and a null SET *removes* the property: a call that failed
+            // reported success and deleted what was there (#1897).
             let evaluated: Vec<Option<PropertyValue>> = self.writes.iter().map(|w| {
-                let SetWrite::Property(_, _, expr) = w else { return None };
+                let SetWrite::Property(_, _, expr) = w else { return Ok(None) };
                 let val = match eval_expression(expr, &record, store) {
                     Ok(v) => match v {
                         Value::Property(pv) => pv,
@@ -20774,10 +20778,10 @@ impl PhysicalOperator for SetPropertyOperator {
                         Value::Edge(id, _) => PropertyValue::Integer(id.as_u64() as i64),
                         Value::Path { .. } => PropertyValue::Null,
                     },
-                    Err(_) => PropertyValue::Null,
+                    Err(e) => return Err(e),
                 };
-                Some(val)
-            }).collect();
+                Ok(Some(val))
+            }).collect::<ExecutionResult<_>>()?;
 
             // A property is a scalar or a list of scalars. `SET a.maplist =
             // [{num: 1}]` stored an `Array([Map(..)])` -- something
