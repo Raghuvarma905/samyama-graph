@@ -444,6 +444,22 @@ mod tests {
     /// are not exotic: they are the ordinary way to write a destructive
     /// statement in Cypher, and the NLQ pipeline runs whatever the model
     /// returns once this says yes.
+    #[test]
+    fn a_write_that_begins_with_match_is_not_safe() {
+        let pipeline = make_pipeline();
+        for q in [
+            "MATCH (n) DETACH DELETE n",
+            "MATCH (n) DELETE n",
+            "MATCH (n:Person) SET n.pwned = 1 RETURN n",
+            "MATCH (a:Person) MERGE (b:Backdoor {x: 1}) RETURN a",
+            "MATCH (n) REMOVE n.age RETURN n",
+        ] {
+            assert!(
+                !pipeline.is_safe_query(q),
+                "accepted a destructive statement because it begins with MATCH: {q}"
+            );
+        }
+    }
 
     /// Every write form the parser classifies, asserted through the gate rather
     /// than through `is_write` directly — #438 asks for a negative test per write
@@ -483,23 +499,6 @@ mod tests {
             assert!(
                 !pipeline.is_safe_query(q),
                 "the read-only gate accepted a write: {q:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_write_that_begins_with_match_is_not_safe() {
-        let pipeline = make_pipeline();
-        for q in [
-            "MATCH (n) DETACH DELETE n",
-            "MATCH (n) DELETE n",
-            "MATCH (n:Person) SET n.pwned = 1 RETURN n",
-            "MATCH (a:Person) MERGE (b:Backdoor {x: 1}) RETURN a",
-            "MATCH (n) REMOVE n.age RETURN n",
-        ] {
-            assert!(
-                !pipeline.is_safe_query(q),
-                "accepted a destructive statement because it begins with MATCH: {q}"
             );
         }
     }
