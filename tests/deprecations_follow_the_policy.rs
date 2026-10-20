@@ -92,9 +92,16 @@ fn released() -> BTreeSet<Version> {
         .collect()
 }
 
-/// `(method, path)` for every operation in the OpenAPI document, and the subset
-/// marked `deprecated: true`.
-fn openapi_operations() -> (BTreeSet<(String, String)>, BTreeSet<(String, String)>) {
+/// `(method, path)`, the key of one OpenAPI operation.
+type Operation = (String, String);
+
+/// Every operation in the OpenAPI document, and the subset marked `deprecated: true`.
+struct OpenApi {
+    all: BTreeSet<Operation>,
+    deprecated: BTreeSet<Operation>,
+}
+
+fn openapi_operations() -> OpenApi {
     let doc: serde_yaml::Value =
         serde_yaml::from_str(&read("openapi/openapi.yaml")).expect("openapi.yaml is YAML");
     let mut all = BTreeSet::new();
@@ -112,10 +119,10 @@ fn openapi_operations() -> (BTreeSet<(String, String)>, BTreeSet<(String, String
             all.insert((method, path.clone()));
         }
     }
-    (all, deprecated)
+    OpenApi { all, deprecated }
 }
 
-fn http_operation(e: &serde_json::Value) -> (String, String) {
+fn http_operation(e: &serde_json::Value) -> Operation {
     let op = &e["http"];
     (
         op["method"].as_str().unwrap_or_else(|| panic!("{}: http.method", field(e, "id"))).to_lowercase(),
@@ -129,7 +136,7 @@ fn http_operation(e: &serde_json::Value) -> (String, String) {
 fn the_registry_the_release_notes_and_the_openapi_document_are_all_readable() {
     assert!(!entries().is_empty(), "no deprecations listed; the checks below would be vacuous");
     assert!(released().len() >= 3, "fewer than three releases found in docs/release-notes");
-    assert!(!openapi_operations().0.is_empty(), "openapi.yaml lists no operations");
+    assert!(!openapi_operations().all.is_empty(), "openapi.yaml lists no operations");
     assert!(
         parse(field(&registry(), "policy_applies_from")).is_some(),
         "`policy_applies_from` is not X.Y.Z"
@@ -188,7 +195,7 @@ fn a_removal_waits_for_a_major_and_two_minors_of_notice() {
 
 #[test]
 fn deprecated_http_operations_and_the_registry_agree() {
-    let (all, marked) = openapi_operations();
+    let OpenApi { all, deprecated: marked } = openapi_operations();
     let mut listed = BTreeSet::new();
     for e in entries().iter().filter(|e| field(e, "surface") == "http") {
         let id = field(e, "id");
