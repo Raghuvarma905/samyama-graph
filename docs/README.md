@@ -46,6 +46,7 @@ eight of eighteen documents (#1450).
 
 - **[ACID-GUARANTEES.md](./ACID-GUARANTEES.md)** — the transaction model: MVCC, the logical WAL, what durability `SAMYAMA_FSYNC` does and does not buy, and why there is no Raft replication to rely on.
 - **[FAILURE-MODES.md](./FAILURE-MODES.md)** — how the engine behaves when things go wrong.
+- **[SOC2-CONTROL-SET.md](./SOC2-CONTROL-SET.md)** — SOC 2 gap analysis (documented, not certified): access control, audit, change management, backup and incident response, each control with its evidence and its gap.
 - **[BI-CONNECTIVITY.md](./BI-CONNECTIVITY.md)** — connecting BI tools.
 
 ### Data, provenance and privacy
