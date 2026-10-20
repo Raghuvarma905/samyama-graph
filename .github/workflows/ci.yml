@@ -897,6 +897,56 @@ jobs:
             ${{ runner.temp }}/gpml-conformance/suite/results/summary.json
           if-no-files-found: warn
 
+  # API-09: the SDKs users already have keep working against this build.
+  #
+  # docs/VERSIONING.md promises that the previous minor's SDKs work against the
+  # current server. This installs the Python and TypeScript SDKs AS PUBLISHED --
+  # from PyPI and npm, not from this tree -- for the latest patch of each of the
+  # two most recent minors, and runs a suite through each against the release
+  # binary `test` built. The versions are read from Cargo.toml and the package
+  # indexes on every run (sdk/compat/run.py); nothing here names one.
+  #
+  # In `ci-ok`'s needs: a compatibility promise that does not block a merge that
+  # breaks it is not enforced, and "enforced in CI" is the requirement.
+  sdk-compat:
+    name: sdk-compat (published SDKs against this build)
+    needs: [changes, test]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "20"}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The binary `test` already built; a missing artifact is built here
+      # instead, as the gpml job does.
+      - name: Take the release binary from the test job
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: samyama-release
+          path: target/release
+
+      - name: Use it if it arrived, otherwise build it
+        run: |
+          set -euo pipefail
+          if [ -f target/release/samyama ]; then
+            # An artifact download does not preserve the executable bit.
+            chmod +x target/release/samyama
+            echo "using the binary built by the test job"
+          else
+            echo "::notice::no release artifact; building the engine"
+            cargo build --release --bin samyama
+          fi
+
+      - name: Run the published SDKs against this build
+        run: python3 sdk/compat/run.py --bin target/release/samyama
+
   # The one check branch protection should require.
   #
   # `test` and the two snapshot jobs take their check names from a matrix. When an
@@ -936,6 +986,7 @@ jobs:
       - sdks
       - snapshot-portability
       - snapshot-portability-read
+      - sdk-compat
     runs-on: ubuntu-latest
     steps:
       - name: Every suite either succeeded or was skipped
