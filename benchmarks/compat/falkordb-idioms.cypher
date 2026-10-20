@@ -7,6 +7,8 @@
 //
 // Every entry was **run on FalkorDB** before it was added (graph module
 // 4.22.1, `falkordb/falkordb:latest`, 2026-10-17) and FalkorDB accepted it.
+// Re-run on 2026-10-20 against the same version, pinned by digest, with
+// `scripts/falkordb_corpus_run.py`: FalkorDB ran all 53.
 // Three shapes a Neo4j user would expect were tried and left out because
 // FalkorDB itself refuses them: `shortestPath` inside MATCH (FalkorDB takes it
 // only in WITH or RETURN), `EXISTS { … }` subqueries, and the `=~` operator.
