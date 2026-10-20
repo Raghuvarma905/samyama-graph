@@ -442,6 +442,12 @@ jobs:
         # nobody can rely on at the moment it matters.
         run: python3 scripts/test_check_release_gate.py
 
+      - name: The triage-SLA measurement counts neither weekends nor labels
+        # The daily measurement itself lives in triage-sla.yml, because whether
+        # an issue got a reply is not a property of a PR. Its rules are, and a
+        # change that breaks them should fail here, not on some later weekday.
+        run: python3 scripts/test_triage_sla.py
+
       - name: LINT-RATCHET — the clippy warning count may not rise
         id: lint_ratchet
         # Runs even if an earlier gate failed, and the run-all-gates step

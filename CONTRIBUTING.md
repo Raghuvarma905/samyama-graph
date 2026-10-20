@@ -189,6 +189,7 @@ Small, well-scoped PRs are reviewed and merged faster than large ones.
 | **CI** (`ci.yml`) | every PR, push to `main` | `cargo test --workspace` (dev profile) and `cargo check --all-targets` | ~7 min |
 | **Nightly sweep** (`nightly.yml`) | 02:30 UTC, or manual dispatch | `scripts/verify-sweep.sh` — tests, every example, every bench, every case study | ~50 min |
 | **GPU CI** (`gpu-ci.yml`) | manual dispatch only | GPU-path tests on a self-hosted runner | — |
+| **Triage SLA** (`triage-sla.yml`) | 03:30 UTC on weekdays, or manual dispatch | `scripts/triage_sla.py` — fails if an outside issue waited more than 2 business days for a first response ([SUPPORT.md](SUPPORT.md)) | ~1 min |
 
 **`test (ubuntu-latest)` is a required check on `main`.** A PR cannot merge until
 it passes.
@@ -228,7 +229,8 @@ Good first contributions, roughly easiest to hardest:
 4. **Open issues** — see the
    [issue tracker](https://github.com/samyama-ai/samyama-graph/issues), where
    each issue is a concrete unit of work, and known gaps noted in
-   `docs/CYPHER-COMPATIBILITY.md`.
+   `docs/CYPHER-COMPATIBILITY.md`. [`ROADMAP.md`](ROADMAP.md) explains which
+   of them are accepted for a date.
 
 ## Project Layout
 
