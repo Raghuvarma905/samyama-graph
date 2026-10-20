@@ -925,7 +925,11 @@ jobs:
 
       # The binary `test` already built; a missing artifact is built here
       # instead, as the gpml job does.
+      - name: Discard any cached release executable
+        run: rm -f target/release/samyama
+
       - name: Take the release binary from the test job
+        id: sdk_release_binary
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -935,13 +939,15 @@ jobs:
       - name: Use it if it arrived, otherwise build it
         run: |
           set -euo pipefail
-          if [ -f target/release/samyama ]; then
+          if [ "${{ steps.sdk_release_binary.outcome }}" = "success" ] && [ -f target/release/samyama ]; then
             # An artifact download does not preserve the executable bit.
             chmod +x target/release/samyama
             echo "using the binary built by the test job"
           else
             echo "::notice::no release artifact; building the engine"
-            cargo build --release --bin samyama
+            # A failed download may have left a partial executable behind.
+            rm -f target/release/samyama
+            cargo build --release --bin samyama --locked
           fi
 
       - name: Run the published SDKs against this build
