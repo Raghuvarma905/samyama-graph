@@ -164,3 +164,42 @@ fn labels_and_plus_equals_still_apply() {
         vec![vec![some("a@x")]]
     );
 }
+
+/// `ON MATCH SET n.k = null` removes `k`, as `SET n.k = null` does.
+///
+/// The single-node MERGE path used to skip a null value instead of removing
+/// the property, so the old `k` survived a write that asked for it to go. Read
+/// back through `keys(n)` as well as `n.k`: a property stored as null and a
+/// property removed both read as null, and only the key count tells them apart.
+#[test]
+fn on_match_set_to_null_removes_the_property() {
+    let mut s = GraphStore::new();
+    write(&mut s, "CREATE (:P {email: 'a@x', k: 7})");
+    write(&mut s, "MERGE (n:P {email: 'a@x'}) ON MATCH SET n.k = null");
+    assert_eq!(rows(&s, NODE, COLS), vec![vec![some("a@x"), None, None, None]]);
+    assert_eq!(
+        rows(&s, "MATCH (n:P) RETURN size(keys(n)) AS c", &["c"]),
+        vec![vec![some("1")]],
+        "k was kept as a stored null rather than removed"
+    );
+}
+
+/// `ON CREATE SET` may write to a variable bound before the MERGE.
+///
+/// `MATCH (a) MERGE (n …) ON CREATE SET a.x = 1` ignored the write to `a`: it
+/// returned without error and `a.x` stayed unset, the silent write-loss of
+/// #1896 and #1897. It now lands -- once, on the create, and not again on a
+/// later match, where the `ON CREATE` branch does not run.
+#[test]
+fn on_create_set_writes_to_a_variable_bound_before_the_merge() {
+    let mut s = GraphStore::new();
+    write(&mut s, "CREATE (:A {id: 1})");
+    write(&mut s, "MATCH (a:A {id: 1}) MERGE (n:P {email: 'b@x'}) ON CREATE SET a.x = 1");
+    let a = "MATCH (a:A) RETURN a.x AS x";
+    assert_eq!(rows(&s, a, &["x"]), vec![vec![some("1")]], "the ON CREATE write to `a` was dropped");
+    assert_eq!(rows(&s, "MATCH (n:P) RETURN n.email AS e", &["e"]), vec![vec![some("b@x")]]);
+
+    // Matched this time: ON CREATE does not run, so `a.x` keeps the 1.
+    write(&mut s, "MATCH (a:A {id: 1}) MERGE (n:P {email: 'b@x'}) ON CREATE SET a.x = 2");
+    assert_eq!(rows(&s, a, &["x"]), vec![vec![some("1")]]);
+}
