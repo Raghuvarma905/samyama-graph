@@ -633,9 +633,10 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("Turtle") && msg.contains(".sgsnap"), "{msg}");
-        let err = write(Format::GraphMl, &store, Vec::new(), &Options::default()).unwrap_err();
+        // A format with no writer yet. Not GraphML: that one writes (#1914).
+        let err = write(Format::Turtle, &store, Vec::new(), &Options::default()).unwrap_err();
         assert!(
-            matches!(err, ConvertError::CannotWrite(Format::GraphMl)),
+            matches!(err, ConvertError::CannotWrite(Format::Turtle)),
             "{err}"
         );
     }
