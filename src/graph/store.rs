@@ -7421,6 +7421,7 @@ mod tests {
             ("txn_create_node", "reserves an id inside the transaction; the node enters the store at commit_transaction, which bumps (#1200)"),
             ("begin_session_transaction", "opens the session transaction and advances the version; no row changes, and the statements that follow bump on their own paths (#1200 step 6)"),
             ("commit_session_transaction", "drops the rollback journal, keeping every write already applied and already bumped; rollback_session_transaction, which does change rows, bumps (#1200 step 6)"),
+            ("add_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
         ];
 
         let src = std::fs::read_to_string(concat!(
