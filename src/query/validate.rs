@@ -2059,15 +2059,11 @@ fn validate_variables_are_bound(query: &Query) -> Result<(), ValidationError> {
         }
     }
     let mut note_merge_use = |mc: &crate::query::ast::MergeClause, used: &mut Vec<String>| {
-        for item in mc.on_create_set.iter().chain(mc.on_match_set.iter()) {
+        for item in mc.on_create_set().chain(mc.on_match_set()) {
             used.push(item.variable.clone());
             collect_all_vars(&item.value, used);
         }
-        for item in mc
-            .on_create_entity_set
-            .iter()
-            .chain(mc.on_match_entity_set.iter())
-        {
+        for item in mc.on_create_entity_set().chain(mc.on_match_entity_set()) {
             used.push(item.variable.clone());
             collect_all_vars(&item.value, used);
         }
@@ -2517,8 +2513,8 @@ fn write_expressions(query: &Query) -> Vec<&Expression> {
         out.extend(sc.entity_items().map(|i| &i.value));
     }
     fn from_merge<'a>(mc: &'a MergeClause, out: &mut Vec<&'a Expression>) {
-        out.extend(mc.on_create_set.iter().chain(&mc.on_match_set).map(|i| &i.value));
-        out.extend(mc.on_create_entity_set.iter().chain(&mc.on_match_entity_set).map(|i| &i.value));
+        out.extend(mc.on_create_set().chain(mc.on_match_set()).map(|i| &i.value));
+        out.extend(mc.on_create_entity_set().chain(mc.on_match_entity_set()).map(|i| &i.value));
     }
     fn from_foreach<'a>(f: &'a ForeachClause, out: &mut Vec<&'a Expression>) {
         out.push(&f.expression);

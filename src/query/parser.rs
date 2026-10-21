@@ -1925,36 +1925,14 @@ fn parse_load_parquet_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<L
 fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> ParseResult<()> {
     // merge_stmt has pattern, on_create_set?, on_match_set?, return_clause?
     let mut pattern = None;
-    let mut on_create_set = Vec::new();
-    let mut on_match_set = Vec::new();
-    let mut on_create_labels = Vec::new();
-    let mut on_match_labels = Vec::new();
-    let mut on_create_entity_set = Vec::new();
-    let mut on_match_entity_set = Vec::new();
+    let mut on_create = Vec::new();
+    let mut on_match = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
-            Rule::on_create_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => on_create_entity_set.push(parse_set_entity_item(si)?),
-                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
-            Rule::on_match_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => on_match_entity_set.push(parse_set_entity_item(si)?),
-                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
+            Rule::on_create_set => parse_on_set_block(inner, &mut on_create)?,
+            Rule::on_match_set => parse_on_set_block(inner, &mut on_match)?,
             Rule::set_clause => {
                 // A bare SET after MERGE, applying on both branches. Kept in
                 // `query.set_clauses` rather than folded into ON CREATE/ON MATCH so the
@@ -1974,52 +1952,40 @@ fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
 
     query.merge_clause = Some(MergeClause {
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
-        on_create_set,
-        on_match_set,
-        on_create_labels,
-        on_match_labels,
-        on_create_entity_set,
-        on_match_entity_set,
+        on_create,
+        on_match,
     });
+    Ok(())
+}
+
+/// The items of one `ON CREATE SET` / `ON MATCH SET`, appended in the order
+/// written, so a later block follows an earlier one (#1919).
+fn parse_on_set_block(
+    pair: pest::iterators::Pair<Rule>,
+    ops: &mut Vec<crate::query::ast::SetOp>,
+) -> ParseResult<()> {
+    use crate::query::ast::SetOp;
+    for si in pair.into_inner() {
+        match si.as_rule() {
+            Rule::set_item => ops.push(SetOp::Property(parse_set_item(si)?)),
+            Rule::set_entity_item => ops.push(SetOp::Entity(parse_set_entity_item(si)?)),
+            Rule::set_label_item => ops.push(SetOp::Labels(parse_set_label_item(si)?)),
+            _ => {}
+        }
+    }
     Ok(())
 }
 
 fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeClause> {
     let mut pattern = None;
-    let mut on_create_set = Vec::new();
-    let mut on_match_set = Vec::new();
-    let mut on_create_labels = Vec::new();
-    let mut on_match_labels = Vec::new();
-    let mut on_create_entity_set = Vec::new();
-    let mut on_match_entity_set = Vec::new();
+    let mut on_create = Vec::new();
+    let mut on_match = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
-            Rule::on_create_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => {
-                            on_create_entity_set.push(parse_set_entity_item(si)?)
-                        }
-                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
-            Rule::on_match_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => {
-                            on_match_entity_set.push(parse_set_entity_item(si)?)
-                        }
-                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
+            Rule::on_create_set => parse_on_set_block(inner, &mut on_create)?,
+            Rule::on_match_set => parse_on_set_block(inner, &mut on_match)?,
             Rule::return_clause => {
                 // Handled at statement level for merge_stmt
             }
@@ -2029,12 +1995,8 @@ fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeCla
 
     Ok(MergeClause {
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
-        on_create_set,
-        on_match_set,
-        on_create_labels,
-        on_match_labels,
-        on_create_entity_set,
-        on_match_entity_set,
+        on_create,
+        on_match,
     })
 }
 
@@ -3766,8 +3728,8 @@ mod tests {
         let ast = result.unwrap();
         assert!(ast.merge_clause.is_some());
         let merge = ast.merge_clause.unwrap();
-        assert_eq!(merge.on_create_set.len(), 1);
-        assert_eq!(merge.on_match_set.len(), 1);
+        assert_eq!(merge.on_create_set().count(), 1);
+        assert_eq!(merge.on_match_set().count(), 1);
     }
 
     #[test]

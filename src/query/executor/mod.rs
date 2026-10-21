@@ -1105,11 +1105,12 @@ fn substitute_merge(
     p: &HashMap<String, crate::graph::PropertyValue>,
 ) -> ExecutionResult<()> {
     substitute_pattern(&mut mc.pattern, p)?;
-    for item in mc.on_create_set.iter_mut().chain(mc.on_match_set.iter_mut()) {
-        substitute_expr(&mut item.value, p)?;
-    }
-    for item in mc.on_create_entity_set.iter_mut().chain(mc.on_match_entity_set.iter_mut()) {
-        substitute_expr(&mut item.value, p)?;
+    for op in mc.on_create.iter_mut().chain(mc.on_match.iter_mut()) {
+        match op {
+            crate::query::ast::SetOp::Property(item) => substitute_expr(&mut item.value, p)?,
+            crate::query::ast::SetOp::Entity(item) => substitute_expr(&mut item.value, p)?,
+            crate::query::ast::SetOp::Labels(_) => {}
+        }
     }
     Ok(())
 }
