@@ -143,6 +143,30 @@ index over any float list nobody had indexed.
   label or property — is skipped and counted in `ImportStats::index_conflicts`:
   the rows already there were indexed under the target's definition.
 
+**The header can say where the data came from** (`sources`, added 2026-10-21 for
+#1911). One entry per input a converter read (`samyama convert`, #1905), so a
+converted file explains itself and can be converted back:
+
+```json
+"sources": [{"format": "turtle", "file": "cso.ttl", "sha256": "…",
+             "converter": "samyama-convert 1.12.0", "mapping": {…}}]
+```
+
+- **Additive, no version bump.** Absent when empty, as `queries` and
+  `read_only` are, so a header with no sources is written exactly as before
+  and a header written before #1911 reads with none. `mapping` is the resolved
+  mapping (#1910), omitted when none applied. `file` is a bare name, never a
+  path, for the same reason as `queries.file`.
+- **A list, carried by the graph.** Import adds a snapshot's sources to the
+  store (`GraphStore::snapshot_sources`), only once the import has succeeded,
+  and every export writes them back. Two converted files imported into one
+  tenant and exported again keep both entries.
+- **Never claimed silently.** The store remembers its data epoch when sources
+  were recorded. An export at a later epoch -- the graph changed after it was
+  converted -- keeps the sources and adds `sources_may_be_stale` to `dropped`,
+  so the header says where the data started, not that it still matches.
+- **Shown by `samyama verify`**, one line per source.
+
 Properties are encoded as JSON values. Edge records ("stub edges") carry only `id, src, tgt, type, props` — endpoint/type metadata, no creation timestamps in v2.
 
 ### Typed values

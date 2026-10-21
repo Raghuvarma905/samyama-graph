@@ -879,6 +879,17 @@ fn cmd_verify(argv: &[String]) -> i32 {
     let total = report.results.len();
     let failed: Vec<_> = report.failed().collect();
     println!("verify {snapshot}");
+    // Where the data came from, when a converter recorded it (#1911).
+    for src in &header.sources {
+        println!(
+            "  source {} ({}), sha256 {}, by {}{}",
+            src.file,
+            src.format,
+            src.sha256,
+            src.converter,
+            if src.mapping.is_some() { ", with a mapping" } else { "" }
+        );
+    }
     println!("  catalog {catalog_path}: {total} entries");
     if header.queries.is_some() {
         println!("  catalog sha256 matches the snapshot header");

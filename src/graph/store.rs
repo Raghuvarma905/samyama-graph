@@ -1395,6 +1395,13 @@ pub struct GraphStore {
     /// is `Relaxed`: a reader that sees a stale epoch re-executes the query,
     /// which is the safe direction.
     epoch: std::sync::atomic::AtomicU64,
+    /// Where this graph's data came from, from the `.sgsnap` headers it was
+    /// imported from or a converter that built it (#1911). Written back into
+    /// the header of every export.
+    snapshot_sources: Vec<crate::snapshot::format::SnapshotSource>,
+    /// The data epoch when `snapshot_sources` was last added to. An export at
+    /// a later epoch flags the sources as possibly stale.
+    snapshot_sources_epoch: u64,
 }
 
 
@@ -1473,6 +1480,8 @@ impl GraphStore {
             catalog: GraphCatalog::new(),
             statistics_cache: std::sync::RwLock::new(None),
             epoch: std::sync::atomic::AtomicU64::new(0),
+            snapshot_sources: Vec::new(),
+            snapshot_sources_epoch: 0,
         }
     }
 
@@ -4818,6 +4827,30 @@ NodeDeleted { .. } => {
         self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Where this graph's data came from (#1911). Empty for a graph built by
+    /// queries alone.
+    pub fn snapshot_sources(&self) -> &[crate::snapshot::format::SnapshotSource] {
+        &self.snapshot_sources
+    }
+
+    /// Record inputs this graph's data now comes from: an imported snapshot's
+    /// sources, or the file a converter just read. Appended, so two imports
+    /// into one graph keep both, and taken as describing the graph as it is
+    /// now.
+    pub fn add_snapshot_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
+    ) {
+        self.snapshot_sources.extend(sources);
+        self.snapshot_sources_epoch = self.epoch();
+    }
+
+    /// Whether the data is unchanged since the sources were last recorded.
+    /// `false` means an export should say they may be stale.
+    pub fn snapshot_sources_are_current(&self) -> bool {
+        self.epoch() == self.snapshot_sources_epoch
+    }
+
     /// Declare that query-visible data changed.
     ///
     /// `&self` rather than `&mut self` so the paths that hand out an interior
@@ -6389,6 +6422,7 @@ NodeDeleted { .. } => {
     /// Clear all data from the graph
     pub fn clear(&mut self) {
         self.invalidate_statistics_cache();
+        self.snapshot_sources.clear();
         self.nodes.clear();
         self.edge_type_table.clear();
         self.edge_type_to_id.clear();
