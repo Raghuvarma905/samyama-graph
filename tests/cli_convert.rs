@@ -162,9 +162,9 @@ fn usage_errors_exit_2_before_the_input_is_read() {
         assert!(stderr(&o).contains(says), "{args:?}: {}", stderr(&o));
     }
     // A refused output format is checked before a missing input is noticed.
-    let o = run(&[&out("missing.sgsnap"), &out("out.graphml")]);
+    let o = run(&[&out("missing.sgsnap"), &out("out.nt")]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
-    assert!(!dir.path().join("out.graphml").exists());
+    assert!(!dir.path().join("out.nt").exists());
 }
 
 #[test]
