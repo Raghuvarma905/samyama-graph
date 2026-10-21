@@ -3,6 +3,7 @@ members = [
     ".", "crates/samyama-graph-algorithms",
     "crates/samyama-optimization",
     "crates/samyama-sdk",
+    "crates/samyama-convert",
     "crates/samyama-gpu",
     "cli",
 ]
