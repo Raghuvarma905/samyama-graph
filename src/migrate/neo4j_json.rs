@@ -81,6 +81,12 @@ pub struct ImportReport {
     pub unknown_record_types: Vec<String>,
     /// Lines that were not valid JSON, as `(line number, message)`.
     pub unparseable_lines: Vec<(usize, String)>,
+    /// Nodes labelled `Unresolved` created for relationship endpoints the file
+    /// never defined, when [`ImportOptions::placeholders`] asked for them
+    /// (#1913). Each holds the missing Neo4j id as `neo4j_id`. Zero otherwise:
+    /// those relationships are counted in `dangling_edges` instead.
+    #[serde(default)]
+    pub placeholder_nodes: usize,
 }
 
 impl ImportReport {
@@ -129,11 +135,31 @@ impl From<crate::graph::GraphError> for ImportError {
     }
 }
 
+/// How an import treats what the file does not resolve.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportOptions {
+    /// Give a relationship whose endpoint the file never defines a node
+    /// labelled `Unresolved`, holding the missing id as `neo4j_id`, instead of
+    /// leaving the relationship out. Off by default: the relationship is
+    /// counted as dangling and not created (#1913).
+    pub placeholders: bool,
+}
+
 /// Import `apoc.export.json` text into `store`, appending to whatever it holds.
 pub fn import_str(
     text: &str,
     store: &mut GraphStore,
     tenant_id: &str,
+) -> Result<ImportReport, ImportError> {
+    import_str_with(text, store, tenant_id, ImportOptions::default())
+}
+
+/// [`import_str`] with [`ImportOptions`].
+pub fn import_str_with(
+    text: &str,
+    store: &mut GraphStore,
+    tenant_id: &str,
+    options: ImportOptions,
 ) -> Result<ImportReport, ImportError> {
     let mut report = ImportReport::default();
     let records = split_records(text, &mut report)?;
@@ -172,6 +198,9 @@ pub fn import_str(
 
     let mut missing: Vec<String> = Vec::new();
     for record in pending {
+        if options.placeholders {
+            resolve_with_placeholders(&record, store, tenant_id, &mut node_ids, &mut report)?;
+        }
         import_relationship(&record, store, &node_ids, &mut report, &mut missing)?;
     }
     missing.sort();
@@ -336,6 +365,33 @@ fn import_relationship(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Create an `Unresolved` node for each endpoint of `record` the file never
+/// defined, so the relationship can be created against it. An endpoint with no
+/// id at all is left alone: there is nothing to hold, and the relationship
+/// stays dangling.
+fn resolve_with_placeholders(
+    record: &Json,
+    store: &mut GraphStore,
+    tenant_id: &str,
+    node_ids: &mut HashMap<String, NodeId>,
+    report: &mut ImportReport,
+) -> Result<(), ImportError> {
+    for key in ["start", "end"] {
+        let Some(v) = record.get(key) else { continue };
+        let Some(id) = v.get("id").and_then(json_id).or_else(|| json_id(v)) else {
+            continue;
+        };
+        if node_ids.contains_key(&id) {
+            continue;
+        }
+        let node = store.create_node("Unresolved");
+        store.set_node_property(tenant_id, node, "neo4j_id", id.clone())?;
+        node_ids.insert(id, node);
+        report.placeholder_nodes += 1;
     }
     Ok(())
 }
