@@ -58,6 +58,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64
             manylinux: "2_28"
+            sccache: "true"
           # Built natively on an arm runner. Cross-compiling through the
           # manylinux cross image failed twice (2026-09-07 and v1.8.0): bindgen
           # found no aarch64 sysroot headers, `bits/libc-header-start.h`.
@@ -65,6 +66,7 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64
             manylinux: "2_28"
+            sccache: "true"
           # manylinux is meaningless off Linux, but every entry sets it so the
           # action never receives an empty string for an input it expects unset.
           # macos-13 is no longer a GitHub-hosted label; a job asking for it
@@ -73,6 +75,7 @@ jobs:
             runner: macos-15-intel
             target: x86_64
             manylinux: "off"
+            sccache: "true"
           # macos-14 retires 2026-11-02, and GitHub fails jobs asking for it
           # during announced brownouts before then -- the first was 2026-10-05
           # 14:00 UTC. A brownout here withholds every wheel, because `publish`
@@ -81,10 +84,12 @@ jobs:
             runner: macos-15
             target: aarch64
             manylinux: "off"
+            sccache: "true"
           - platform: windows-x64
             runner: windows-2022
             target: x64
             manylinux: "off"
+            sccache: "false"
 
     steps:
       - uses: actions/checkout@v4
@@ -108,7 +113,23 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist --locked
-          sccache: "true"
+          # Per-platform: windows-x64 builds without it. MSVC 14.51 (Visual
+          # Studio 18, which arrived on the then-floating `windows-latest`)
+          # made every rocksdb translation unit fail under the sccache wrapper
+          # with
+          #   c1xx: fatal error C1083: Cannot open source file: '/WX-'
+          # -- cl.exe receiving `/WX-` as an input path rather than a flag.
+          # The flag is in neither cc-rs nor librocksdb-sys (both checked at
+          # the versions involved), so it is introduced between cc-rs and
+          # cl.exe, which is where sccache sits. v1.11.0 built fine here on
+          # 2026-10-05; nothing in sdk/python's native build changed between
+          # the two tags, so the trigger was the toolchain, not this repo.
+          #
+          # The runner is pinned to windows-2022 below, so sccache would very
+          # likely work again -- it stays off anyway. A cache miss costs
+          # minutes on one job; this cost v1.12.0 its entire PyPI release, and
+          # the pin will eventually have to move.
+          sccache: ${{ matrix.sccache }}
           # librocksdb-sys generates its bindings with bindgen, which needs
           # libclang, and the manylinux images ship none: v1.8.0's x86_64 wheel
           # failed on "Unable to find libclang". Runs only in the Linux container.
