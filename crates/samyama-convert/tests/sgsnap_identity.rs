@@ -31,10 +31,16 @@ fn graph() -> GraphStore {
 }
 
 /// Everything a reader can see, in an order that does not depend on ids.
+///
+/// Nodes are read through `node_materialized`, as persistence reads them: most
+/// node properties live in the column store, and a node's row copy alone shows
+/// only the ones that never moved there.
 fn contents(s: &GraphStore) -> (Vec<String>, Vec<String>) {
+    let materialized = |id| s.node_materialized(id).expect("listed node exists");
     let mut nodes: Vec<String> = s
         .all_nodes()
         .iter()
+        .map(|n| materialized(n.id))
         .map(|n| {
             let mut labels: Vec<_> = n.labels.iter().map(|l| l.as_str().to_string()).collect();
             labels.sort();
@@ -49,9 +55,11 @@ fn contents(s: &GraphStore) -> (Vec<String>, Vec<String>) {
         .collect();
     nodes.sort();
     let name = |id| {
-        s.get_node(id)
-            .and_then(|n| n.properties.get("name").map(|v| format!("{v:?}")))
-            .unwrap_or_else(|| format!("{:?}", s.get_node(id).map(|n| n.labels.clone())))
+        let n = materialized(id);
+        n.properties
+            .get("name")
+            .map(|v| format!("{v:?}"))
+            .unwrap_or_else(|| format!("{:?}", n.labels))
     };
     let mut edges: Vec<String> = s
         .all_edges()
