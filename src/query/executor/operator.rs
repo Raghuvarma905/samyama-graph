@@ -20739,8 +20739,12 @@ impl PhysicalOperator for SetPropertyOperator {
             // Evaluate every property write's value first, before anything is
             // written, so `SET a.x = a.y, a.y = a.x` swaps. A whole-entity
             // write is evaluated where it stands, as it always was.
+            //
+            // An evaluation error is the statement's error. It used to become
+            // `Null`, and a null SET *removes* the property: a call that failed
+            // reported success and deleted what was there (#1897).
             let evaluated: Vec<Option<PropertyValue>> = self.writes.iter().map(|w| {
-                let SetWrite::Property(_, _, expr) = w else { return None };
+                let SetWrite::Property(_, _, expr) = w else { return Ok(None) };
                 let val = match eval_expression(expr, &record, store) {
                     Ok(v) => match v {
                         Value::Property(pv) => pv,
@@ -20788,10 +20792,10 @@ impl PhysicalOperator for SetPropertyOperator {
                         Value::Edge(id, _) => PropertyValue::Integer(id.as_u64() as i64),
                         Value::Path { .. } => PropertyValue::Null,
                     },
-                    Err(_) => PropertyValue::Null,
+                    Err(e) => return Err(e),
                 };
-                Some(val)
-            }).collect();
+                Ok(Some(val))
+            }).collect::<ExecutionResult<_>>()?;
 
             // A property is a scalar or a list of scalars. `SET a.maplist =
             // [{num: 1}]` stored an `Array([Map(..)])` -- something
@@ -23354,17 +23358,21 @@ impl PhysicalOperator for WithBarrierOperator {
 /// ExpandInto operator: checks whether an edge exists between two already-bound endpoints.
 ///
 /// Unlike ExpandOperator (which fans out from one bound node to discover new neighbors),
-/// ExpandInto takes a record where BOTH source and target are already bound, and checks
-/// whether a connecting edge exists. If it does, the record passes through (with the edge
-/// optionally bound); if not, the record is filtered out.
+/// ExpandInto takes a record where BOTH source and target are already bound, and emits
+/// it once per connecting edge (with the edge optionally bound); with none, the record is
+/// filtered out.
 ///
-/// This is semantically a filter (fan-in), not an expansion (fan-out).
+/// Once per edge, not once: two parallel `KNOWS` between `a` and `b` are two matches of
+/// `(a)-[r:KNOWS]->(b)`, and an enumerated plan that closed a pattern with this operator
+/// returned one row where every other plan returned two (#1616).
 pub struct ExpandIntoOperator {
     input: OperatorBox,
     source_binding: String,
     target_binding: String,
     edge_type: Option<String>,
     edge_binding: Option<String>,
+    /// The current input record and the edges still to emit it with.
+    pending: Option<(Record, std::vec::IntoIter<crate::graph::EdgeId>)>,
 }
 
 impl ExpandIntoOperator {
@@ -23381,6 +23389,7 @@ impl ExpandIntoOperator {
             target_binding,
             edge_type,
             edge_binding,
+            pending: None,
         }
     }
 }
@@ -23401,6 +23410,31 @@ impl PhysicalOperator for ExpandIntoOperator {
 
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         loop {
+            if let Some((record, edges)) = &mut self.pending {
+                if let Some(edge_id) = edges.next() {
+                    let mut new_record = record.clone();
+                    if let Some(ref edge_var) = self.edge_binding {
+                        // Try full Edge first, fall back to edge_type_ids for stubs
+                        if let Some(edge) = store.get_edge(edge_id) {
+                            new_record.bind(
+                                edge_var.clone(),
+                                Value::EdgeRef(edge_id, edge.source, edge.target, edge.edge_type.clone()),
+                            );
+                        } else if let Some(edge_type) = store.get_edge_type(edge_id) {
+                            let (s, t) = (
+                                record.get(&self.source_binding).and_then(|v| v.node_id()),
+                                record.get(&self.target_binding).and_then(|v| v.node_id()),
+                            );
+                            if let (Some(s), Some(t)) = (s, t) {
+                                new_record.bind(edge_var.clone(), Value::EdgeRef(edge_id, s, t, edge_type));
+                            }
+                        }
+                    }
+                    return Ok(Some(new_record));
+                }
+                self.pending = None;
+            }
+
             let record = match self.input.next(store)? {
                 Some(r) => r,
                 None => return Ok(None),
@@ -23415,27 +23449,11 @@ impl PhysicalOperator for ExpandIntoOperator {
                 .ok_or_else(|| ExecutionError::VariableNotFound(self.target_binding.clone()))?;
 
             let et = self.edge_type.as_ref().map(|t| EdgeType::new(t.as_str()));
-            let et_ref = et.as_ref();
-
-            if let Some(edge_id) = store.edge_between(source_id, target_id, et_ref) {
-                let mut new_record = record;
-                if let Some(ref edge_var) = self.edge_binding {
-                    // Try full Edge first, fall back to edge_type_ids for stubs
-                    if let Some(edge) = store.get_edge(edge_id) {
-                        new_record.bind(
-                            edge_var.clone(),
-                            Value::EdgeRef(edge_id, edge.source, edge.target, edge.edge_type.clone()),
-                        );
-                    } else if let Some(edge_type) = store.get_edge_type(edge_id) {
-                        new_record.bind(
-                            edge_var.clone(),
-                            Value::EdgeRef(edge_id, source_id, target_id, edge_type),
-                        );
-                    }
-                }
-                return Ok(Some(new_record));
+            let edges = store.edges_between(source_id, target_id, et.as_ref());
+            // None -- the record is filtered out, and the next one tried.
+            if !edges.is_empty() {
+                self.pending = Some((record, edges.into_iter()));
             }
-            // No edge found — skip this record, try next
         }
     }
 
@@ -23459,6 +23477,7 @@ impl PhysicalOperator for ExpandIntoOperator {
     }
 
     fn reset(&mut self) {
+        self.pending = None;
         self.input.reset();
     }
 
@@ -26094,6 +26113,32 @@ mod tests {
         // Edge should be bound
         let edge_val = result.get("r").unwrap();
         assert_eq!(edge_val.edge_id(), Some(eid));
+    }
+
+    #[test]
+    fn test_expand_into_emits_once_per_parallel_edge() {
+        // Two parallel KNOWS are two matches of (a)-[r:KNOWS]->(b) (#1616).
+        let mut store = GraphStore::new();
+        let n1 = store.create_node("Person");
+        let n2 = store.create_node("Person");
+        let e1 = store.create_edge(n1, n2, "KNOWS").unwrap();
+        let e2 = store.create_edge(n1, n2, "KNOWS").unwrap();
+        store.create_edge(n1, n2, "LIKES").unwrap();
+
+        let mut r = Record::new();
+        r.bind("a".to_string(), Value::NodeRef(n1));
+        r.bind("b".to_string(), Value::NodeRef(n2));
+        let input = Box::new(StaticInputOperator { records: vec![r], index: 0 });
+        let mut op = ExpandIntoOperator::new(input, "a".to_string(), "b".to_string(), Some("KNOWS".to_string()), Some("r".to_string()));
+
+        let mut got = Vec::new();
+        while let Some(rec) = op.next(&store).unwrap() {
+            got.push(rec.get("r").unwrap().edge_id().unwrap());
+        }
+        got.sort();
+        let mut want = vec![e1, e2];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
