@@ -145,6 +145,48 @@ index over any float list nobody had indexed.
 
 Properties are encoded as JSON values. Edge records ("stub edges") carry only `id, src, tgt, type, props` — endpoint/type metadata, no creation timestamps in v2.
 
+### Typed values
+
+A string, integer, float, boolean, null, list or map property is the JSON value
+of the same kind; lists and map values are encoded recursively. Every other
+`PropertyValue` is a JSON object whose `__type` names it (#1907). The codec is
+`samyama::snapshot::codec::{property_to_json, json_to_property}`, public so a
+converter outside the server calls it rather than copying this table.
+
+| `__type` | Fields | `PropertyValue` | Meaning |
+|---|---|---|---|
+| `DateTime` | `value` (i64) | `DateTime` | milliseconds since the Unix epoch, UTC. The original temporal form, kept unchanged so snapshots written before #689 still read |
+| `Date` | `days` (i32) | `Date` | days since 1970-01-01 |
+| `LocalTime` | `nanos` (i64) | `LocalTime` | nanoseconds since midnight |
+| `Time` | `nanos` (i64), `offset` (i32) | `Time` | nanoseconds since midnight; offset from UTC in seconds |
+| `LocalDateTime` | `secs` (i64), `nanos` (u32) | `LocalDateTime` | seconds since the epoch with no zone, plus a sub-second part |
+| `ZonedDateTime` | `secs` (i64), `nanos` (u32), `offset` (i32), `zone` (string or null) | `ZonedDateTime` | an instant, its offset in seconds, and the IANA zone name when there was one |
+| `Duration` | `months`, `days`, `seconds` (i64), `nanos` (i32) | `Duration` | the four components kept apart, as Cypher keeps them |
+| `Vector` | `value` (array of numbers) | `Vector` | an `f32` embedding |
+
+Reading rules, which a second implementation must follow to agree with this one:
+
+- **A missing or mistyped required field is not defaulted.** For every tag except
+  `Duration`, the object is then read as a plain map, so a damaged record does
+  not become the epoch. `Duration`'s four fields each default to `0`;
+  `offset` defaults to `0` and `nanos` (for `LocalDateTime` / `ZonedDateTime`) to
+  `0` when absent.
+- **An unknown `__type` is a plain map.** That keeps a newer writer's tag
+  readable as data by an older reader, with the tag visible.
+- **Strings are trimmed on import.**
+- **One ambiguity is inherent.** A user's map property that holds a `__type` key
+  naming one of these tags, with that tag's fields, reads back as the typed
+  value. No tag is reserved against user data; a map shaped exactly like a typed
+  value is the one input that does not round-trip.
+
+### Writing a file from a standalone store
+
+`samyama::snapshot::write_file(&store, path, &WriteOptions)` writes any
+`GraphStore`, with no server (#1907). It creates parent directories, writes
+`<path>.tmp`, syncs it, and renames it over `path`, so a crash or an export
+error never leaves a truncated `.sgsnap` that a later import would read as
+short. It returns the export's `ExportStats`, `dropped` included.
+
 ## Consequences
 
 ### Positive

@@ -1090,11 +1090,12 @@ fn substitute_set(
     sc: &mut crate::query::ast::SetClause,
     p: &HashMap<String, crate::graph::PropertyValue>,
 ) -> ExecutionResult<()> {
-    for item in &mut sc.items {
-        substitute_expr(&mut item.value, p)?;
-    }
-    for item in &mut sc.entity_items {
-        substitute_expr(&mut item.value, p)?;
+    for op in &mut sc.ops {
+        match op {
+            crate::query::ast::SetOp::Property(item) => substitute_expr(&mut item.value, p)?,
+            crate::query::ast::SetOp::Entity(item) => substitute_expr(&mut item.value, p)?,
+            crate::query::ast::SetOp::Labels(_) => {}
+        }
     }
     Ok(())
 }
