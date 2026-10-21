@@ -31,6 +31,7 @@ async fn main() {
         Some("queries") => std::process::exit(cmd_queries(&argv)),
         Some("snapshot-read-only") => std::process::exit(cmd_snapshot_read_only(&argv)),
         Some("results-build") => std::process::exit(cmd_results_build(&argv)),
+        Some("convert") => std::process::exit(cmd_convert(&argv)),
         _ => {}
     }
 
@@ -774,6 +775,203 @@ fn cmd_auth_token(argv: &[String]) -> i32 {
 /// run is refused before any query executes: a catalog from another build
 /// checks another graph's answers. A snapshot whose header names no catalog
 /// verifies exactly as before.
+/// `samyama convert <input> <output>`: convert a graph file to another format,
+/// offline, with a loss report (#1909, #1905). A thin command over
+/// [`samyama::convert`].
+///
+/// Exit codes: 0 converted (the report may list losses); 1 converted, but
+/// `--require-lossless` was given and something was dropped; 2 usage (unknown
+/// or unsupported format, missing argument); 65 the input could not be
+/// parsed; 66 the input could not be opened; 73 the output could not be
+/// written. 0 and 2 match `samyama queries run`; 65, 66 and 73 are the
+/// sysexits codes `verify` already uses.
+fn cmd_convert(argv: &[String]) -> i32 {
+    use samyama::convert::{self, EndpointPolicy, Format, Options};
+
+    let usage = || {
+        eprintln!(
+            "usage: samyama convert <input> <output> [--from FMT] [--to FMT]\n\
+             \x20                      [--missing-endpoints fail|placeholder|drop]\n\
+             \x20                      [--report report.json] [--require-lossless]\n\
+             \x20      samyama convert --formats\n\n\
+             The format comes from each file's extension; --from / --to override it.\n\
+             A path with no extension is a CSV directory.\n\n{}",
+            convert::format_matrix()
+        );
+    };
+    let rest = &argv[2..];
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        usage();
+        return 0;
+    }
+    if rest.iter().any(|a| a == "--formats") {
+        print!("{}", convert::format_matrix());
+        return 0;
+    }
+
+    // Flags that take a value, and the positional arguments around them.
+    const VALUED: [&str; 6] = ["--from", "--to", "--missing-endpoints", "--report", "--mapping", "--preset"];
+    let mut positional = Vec::new();
+    let mut values = std::collections::HashMap::new();
+    let mut require_lossless = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if VALUED.contains(&a) {
+            match rest.get(i + 1).filter(|v| !v.starts_with("--")) {
+                Some(v) => {
+                    values.insert(a, v.as_str());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("convert: {a} needs a value");
+                    return 2;
+                }
+            }
+        } else if a == "--require-lossless" {
+            require_lossless = true;
+            i += 1;
+        } else if a.starts_with("--") {
+            eprintln!("convert: unknown option {a}");
+            usage();
+            return 2;
+        } else {
+            positional.push(a);
+            i += 1;
+        }
+    }
+    let [input, output] = positional[..] else {
+        eprintln!("convert: needs exactly an <input> and an <output>, got {}", positional.len());
+        usage();
+        return 2;
+    };
+    // The RDF mapping arrives with #1910; until then a flag that would change
+    // the result is refused rather than ignored.
+    for flag in ["--mapping", "--preset"] {
+        if values.contains_key(flag) {
+            eprintln!("convert: {flag} is not supported yet (#1910)");
+            return 2;
+        }
+    }
+    let on_missing_endpoint = match values.get("--missing-endpoints").copied() {
+        None | Some("fail") => EndpointPolicy::Fail,
+        Some("placeholder") => EndpointPolicy::Placeholder,
+        Some("drop") => EndpointPolicy::Drop,
+        Some(other) => {
+            eprintln!("convert: --missing-endpoints is fail, placeholder or drop, not {other:?}");
+            return 2;
+        }
+    };
+    let pick = |flag: &str, path: &str| -> Result<Format, i32> {
+        match values.get(flag) {
+            Some(name) => Format::from_name(name).ok_or_else(|| {
+                eprintln!("convert: {flag} {name:?} is not a format; see --formats");
+                2
+            }),
+            None => Format::from_path(std::path::Path::new(path)).ok_or_else(|| {
+                eprintln!("convert: cannot tell the format of {path} from its extension; pass {flag}");
+                2
+            }),
+        }
+    };
+    let from = match pick("--from", input) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    let to = match pick("--to", output) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    // Both checked before the input is opened: an unsupported output must not
+    // cost a read of a large input.
+    if !from.can_read() {
+        eprintln!("convert: {}", convert::ConvertError::CannotRead(from));
+        return 2;
+    }
+    if !to.can_write() {
+        eprintln!("convert: {}", convert::ConvertError::CannotWrite(to));
+        return 2;
+    }
+
+    // Losses are judged here, after writing, so exit 1 means "converted, and
+    // something was dropped" -- the report is still written.
+    let opts = Options { on_missing_endpoint, require_lossless: false };
+    let file = match std::fs::File::open(input) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("convert: could not open {input}: {e}");
+            return 66;
+        }
+    };
+    let mut store = samyama::graph::GraphStore::new();
+    let read = match convert::read(from, std::io::BufReader::new(file), &mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("convert: could not read {input} as {from}: {e}");
+            return 65;
+        }
+    };
+    eprintln!("read {from}: {} nodes, {} edges", read.node_count(), read.edge_count());
+    let written = if to == Format::from_path(std::path::Path::new(output)).unwrap_or(to) {
+        convert::write_path(&store, std::path::Path::new(output), &opts)
+    } else {
+        // `--to` overrides the extension, so the writer is chosen by format
+        // and the file is still replaced whole: written beside it, then renamed.
+        let tmp = format!("{output}.tmp");
+        std::fs::File::create(&tmp)
+            .map_err(|e| convert::ConvertError::Io { path: tmp.clone().into(), source: e })
+            .and_then(|f| convert::write(to, &store, std::io::BufWriter::new(f), &opts))
+            .and_then(|r| {
+                std::fs::rename(&tmp, output)
+                    .map(|_| r)
+                    .map_err(|e| convert::ConvertError::Io { path: output.into(), source: e })
+            })
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+    };
+    let written = match written {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("convert: could not write {output} as {to}: {e}");
+            return 73;
+        }
+    };
+    let report = convert::ConvertReport { input_format: from, output_format: to, input: read, output: written };
+    let dropped: Vec<String> = report.dropped().iter().map(|d| format!("{} {}", d.count, d.what)).collect();
+    eprintln!(
+        "{from} → {to}: {} nodes, {} edges; dropped: {}",
+        report.output.node_count(),
+        report.output.edge_count(),
+        if dropped.is_empty() { "nothing".to_string() } else { dropped.join(", ") }
+    );
+
+    if let Some(path) = values.get("--report") {
+        let side = |r: &convert::FormatReport| {
+            serde_json::json!({
+                "nodes": r.node_count(),
+                "edges": r.edge_count(),
+                "dropped": r.dropped(),
+            })
+        };
+        let json = serde_json::json!({
+            "input": { "path": input, "format": from.to_string(), "report": side(&report.input) },
+            "output": { "path": output, "format": to.to_string(), "report": side(&report.output) },
+            "lossless": report.lossless(),
+        });
+        if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap_or_default()) {
+            eprintln!("convert: could not write the report {path}: {e}");
+            return 73;
+        }
+    }
+
+    if require_lossless && !report.lossless() {
+        eprintln!("convert: --require-lossless was given and the conversion dropped {}", dropped.join(", "));
+        return 1;
+    }
+    0
+}
+
 fn cmd_verify(argv: &[String]) -> i32 {
     let flag = |name: &str| argv.iter().position(|a| a == name).and_then(|i| argv.get(i + 1));
     let Some(snapshot) = argv.get(2).filter(|s| !s.starts_with("--")) else {
