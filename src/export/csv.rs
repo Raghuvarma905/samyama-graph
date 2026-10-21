@@ -221,3 +221,220 @@ mod tests {
         assert_eq!((rep.rows_written, rep.columns), (0, 1));
     }
 }
+
+/// What a whole-graph CSV export wrote, and what it could not express (#1914).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GraphCsvReport {
+    pub nodes_written: usize,
+    pub edges_written: usize,
+    /// The files written, relative to the directory, in the order written.
+    pub files: Vec<String>,
+    /// Properties whose values were not all one type in a file, so the
+    /// column is a `string` and numbers in it are digits, not numbers.
+    /// Listed as `file:column`.
+    pub columns_widened_to_string: Vec<String>,
+    /// Lists, maps and vectors written as JSON text in one field.
+    pub values_written_as_json: usize,
+    /// Temporal values written as ISO-8601 text.
+    pub temporal_values_written_as_text: usize,
+    /// Labels containing `;`, the separator `neo4j-admin` reads between labels.
+    pub labels_containing_a_semicolon: Vec<String>,
+}
+
+impl GraphCsvReport {
+    /// True when every value kept a column type that means what it meant here.
+    pub fn typed_losslessly(&self) -> bool {
+        self.columns_widened_to_string.is_empty()
+            && self.values_written_as_json == 0
+            && self.temporal_values_written_as_text == 0
+            && self.labels_containing_a_semicolon.is_empty()
+    }
+}
+
+/// A column's `neo4j-admin` type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColType {
+    Boolean,
+    Long,
+    Double,
+    String,
+}
+
+impl ColType {
+    fn of(v: &crate::graph::PropertyValue) -> ColType {
+        use crate::graph::PropertyValue as P;
+        match v {
+            P::Boolean(_) => ColType::Boolean,
+            P::Integer(_) => ColType::Long,
+            P::Float(_) => ColType::Double,
+            _ => ColType::String,
+        }
+    }
+
+    /// The narrowest type holding both, by the rule GraphML export uses: a
+    /// long and a double make a double, any other mix a string (#1575).
+    fn widen(self, other: ColType) -> ColType {
+        match (self, other) {
+            (a, b) if a == b => a,
+            (ColType::Long, ColType::Double) | (ColType::Double, ColType::Long) => ColType::Double,
+            _ => ColType::String,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ColType::Boolean => "boolean",
+            ColType::Long => "long",
+            ColType::Double => "double",
+            ColType::String => "string",
+        }
+    }
+}
+
+/// One property value as a CSV field's text.
+fn graph_cell(v: &crate::graph::PropertyValue, report: &mut GraphCsvReport) -> String {
+    use crate::graph::PropertyValue as P;
+    match v {
+        P::Null => String::new(),
+        P::String(s) => s.clone(),
+        P::Integer(i) => i.to_string(),
+        P::Float(f) => f.to_string(),
+        P::Boolean(b) => b.to_string(),
+        P::Array(_) | P::Map(_) | P::Vector(_) => {
+            report.values_written_as_json += 1;
+            v.to_json().to_string()
+        }
+        temporal => {
+            report.temporal_values_written_as_text += 1;
+            temporal.to_string()
+        }
+    }
+}
+
+/// A file-name-safe form of a label or type: anything but `[A-Za-z0-9_-]`
+/// becomes `_`.
+fn file_part(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+
+/// One file's rows before writing: the columns are only known once every row
+/// has been seen.
+struct Table {
+    /// Leading columns (`:ID`, `:LABEL` / `:START_ID`, `:END_ID`, `:TYPE`)
+    /// and their values per row.
+    fixed_header: Vec<&'static str>,
+    fixed: Vec<Vec<String>>,
+    props: Vec<crate::graph::PropertyMap>,
+}
+
+/// Write the whole graph into `dir`, which must exist and be empty, as the
+/// CSV files `neo4j-admin database import` reads (#1914).
+///
+/// A graph is not one table, so it is one file per label combination,
+/// `nodes_<Label>[_<Label>].csv` with `:ID` and `:LABEL` (labels `;`
+/// separated), and one per relationship type, `edges_<TYPE>.csv` with
+/// `:START_ID`, `:END_ID` and `:TYPE`; each then has a column per property,
+/// typed (`born:long`, `active:boolean`) when every value in that file has
+/// one type. Ids are this graph's node ids. Property names are written as
+/// they are; neo4j-admin reads `:` in a header as the type separator, so a
+/// property name containing one will not import as that name.
+pub fn write_graph_dir(
+    store: &crate::graph::GraphStore,
+    dir: &std::path::Path,
+) -> std::io::Result<GraphCsvReport> {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+
+    let mut report = GraphCsvReport::default();
+    let mut tables: BTreeMap<String, Table> = BTreeMap::new();
+
+    for node in store.all_nodes() {
+        let mut labels: Vec<String> = node.labels.iter().map(|l| l.as_str().to_string()).collect();
+        labels.sort();
+        for l in &labels {
+            if l.contains(';') && !report.labels_containing_a_semicolon.contains(l) {
+                report.labels_containing_a_semicolon.push(l.clone());
+            }
+        }
+        let file = if labels.is_empty() {
+            "nodes__unlabelled.csv".to_string()
+        } else {
+            format!("nodes_{}.csv", labels.iter().map(|l| file_part(l)).collect::<Vec<_>>().join("_"))
+        };
+        let t = tables.entry(file).or_insert_with(|| Table {
+            fixed_header: vec![":ID", ":LABEL"],
+            fixed: Vec::new(),
+            props: Vec::new(),
+        });
+        t.fixed.push(vec![node.id.as_u64().to_string(), labels.join(";")]);
+        t.props.push(store.node_properties_merged(node.id));
+        report.nodes_written += 1;
+    }
+    for edge in store.all_edges() {
+        let ty = edge.edge_type.as_str().to_string();
+        let t = tables
+            .entry(format!("edges_{}.csv", file_part(&ty)))
+            .or_insert_with(|| Table {
+                fixed_header: vec![":START_ID", ":END_ID", ":TYPE"],
+                fixed: Vec::new(),
+                props: Vec::new(),
+            });
+        t.fixed.push(vec![edge.source.as_u64().to_string(), edge.target.as_u64().to_string(), ty]);
+        t.props.push(store.edge_properties_merged(edge.id));
+        report.edges_written += 1;
+    }
+
+    // Node files first, then edge files: the order neo4j-admin is given them.
+    let mut names: Vec<&String> = tables.keys().collect();
+    names.sort_by_key(|n| (n.starts_with("edges_"), n.to_string()));
+    for name in names {
+        let t = &tables[name];
+        // Every type each column held, then the one it is written as. A
+        // column reported as widened held more than one type and ended as a
+        // string; a long-and-double column is a double and loses nothing.
+        let mut seen: BTreeMap<String, Vec<ColType>> = BTreeMap::new();
+        for props in &t.props {
+            for (k, v) in props {
+                if matches!(v, crate::graph::PropertyValue::Null) {
+                    continue;
+                }
+                let held = seen.entry(k.clone()).or_default();
+                let ty = ColType::of(v);
+                if !held.contains(&ty) {
+                    held.push(ty);
+                }
+            }
+        }
+        let types: BTreeMap<String, ColType> = seen
+            .iter()
+            .map(|(k, held)| {
+                let ty = held[1..].iter().fold(held[0], |a, b| a.widen(*b));
+                if held.len() > 1 && ty == ColType::String {
+                    report.columns_widened_to_string.push(format!("{name}:{k}"));
+                }
+                (k.clone(), ty)
+            })
+            .collect();
+
+        let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join(name))?);
+        let mut header: Vec<String> = t.fixed_header.iter().map(|h| h.to_string()).collect();
+        header.extend(types.iter().map(|(k, ty)| format!("{k}:{}", ty.name())));
+        writeln!(out, "{}", header.iter().map(|h| quote(h)).collect::<Vec<_>>().join(","))?;
+        for (fixed, props) in t.fixed.iter().zip(&t.props) {
+            let mut row: Vec<String> = fixed.iter().map(|f| quote(f)).collect();
+            for k in types.keys() {
+                row.push(match props.get(k) {
+                    Some(v) => quote(&graph_cell(v, &mut report)),
+                    None => String::new(),
+                });
+            }
+            writeln!(out, "{}", row.join(","))?;
+        }
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        report.files.push(name.clone());
+    }
+    report.columns_widened_to_string.sort();
+    Ok(report)
+}
