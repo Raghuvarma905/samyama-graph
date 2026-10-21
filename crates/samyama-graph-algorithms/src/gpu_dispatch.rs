@@ -4,6 +4,7 @@
 //! baseline (ADR-025). Each GPU-eligible algorithm probes here for the size
 //! threshold, then routes to `samyama-gpu` with transparent CPU fallback.
 
+use crate::cpu_fallback::CpuFallbackReason;
 use samyama_gpu::threshold;
 use samyama_gpu::GpuBackendType;
 
@@ -27,9 +28,14 @@ pub fn min_gpu_nodes() -> usize {
 
 /// The dispatch gate the algorithms use: should a graph of `n` nodes go to the GPU?
 ///
+/// `Ok(())` sends it to the GPU; `Err` carries the reason it stays on the CPU,
+/// which the caller logs with [`crate::cpu_fallback::note_cpu_fallback`]
+/// (HW-10, #1684). A gate that answered only `false` left every fallback
+/// unexplained: "graph too small" and "no GPU on this host" looked the same.
+///
 /// Initialises the GPU runtime only when `n` could clear some threshold, so tiny
 /// graphs never pay device init.
-pub fn should_dispatch_gpu(n: usize) -> bool {
+pub fn gpu_route(n: usize) -> Result<(), CpuFallbackReason> {
     let raw = std::env::var(threshold::MIN_GPU_NODES_ENV).ok();
     dispatch_decision(n, raw.as_deref(), || {
         let rt = samyama_gpu::GpuRuntime::init();
@@ -37,23 +43,30 @@ pub fn should_dispatch_gpu(n: usize) -> bool {
     })
 }
 
-/// Pure core of [`should_dispatch_gpu`]. `active_backend` initialises (or looks up)
+/// [`gpu_route`] as a yes or no, for callers that do not report a reason.
+pub fn should_dispatch_gpu(n: usize) -> bool {
+    gpu_route(n).is_ok()
+}
+
+/// Pure core of [`gpu_route`]. `active_backend` initialises (or looks up)
 /// the runtime and returns the active backend, or `None` when no GPU is available;
 /// it is called at most once, and only when `n` is large enough to possibly dispatch.
 fn dispatch_decision(
     n: usize,
     raw_override: Option<&str>,
     active_backend: impl FnOnce() -> Option<GpuBackendType>,
-) -> bool {
+) -> Result<(), CpuFallbackReason> {
     let floor = threshold::parse_min_gpu_nodes_override(raw_override)
         .unwrap_or_else(threshold::min_default_across_backends);
     if n <= floor {
-        return false;
+        return Err(CpuFallbackReason::BelowThreshold { nodes: n, min_nodes: floor });
     }
-    match active_backend() {
-        Some(backend) => n > threshold::resolve_min_gpu_nodes(backend, raw_override),
-        None => false,
+    let backend = active_backend().ok_or(CpuFallbackReason::NoDevice)?;
+    let min_nodes = threshold::resolve_min_gpu_nodes(backend, raw_override);
+    if n <= min_nodes {
+        return Err(CpuFallbackReason::BelowThreshold { nodes: n, min_nodes });
     }
+    Ok(())
 }
 
 /// Whether any GPU backend (CUDA or wgpu) is available for dispatch. Initializes the
@@ -84,6 +97,15 @@ mod tests {
     use std::cell::Cell;
 
     fn decide(n: usize, raw: Option<&str>, backend: Option<GpuBackendType>) -> (bool, bool) {
+        let (d, probed) = route(n, raw, backend);
+        (d.is_ok(), probed)
+    }
+
+    fn route(
+        n: usize,
+        raw: Option<&str>,
+        backend: Option<GpuBackendType>,
+    ) -> (Result<(), CpuFallbackReason>, bool) {
         let probed = Cell::new(false);
         let d = dispatch_decision(n, raw, || {
             probed.set(true);
@@ -117,6 +139,27 @@ mod tests {
     #[test]
     fn no_gpu_never_dispatches() {
         assert_eq!(decide(10_000_000, None, None), (false, true));
+    }
+
+    #[test]
+    fn no_gpu_is_reported_as_no_device() {
+        assert_eq!(route(10_000_000, None, None).0, Err(CpuFallbackReason::NoDevice));
+    }
+
+    #[test]
+    fn a_small_graph_reports_the_threshold_it_missed() {
+        // Below the cross-backend floor: the runtime is never asked.
+        let floor = threshold::min_default_across_backends();
+        assert_eq!(
+            route(floor, None, Some(GpuBackendType::Cuda)),
+            (Err(CpuFallbackReason::BelowThreshold { nodes: floor, min_nodes: floor }), false)
+        );
+        // Above the floor but below this backend's own threshold.
+        let metal = threshold::resolve_min_gpu_nodes(GpuBackendType::Metal, None);
+        assert_eq!(
+            route(metal, None, Some(GpuBackendType::Metal)).0,
+            Err(CpuFallbackReason::BelowThreshold { nodes: metal, min_nodes: metal })
+        );
     }
 
     #[test]
