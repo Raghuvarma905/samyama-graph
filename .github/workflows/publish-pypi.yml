@@ -95,6 +95,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Select the release lock policy
+        id: lock_policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          lockfile="$PYTHON_SDK_DIR/Cargo.lock"
+          if [ -f "$lockfile" ]; then
+            echo 'cargo_flags=--locked' >> "$GITHUB_OUTPUT"
+          else
+            # A backfill may check out a tag older than this lockfile policy.
+            # Only an ancestor of its introduction qualifies; a new release
+            # that deletes/omits the lockfile must fail, not resolve afresh.
+            introduced=$(git log --reverse --diff-filter=A --format=%H "$GITHUB_SHA" -- "$lockfile" | sed -n '1p')
+            if [ -n "$introduced" ] && git merge-base --is-ancestor HEAD "$introduced"; then
+              echo '::warning::legacy source predates the Python lockfile; resolving its original manifest'
+              echo 'cargo_flags=' >> "$GITHUB_OUTPUT"
+            else
+              echo '::error::Python Cargo.lock is missing from a source that does not predate the lockfile policy'
+              exit 1
+            fi
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -112,7 +135,7 @@ jobs:
           working-directory: ${{ env.PYTHON_SDK_DIR }}
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist --locked
+          args: --release --out dist ${{ steps.lock_policy.outputs.cargo_flags }}
           # Per-platform: windows-x64 builds without it. MSVC 14.51 (Visual
           # Studio 18, which arrived on the then-floating `windows-latest`)
           # made every rocksdb translation unit fail under the sccache wrapper
@@ -295,7 +318,9 @@ jobs:
   matrix-complete:
     name: every platform built
     needs: [wheels, sdist, publish]
-    if: '!cancelled()'
+    if: >-
+      !cancelled()
+      && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
