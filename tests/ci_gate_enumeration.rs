@@ -36,11 +36,18 @@ const AGGREGATOR: &str = "ci-ok";
 /// that is in neither fails. So an entry cannot outlive the decision it records,
 /// and a new suite cannot quietly escape the gate -- escaping it means adding a
 /// line here, with a reason, in a diff someone reads.
-const UNGATED: &[(&str, &str)] = &[(
-    "gpml",
-    "conformance has never gated a merge; requiring it is a policy decision, \
-     separate from folding it into this workflow (#1865)",
-)];
+const UNGATED: &[(&str, &str)] = &[
+    (
+        "gpml",
+        "conformance has never gated a merge; requiring it is a policy decision, \
+         separate from folding it into this workflow (#1865)",
+    ),
+    (
+        "orchestration",
+        "a new suite that installs Airflow and Dagster from PyPI; making it block \
+         every merge is a policy decision, separate from adding it (#1715)",
+    ),
+];
 
 fn jobs(doc: &serde_yaml::Value) -> Vec<String> {
     doc["jobs"]

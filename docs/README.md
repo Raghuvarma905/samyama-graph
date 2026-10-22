@@ -48,6 +48,9 @@ eight of eighteen documents (#1450).
 - **[FAILURE-MODES.md](./FAILURE-MODES.md)** — how the engine behaves when things go wrong.
 - **[SOC2-CONTROL-SET.md](./SOC2-CONTROL-SET.md)** — SOC 2 gap analysis (documented, not certified): access control, audit, change management, backup and incident response, each control with its evidence and its gap.
 - **[BI-CONNECTIVITY.md](./BI-CONNECTIVITY.md)** — connecting BI tools.
+- **[ORCHESTRATION.md](./ORCHESTRATION.md)** — loading the graph from a scheduled pipeline: a retry-safe, parameter-bound load with validation, as reference pipelines for Airflow and Dagster that the test suite runs against a real server.
+- **[ORCHESTRATION-AIRFLOW.md](./ORCHESTRATION-AIRFLOW.md)** — how to run the reference DAG in Airflow 3: credential, Connection, params, what a failure means.
+- **[ORCHESTRATION-DAGSTER.md](./ORCHESTRATION-DAGSTER.md)** — how to run the reference assets and checks in Dagster.
 
 ### Data, provenance and privacy
 
