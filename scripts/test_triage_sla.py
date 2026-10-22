@@ -12,11 +12,14 @@ Run: python3 scripts/test_triage_sla.py
 from __future__ import annotations
 
 import sys
+import os
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_sla import TZ, Event, Issue, business_days, judge
+from triage_sla import TZ, Event, Issue, business_days, judge, policy_publication
 
 # release-bot has write access, as an app installed on the repo can.
 TEAM = {"maint", "release-bot"}
@@ -31,8 +34,8 @@ def issue(at, author="outsider"):
     return Issue(1, "t", author, at.astimezone(timezone.utc), "u")
 
 
-def ev(kind, actor, at, bot=False):
-    return Event(kind, actor, bot, at.astimezone(timezone.utc))
+def ev(kind, actor, at, bot=False, body="Thanks; we are investigating."):
+    return Event(kind, actor, bot, at.astimezone(timezone.utc), body)
 
 
 FAILURES = []
@@ -72,7 +75,15 @@ check("the author, a non-maintainer and a bot -- even one with write access -- a
       v.response is None and v.status == "no response (missed)")
 
 v = judge(issue(FRI_15), [ev("closed", "maint", ist(2026, 10, 19, 9))], is_maintainer, FRI_15, NOW)
-check("a maintainer closing the issue is a response", v.response is not None and v.met)
+check("a maintainer closing without an explanation is not a response", v.response is None)
+
+v = judge(issue(FRI_15), [ev("closed", "maint", ist(2026, 10, 19, 10)),
+                         ev("comment", "maint", ist(2026, 10, 19, 9))], is_maintainer, FRI_15, NOW)
+check("an explained closure counts its explanatory comment", v.response is not None and v.response.kind == "comment" and v.met)
+
+v = judge(issue(FRI_15), [ev("comment", "maint", ist(2026, 10, 19, 9), body="  ")],
+          is_maintainer, FRI_15, NOW)
+check("an empty comment is not an explanation", v.response is None)
 
 v = judge(issue(FRI_15), [ev("closed", "outsider", ist(2026, 10, 16, 16))], is_maintainer, FRI_15, NOW)
 check("the author closing their own issue is not a response", v.response is None)
@@ -91,6 +102,40 @@ v = judge(issue(FRI_15), [ev("comment", "maint", ist(2026, 10, 30)),
                           ev("comment", "maint", ist(2026, 10, 16, 16))], is_maintainer, FRI_15, NOW)
 check("the earliest response is the one measured, whatever order the API returns",
       v.response.at == ist(2026, 10, 16, 16).astimezone(timezone.utc))
+
+with tempfile.TemporaryDirectory(prefix="triage-policy-history-") as tmp:
+    repo = Path(tmp) / "repo"
+    repo.mkdir()
+    def git(*args, at="2026-10-01T00:00:00+00:00"):
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "-c", "user.name=Policy test",
+             "-c", "user.email=policy@example.invalid", "-c", "commit.gpgsign=false",
+             "-c", "core.hooksPath=/dev/null", *args],
+            env={**os.environ, "GIT_AUTHOR_DATE": at, "GIT_COMMITTER_DATE": at},
+            text=True, stderr=subprocess.PIPE).strip()
+    git("init", "-b", "main")
+    git("commit", "--allow-empty", "-m", "before policy")
+    before = git("rev-parse", "HEAD")
+    git("checkout", "-b", "dev")
+    (repo / "SUPPORT.md").write_text("First-response policy\n")
+    git("add", ".")
+    git("commit", "-m", "draft policy", at="2026-10-02T00:00:00+00:00")
+    git("checkout", "main")
+    git("merge", "--no-ff", "dev", "-m", "publish policy", at="2026-10-22T00:00:00+00:00")
+    effective = policy_publication(repo, "main")
+    check("a delayed merge starts the policy on publication, not its source commit date",
+          effective == datetime(2026, 10, 22, tzinfo=timezone.utc))
+    check("an issue opened between drafting and publication is out of scope",
+          not judge(issue(ist(2026, 10, 15)), [], is_maintainer, effective, NOW).in_scope)
+    check("a branch without the policy has no effective date", policy_publication(repo, before) is None)
+    shallow = Path(tmp) / "shallow"
+    subprocess.run(["git", "clone", "--quiet", "--depth=1", repo.as_uri(), str(shallow)], check=True)
+    try:
+        policy_publication(shallow, "HEAD")
+    except RuntimeError:
+        check("a shallow history cannot silently invent an effective date", True)
+    else:
+        check("a shallow history cannot silently invent an effective date", False)
 
 if FAILURES:
     print(f"\n{len(FAILURES)} failed")

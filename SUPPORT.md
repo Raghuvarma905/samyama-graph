@@ -13,8 +13,9 @@
 
 **A maintainer responds to every issue within 2 business days.**
 
-- **A response** is a comment from a maintainer, or a maintainer closing the issue
-  with a reason. Adding a label or an assignee does not count: GitHub does not
+- **A response** is a comment from a maintainer, including the explanation
+  accompanying a closure. Closing without an explanation does not count.
+  Adding a label or an assignee does not count: GitHub does not
   tell you when that happens, so from where you sit nothing has happened.
 - **Business days** are Monday to Friday, in India Standard Time (Asia/Kolkata),
   where the maintainers are. Public holidays are not excluded.
@@ -35,7 +36,8 @@ reports the first-response time of every issue opened by someone outside the
 maintainer team. The [Triage SLA workflow](.github/workflows/triage-sla.yml) runs
 it every weekday and fails when an issue opened since this page was published
 missed the 2 days. Its job summary is the current record. You can run it
-yourself:
+yourself. The policy starts when this page is first merged into the default
+branch:
 
     GITHUB_TOKEN=$(gh auth token) python3 scripts/triage_sla.py
 
@@ -47,7 +49,7 @@ from outside the team both waited far longer than 2 business days:
 | Issue | Opened | First response | Business days |
 |---|---|---|---:|
 | [#275](https://github.com/samyama-ai/samyama-graph/issues/275) | 2026-07-02 | a comment, 2026-09-30 | 64 |
-| [#542](https://github.com/samyama-ai/samyama-graph/issues/542) | 2026-08-17 | closed, 2026-09-30, with no comment | 33 |
+| [#542](https://github.com/samyama-ai/samyama-graph/issues/542) | 2026-08-17 | closed 2026-09-30 without an explanatory response | -- |
 
 They are listed here because a promise is only worth what its record shows, and
 the record starts on the day this page was published.

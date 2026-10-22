@@ -31,6 +31,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Rules of the measurement
         run: python3 scripts/test_triage_sla.py
       - name: Measure the issue tracker

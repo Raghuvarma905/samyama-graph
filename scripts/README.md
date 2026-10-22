@@ -16,7 +16,7 @@ verification tools, and dataset helpers. The automated scripts are called from
 | `test_check_release_gate.py` | Tests the release-gate validator. | `python3 scripts/test_check_release_gate.py` |
 | `check_release_gate.py` | Blocks a release tag when its CH-REGRESS verdict is missing, stale, red, or does not cover the commit being tagged. | `python3 scripts/check_release_gate.py RELEASE-GATE.json --commit SHA` |
 | `triage_sla.py` | Reports the first-response time of every issue opened from outside the maintainer team, and fails if one opened since `SUPPORT.md` was published waited more than 2 business days. `triage-sla.yml` runs it on weekdays; it needs a token. | `GITHUB_TOKEN=$(gh auth token) python3 scripts/triage_sla.py` |
-| `test_triage_sla.py` | Tests the triage-SLA rules offline: business days, weekends, and what counts as a response. | `python3 scripts/test_triage_sla.py` |
+| `test_triage_sla.py` | Tests the triage-SLA rules offline: business days, explained responses, and delayed policy publication through a merge. | `python3 scripts/test_triage_sla.py` |
 | `verify-sweep.sh` | Runs tests, examples, benchmarks, and case studies, recording a result for each. The nightly workflow runs it. | `scripts/verify-sweep.sh --only tests` |
 
 The full sweep accepts `--provision`, `--out DIR`, `--jobs N`, and repeatable

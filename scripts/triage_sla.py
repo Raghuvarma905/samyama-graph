@@ -15,8 +15,9 @@ maintainer would come back `CONTRIBUTOR` and every team issue would look like
 an outside report. If the lookup finds no maintainer at all among the authors,
 it is the lookup that is broken, and the script stops rather than report.
 
-What counts as a response. A comment by a maintainer, or the issue being closed
-by a maintainer (other than its author). Both notify the reporter. A label, an
+What counts as a response. A non-empty comment by a maintainer other than the
+reporter, including the explanation accompanying a closure. A silent closure,
+label, an
 assignment or a milestone does not notify anyone, so it is not a response to
 the person waiting, even though it is triage. Bot comments do not count.
 
@@ -24,8 +25,9 @@ Business days are Monday to Friday in Asia/Kolkata, where the maintainers are.
 Public holidays are not excluded, which makes the measured promise stricter
 than the written one, never looser.
 
-When the policy took effect. The first commit that added SUPPORT.md on the
-default branch. Issues opened before then are reported for the record but
+When the policy took effect. The first-parent integration commit that added
+SUPPORT.md to the default branch, rather than its earlier development-branch
+commit. Issues opened before then are reported for the record but
 cannot fail the check: the policy was not a promise yet.
 
 Run:  GITHUB_TOKEN=$(gh auth token) python3 scripts/triage_sla.py
@@ -40,12 +42,14 @@ import json
 import os
 import re
 import sys
+import subprocess
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 REPO = "samyama-ai/samyama-graph"
 POLICY_FILE = "SUPPORT.md"
@@ -92,12 +96,13 @@ class Event:
     actor: str
     actor_is_bot: bool
     at: datetime
+    body: str = ""
 
 
 def first_response(issue: Issue, events: list[Event], is_maintainer) -> Event | None:
     """The earliest event that counts as a response under the policy, if any."""
     for e in sorted(events, key=lambda e: e.at):
-        if e.actor_is_bot or e.actor == issue.author:
+        if e.kind != "comment" or not e.body.strip() or e.actor_is_bot or e.actor == issue.author:
             continue
         if is_maintainer(e.actor):
             return e
@@ -134,6 +139,26 @@ def judge(issue: Issue, events: list[Event], is_maintainer, effective: datetime 
 
 def _ts(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def policy_publication(repo_root: Path, ref: str) -> datetime | None:
+    """Find the policy's entry onto the default branch's first-parent history."""
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo_root), *args],
+                                       text=True, stderr=subprocess.PIPE, timeout=60).strip()
+
+    if git("rev-parse", "--is-shallow-repository") == "true":
+        raise RuntimeError("policy publication needs full Git history; fetch with depth 0")
+    git("rev-parse", "--verify", f"{ref}^{{commit}}")
+    present = subprocess.run(["git", "-C", str(repo_root), "cat-file", "-e",
+                              f"{ref}:{POLICY_FILE}"], capture_output=True, timeout=60)
+    if present.returncode:
+        return None
+    dates = git("log", "--first-parent", "--diff-merges=first-parent", "--diff-filter=A",
+                "--reverse", "--format=%cI", ref, "--", POLICY_FILE).splitlines()
+    if not dates:
+        raise RuntimeError("could not locate the policy's introduction on the default branch")
+    return datetime.fromisoformat(dates[0]).astimezone(timezone.utc)
 
 
 class GitHub:
@@ -186,11 +211,7 @@ class GitHub:
         out = []
         for c in self.pages(f"issues/{number}/comments?per_page=100"):
             out.append(Event("comment", c["user"]["login"], c["user"]["type"] == "Bot",
-                             _ts(c["created_at"])))
-        for e in self.pages(f"issues/{number}/events?per_page=100"):
-            if e["event"] == "closed" and e.get("actor"):
-                out.append(Event("closed", e["actor"]["login"], e["actor"]["type"] == "Bot",
-                                 _ts(e["created_at"])))
+                             _ts(c["created_at"]), c.get("body") or ""))
         return out
 
     def is_maintainer(self, login: str) -> bool:
@@ -207,10 +228,12 @@ class GitHub:
     def policy_effective(self) -> datetime | None:
         info, _ = self._get(f"https://api.github.com/repos/{self.repo}")
         branch = info["default_branch"]
-        commits = list(self.pages(f"commits?path={POLICY_FILE}&sha={branch}&per_page=100"))
-        if not commits:
-            return None
-        return _ts(commits[-1]["commit"]["committer"]["date"])
+        repo_root = Path(__file__).resolve().parents[1]
+        ref = "refs/triage-sla/default"
+        subprocess.run(["git", "-C", str(repo_root), "fetch", "--quiet", "--no-tags",
+                        f"https://github.com/{self.repo}.git", f"+refs/heads/{branch}:{ref}"],
+                       check=True, capture_output=True, timeout=120)
+        return policy_publication(repo_root, ref)
 
 
 # ------------------------------------------------------------------ report --
@@ -268,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
     except (http.client.IncompleteRead, urllib.error.URLError, TimeoutError) as e:
         # Exit 2, not 1: "could not measure" must not read as "missed".
         print(f"error: could not read the issue tracker: {e!r}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+        print(f"error: could not determine policy publication: {e}", file=sys.stderr)
         return 2
 
     report = render(verdicts, effective)
