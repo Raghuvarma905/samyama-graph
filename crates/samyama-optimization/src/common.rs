@@ -214,6 +214,50 @@ pub struct OptimizationResult {
     pub history: Vec<f64>,
 }
 
+/// The penalty a solution carries when it satisfies every constraint: the
+/// value [`Problem::penalty`] is documented to return in that case.
+pub const NO_CONSTRAINT_VIOLATION: f64 = 0.0;
+
+/// Milliseconds in a second, for reporting a `Duration` in milliseconds.
+const MILLIS_PER_SEC: f64 = 1_000.0;
+
+/// Whether a solution with this constraint penalty is feasible (OPT-09, #1776).
+///
+/// `fitness` is objective plus penalty, so a solver returns its best *fitness*
+/// whether or not that solution obeys the constraints: a budget it cannot meet
+/// comes back as a large number, not as a refusal. This is the field that says
+/// which of the two happened.
+///
+/// Strict on purpose: any violation, however small, is infeasible, because a
+/// tolerance here would be a number the caller never chose. A NaN penalty is
+/// infeasible too -- a constraint that could not be evaluated was not met.
+pub fn is_feasible(penalty: f64) -> bool {
+    penalty <= NO_CONSTRAINT_VIOLATION
+}
+
+/// How far an objective value is from a best known one (OPT-09, #1776).
+///
+/// Absolute, `objective - best_known`, in the objective's own units. Every
+/// solver here minimises, so a positive gap is how much worse the answer is,
+/// and a negative gap means it beat the value supplied as best known. Absolute
+/// rather than relative because the commonest best known value, an optimum of
+/// zero, would make a relative gap a division by zero.
+///
+/// None of the solvers can prove a bound, so there is no gap to report unless
+/// the caller supplies the best known value; callers report `null` then, never
+/// a guess.
+pub fn gap_to_best_known(objective: f64, best_known: f64) -> f64 {
+    objective - best_known
+}
+
+/// A duration in milliseconds, keeping the sub-millisecond part.
+///
+/// Fractional, because a small solve finishes in well under a millisecond and
+/// rounding it to 0 would read as "not measured" (#1798).
+pub fn duration_ms(elapsed: std::time::Duration) -> f64 {
+    elapsed.as_secs_f64() * MILLIS_PER_SEC
+}
+
 /// A simple problem defined by a closure.
 pub struct SimpleProblem<F> 
 where F: Fn(&Array1<f64>) -> f64 + Send + Sync
@@ -235,5 +279,60 @@ where F: Fn(&Array1<f64>) -> f64 + Send + Sync
 
     fn bounds(&self) -> (Array1<f64>, Array1<f64>) {
         (self.lower.clone(), self.upper.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A penalty strictly above zero, however small: one ULP of violation.
+    const TINY_VIOLATION: f64 = f64::MIN_POSITIVE;
+
+    #[test]
+    fn no_penalty_is_feasible() {
+        assert!(is_feasible(NO_CONSTRAINT_VIOLATION));
+    }
+
+    #[test]
+    fn any_positive_penalty_is_infeasible() {
+        assert!(!is_feasible(TINY_VIOLATION));
+        assert!(!is_feasible(f64::INFINITY));
+    }
+
+    #[test]
+    fn a_nan_penalty_is_infeasible() {
+        assert!(!is_feasible(f64::NAN));
+    }
+
+    #[test]
+    fn gap_is_objective_minus_best_known() {
+        let (objective, best_known) = (12.5, 10.0);
+        assert_eq!(
+            gap_to_best_known(objective, best_known),
+            objective - best_known
+        );
+    }
+
+    #[test]
+    fn a_solution_that_beats_the_best_known_has_a_negative_gap() {
+        let best_known = 10.0;
+        let better = best_known - 1.0;
+        assert!(gap_to_best_known(better, best_known) < 0.0);
+    }
+
+    #[test]
+    fn reaching_the_best_known_is_a_zero_gap() {
+        let best_known = 0.0;
+        assert_eq!(gap_to_best_known(best_known, best_known), 0.0);
+    }
+
+    #[test]
+    fn duration_ms_keeps_the_sub_millisecond_part() {
+        assert_eq!(duration_ms(Duration::ZERO), 0.0);
+        assert_eq!(duration_ms(Duration::from_micros(1_500)), 1.5);
+        assert_eq!(duration_ms(Duration::from_micros(250)), 0.25);
+        assert_eq!(duration_ms(Duration::from_secs(2)), 2_000.0);
     }
 }
