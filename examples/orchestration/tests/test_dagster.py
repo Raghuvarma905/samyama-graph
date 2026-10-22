@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 
 import dagster as dg
+import pytest
 
 import samyama_dagster as sd
 from conftest import Source, assert_graph_matches
@@ -110,8 +111,48 @@ def test_the_definitions_read_the_server_from_the_environment(engine, sample, mo
 
 def test_the_definitions_read_the_token_from_the_environment(secured_engine, sample, monkeypatch):
     monkeypatch.setenv("SAMYAMA_URL", secured_engine.url)
-    monkeypatch.setenv("SAMYAMA_TOKEN", secured_engine.token)
+    # Code locations may load before workers receive their secret environment.
+    monkeypatch.delenv("SAMYAMA_TOKEN", raising=False)
     job = sd.build_definitions().resolve_implicit_global_asset_job_def()
+    monkeypatch.setenv("SAMYAMA_TOKEN", secured_engine.token)
     result = job.execute_in_process(raise_on_error=False)
     assert result.success
     assert_graph_matches(secured_engine, sample)
+
+
+@pytest.mark.parametrize("check_name", ["check_accounts", "check_transfers"])
+def test_transient_check_failure_is_retried_then_succeeds(engine, sample, monkeypatch, check_name):
+    real = getattr(sd.sp, check_name)
+    attempts = []
+
+    def transient_once(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise sd.sp.SamyamaUnavailable("HTTP 503: temporarily unavailable")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sd.sp, check_name, transient_once)
+    # Exercise Dagster's real retry scheduler without waiting thirty seconds.
+    monkeypatch.setattr(dg.RetryPolicy, "calculate_delay", lambda self, attempt_num: 0)
+    result = run(resources(engine, sample))
+    assert result.success
+    assert len(attempts) == 2
+    retries = [e for e in result.all_events if e.event_type_value == "STEP_UP_FOR_RETRY"]
+    assert len(retries) == 1
+    assert checks(result) == {"accounts_match_source": True, "transfers_match_source": True}
+    assert_graph_matches(engine, sample)
+
+
+@pytest.mark.parametrize("check_name", ["check_accounts", "check_transfers"])
+def test_permanent_check_failure_is_not_retried(engine, sample, monkeypatch, check_name):
+    attempts = []
+
+    def rejected(*args, **kwargs):
+        attempts.append(1)
+        raise sd.sp.SamyamaRejected(401, "missing credential")
+
+    monkeypatch.setattr(sd.sp, check_name, rejected)
+    result = run(resources(engine, sample))
+    assert not result.success
+    assert len(attempts) == 1
+    assert not [e for e in result.all_events if e.event_type_value == "STEP_UP_FOR_RETRY"]

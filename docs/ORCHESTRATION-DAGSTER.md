@@ -45,8 +45,9 @@ is no Samyama integration package to install.
 | `SAMYAMA_URL` | required -- the server's HTTP endpoint, e.g. `https://graph.internal:8080` |
 | `SAMYAMA_TOKEN` | the token from step 1; leave unset for a server without an auth file |
 
-Both are read through `dg.EnvVar`, so the token is resolved when a run starts
-and is not stored with the code location or shown in the UI.
+The URL uses `dg.EnvVar`; the optional token is read when the resource creates
+its client on the execution worker, so worker-only secrets are available. The
+token value is not stored with the code location or shown in the UI.
 
 ## 4. Run it
 

@@ -11,8 +11,9 @@ Where the settings come from -- nothing about a deployment is written here:
 
 - `SAMYAMA_URL` (required) names the server's HTTP endpoint. `SAMYAMA_TOKEN`
   is the bearer token, needed only when the server runs with an auth file. Both
-  are read through `dg.EnvVar`, so the secret is resolved when a run starts and
-  never stored with the code location.
+  are resolved in the execution environment: the URL through `dg.EnvVar`,
+  and the optional token when the resource creates its client. No token value
+  is stored with the code location.
 - The source files and batch size are the `source_files` resource. They default
   to the bundled sample; set them per run in the launchpad's resource config.
 
@@ -43,10 +44,14 @@ class SamyamaResource(dg.ConfigurableResource):
 
     url: str
     token: Optional[str] = None
+    token_env_var: Optional[str] = None
     timeout_seconds: float = 30.0
 
     def client(self) -> sp.SamyamaHttp:
-        return sp.SamyamaHttp(self.url, token=self.token or None, timeout_seconds=self.timeout_seconds)
+        token = self.token
+        if token is None and self.token_env_var is not None:
+            token = os.environ.get(self.token_env_var)
+        return sp.SamyamaHttp(self.url, token=token or None, timeout_seconds=self.timeout_seconds)
 
 
 class SourceFiles(dg.ConfigurableResource):
@@ -106,13 +111,13 @@ def _result(checks: list[sp.Check]) -> dg.AssetCheckResult:
     )
 
 
-@dg.asset_check(asset=accounts, blocking=True)
+@dg.asset_check(asset=accounts, blocking=True, retry_policy=RETRY)
 @fail_fast_on_permanent_errors
 def accounts_match_source(samyama: SamyamaResource, source_files: SourceFiles) -> dg.AssetCheckResult:
     return _result(sp.check_accounts(samyama.client(), sp.read_accounts(source_files.accounts_csv)))
 
 
-@dg.asset_check(asset=transfers, blocking=True)
+@dg.asset_check(asset=transfers, blocking=True, retry_policy=RETRY)
 @fail_fast_on_permanent_errors
 def transfers_match_source(samyama: SamyamaResource, source_files: SourceFiles) -> dg.AssetCheckResult:
     return _result(sp.check_transfers(samyama.client(), sp.read_transfers(source_files.transfers_csv)))
@@ -128,9 +133,9 @@ def build_definitions() -> dg.Definitions:
         resources={
             "samyama": SamyamaResource(
                 url=dg.EnvVar("SAMYAMA_URL"),
-                # A server without an auth file needs no token, and an EnvVar
-                # that is unset fails the run -- so it is attached only when set.
-                token=dg.EnvVar("SAMYAMA_TOKEN") if os.environ.get("SAMYAMA_TOKEN") else None,
+                # Resolve optional credentials on workers, where secrets may be
+                # injected after the code location builds these definitions.
+                token_env_var="SAMYAMA_TOKEN",
             ),
             "source_files": SourceFiles(),
         },
