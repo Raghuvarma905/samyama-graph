@@ -72,7 +72,9 @@ use crate::query::executor::{ExecutionError, ExecutionResult, Record, Value, Rec
 use crate::graph::PropertyValue;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use rayon::prelude::*;
-use samyama_optimization::common::{Problem, SolverConfig, MultiObjectiveProblem};
+use samyama_optimization::common::{
+    duration_ms, gap_to_best_known, is_feasible, MultiObjectiveProblem, Problem, SolverConfig,
+};
 use samyama_optimization::algorithms::{JayaSolver, RaoSolver, RaoVariant, TLBOSolver, FireflySolver, CuckooSolver, GWOSolver, GASolver, SASolver, BatSolver, ABCSolver, GSASolver, NSGA2Solver, MOTLBOSolver, HSSolver, FPASolver, PSOSolver, DESolver, BMRSolver, BWRSolver, BMWRSolver, QOJayaSolver, SAMPJayaSolver, EHRJayaSolver, ITLBOSolver, GOTLBOSolver, QORaoSolver, SAPHRSolver, MOBMWRSolver, MOBMWRVariant, MORaoDESolver};
 use ndarray::Array1;
 
@@ -19425,6 +19427,60 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
         Ok(())
     }
+
+    /// `bestKnown` (or `best_known`) from an `or.solve` config: the objective
+    /// value the caller knows to be the best, which `gap` is measured against
+    /// (OPT-09, #1776).
+    ///
+    /// An integer is taken as the number it is. Anything else that is present
+    /// -- a string, a list, a NaN or an infinity -- is refused rather than
+    /// dropped: a dropped key would report `gap: null` exactly as an absent one
+    /// does, and the caller could not tell the two apart (#1341).
+    fn or_solve_best_known(config: &HashMap<String, PropertyValue>) -> ExecutionResult<Option<f64>> {
+        let Some(value) = config.get("bestKnown").or_else(|| config.get("best_known")) else {
+            return Ok(None);
+        };
+        let number = match value {
+            PropertyValue::Float(f) => *f,
+            PropertyValue::Integer(i) => *i as f64,
+            other => {
+                return Err(ExecutionError::bad_argument(format!(
+                    "or.solve: `bestKnown` must be a number, got {other:?}"
+                )))
+            }
+        };
+        if !number.is_finite() {
+            return Err(ExecutionError::bad_argument(format!(
+                "or.solve: `bestKnown` must be finite, got {number}"
+            )));
+        }
+        Ok(Some(number))
+    }
+
+    /// Bind the four result-envelope columns every `or.solve` row carries
+    /// (OPT-09, #1776), so the single- and multi-objective branches cannot
+    /// drift apart on their names:
+    ///
+    /// - `objective`: the objective value of the solution written back, without
+    ///   the penalty that `fitness` includes (a list for multi-objective);
+    /// - `feasible`: whether that solution satisfies every constraint;
+    /// - `gap`: `objective - bestKnown`, or `null` when no best known value was
+    ///   supplied (no solver here can prove a bound);
+    /// - `total_time_ms`: wall-clock time of the solve alone, in milliseconds,
+    ///   the same name `/optimize/solve` reports it under.
+    fn bind_result_envelope(
+        record: &mut Record,
+        objective: Value,
+        feasible: Value,
+        gap: Value,
+        total_time_ms: f64,
+    ) {
+        record.bind("objective".to_string(), objective);
+        record.bind("feasible".to_string(), feasible);
+        record.bind("gap".to_string(), gap);
+        record.bind("total_time_ms".to_string(), Value::Property(PropertyValue::Float(total_time_ms)));
+    }
+
     fn execute_or_solve(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<()> {
         if self.args.is_empty() {
              return Err(ExecutionError::bad_argument("algo.or.solve requires a config map".to_string()));
@@ -19441,8 +19497,9 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         // reported success. Both spellings are accepted now, and anything else
         // is refused (#1341).
         Self::reject_unknown_config_keys(&self.args, "or.solve", &[
-            "algorithm", "budget", "costProperties", "costProperty", "cost_properties",
-            "cost_property", "label", "lowerBound", "max", "maxIterations", "max_iterations",
+            "algorithm", "bestKnown", "best_known", "budget", "costProperties", "costProperty",
+            "cost_properties", "cost_property", "label", "lowerBound", "max", "maxIterations",
+            "max_iterations",
             "minTotal", "min", "min_total", "populationSize", "population_size",
             "property", "upperBound",
         ])?;
@@ -19490,6 +19547,21 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
         let budget = config_map.get("budget").and_then(|v| v.as_float());
         let min_total = cfg_f("minTotal", "min_total");
+
+        let best_known = Self::or_solve_best_known(config_map)?;
+        let is_multi_objective =
+            Self::MULTI_OBJECTIVE_SOLVERS.contains(&algorithm) || cost_props.len() > 1;
+        // A gap is a distance between two numbers; a Pareto front has a vector
+        // per point and no single best known value. Ignoring the key would
+        // report `gap: null` for a value the caller did supply. Checked before
+        // the graph is read, so the refusal does not depend on the data.
+        if is_multi_objective && best_known.is_some() {
+            return Err(ExecutionError::bad_argument(
+                "or.solve: `bestKnown` applies to single-objective solves only; \
+                 a multi-objective result has no scalar gap"
+                    .to_string(),
+            ));
+        }
 
         let pop_size = cfg_i("populationSize", "population_size").unwrap_or(50) as usize;
         let max_iter = cfg_i("maxIterations", "max_iterations").unwrap_or(100) as usize;
@@ -19557,13 +19629,15 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         // branch, which has no arm for them, and hit the #1341 "no
         // implementation wired" guard — a dispatch bug that did not exist.
         // They are implemented; they were unroutable.
-        if Self::MULTI_OBJECTIVE_SOLVERS.contains(&algorithm) || cost_props.len() > 1 {
+        if is_multi_objective {
+            let started = std::time::Instant::now();
             let res = match algorithm {
                 "MOTLBO" => MOTLBOSolver::new(solver_config).solve(&problem),
                 "MOBMWR" => MOBMWRSolver::new(solver_config, MOBMWRVariant::MOBMR).solve(&problem),
                 "MORaoDE" => MORaoDESolver::new(solver_config).solve(&problem),
                 _ => NSGA2Solver::new(solver_config).solve(&problem), // Default multi
             };
+            let total_time_ms = duration_ms(started.elapsed());
 
             // Write back first individual from Pareto Front
             if let Some(best) = res.pareto_front.first() {
@@ -19587,9 +19661,30 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             }
             record.bind("algorithm".to_string(), Value::Property(PropertyValue::String(algorithm.to_string())));
             record.bind("front_size".to_string(), Value::Property(PropertyValue::Integer(res.pareto_front.len() as i64)));
+            // The result envelope (OPT-09, #1776), for the point written back.
+            // Feasibility is read from `Problem::penalty`, not from the front's
+            // `constraint_violation`: this problem gives the multi-objective
+            // solvers no penalties, so that field is 0 even when the point
+            // breaks the budget, and reading it would report every point
+            // feasible. `objective` is the raw objective vector, which here is
+            // `fitness` itself: no penalty is added to it.
+            let (objective, feasible) = match res.pareto_front.first() {
+                Some(best) => (
+                    Value::Property(PropertyValue::Array(
+                        best.fitness.iter().map(|&f| PropertyValue::Float(f)).collect(),
+                    )),
+                    Value::Property(PropertyValue::Boolean(is_feasible(Problem::penalty(
+                        &problem,
+                        &best.variables,
+                    )))),
+                ),
+                None => (Value::Null, Value::Null),
+            };
+            Self::bind_result_envelope(&mut record, objective, feasible, Value::Null, total_time_ms);
             self.results.push(record);
 
         } else {
+            let started = std::time::Instant::now();
             let result = match algorithm {
                 "Rao1" => RaoSolver::new(solver_config, RaoVariant::Rao1).solve(&problem),
                 "Rao2" => RaoSolver::new(solver_config, RaoVariant::Rao2).solve(&problem),
@@ -19634,6 +19729,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                     )))
                 }
             };
+            let total_time_ms = duration_ms(started.elapsed());
 
             // 4. Write back results
             for (i, &val) in result.best_variables.iter().enumerate() {
@@ -19674,7 +19770,24 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             // Yield history as an array for plotting
             let history_props: Vec<PropertyValue> = result.history.into_iter().map(PropertyValue::Float).collect();
             record.bind("history".to_string(), Value::Property(PropertyValue::Array(history_props)));
-            
+
+            // The result envelope (OPT-09, #1776). `fitness` is objective plus
+            // penalty, so on its own it cannot say whether the answer obeys the
+            // budget and minimum: these columns separate the two.
+            let objective = problem.objective(&result.best_variables);
+            let feasible = is_feasible(problem.penalty(&result.best_variables));
+            let gap = match best_known {
+                Some(best) => Value::Property(PropertyValue::Float(gap_to_best_known(objective, best))),
+                None => Value::Null,
+            };
+            Self::bind_result_envelope(
+                &mut record,
+                Value::Property(PropertyValue::Float(objective)),
+                Value::Property(PropertyValue::Boolean(feasible)),
+                gap,
+                total_time_ms,
+            );
+
             self.results.push(record);
         }
 
