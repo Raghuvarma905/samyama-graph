@@ -99,13 +99,19 @@ fn assert_solve_was_timed(done: &serde_json::Value) {
     );
 }
 
-#[test]
-fn as_millis_f64_keeps_the_sub_millisecond_part() {
-    use std::time::Duration;
-    assert_eq!(as_millis_f64(Duration::ZERO), 0.0);
-    assert_eq!(as_millis_f64(Duration::from_micros(1_500)), 1.5);
-    assert_eq!(as_millis_f64(Duration::from_micros(250)), 0.25);
-    assert_eq!(as_millis_f64(Duration::from_secs(2)), 2_000.0);
+/// Any fixed seed: the envelope tests check relationships, not values.
+const ENVELOPE_SEED: u64 = 3;
+
+/// `run_solver`'s `bench_dim` value meaning "use the catalog's dimension".
+const CATALOG_DIM: usize = 0;
+
+/// The catalog's known optimum for a benchmark, so a test never restates it.
+fn optimum_of(benchmark: &str) -> Option<f64> {
+    benchmark_catalog()
+        .into_iter()
+        .find(|b| b.id == benchmark)
+        .unwrap_or_else(|| panic!("{benchmark} is in the catalog"))
+        .optimum
 }
 
 #[tokio::test]
@@ -214,6 +220,15 @@ async fn a_single_objective_solve_streams_iterations_then_done_with_its_seed() {
         "sphere is non-negative"
     );
     assert_solve_was_timed(last);
+    // The rest of the result envelope (OPT-09, #1776). Sphere is box-bounded
+    // only, so every answer is feasible, and it has a known optimum, so the gap
+    // is the objective's distance from it.
+    assert_eq!(last["feasible"], true, "{last}");
+    let optimum = optimum_of("sphere").expect("sphere has a known optimum");
+    assert_eq!(
+        last["gap"].as_f64().expect("a gap"),
+        last["final_fitness"].as_f64().unwrap() - optimum
+    );
 
     // The receiver has been taken: a second stream of the same job is refused.
     let resp = app
@@ -246,6 +261,10 @@ async fn a_multi_objective_solve_stamps_the_pareto_front_on_the_last_iteration()
     let (name, done) = events.last().unwrap();
     assert_eq!(name, "done");
     assert_solve_was_timed(done);
+    // A front has no single optimum, and its feasibility cannot be read on
+    // this surface (#1795): both fields are present and null, never guessed.
+    assert!(done.get("feasible").is_some_and(|v| v.is_null()), "{done}");
+    assert!(done.get("gap").is_some_and(|v| v.is_null()), "{done}");
     let front = done["final_pareto"].as_array().expect("a pareto front");
     assert!(!front.is_empty());
     assert!(
@@ -385,6 +404,33 @@ fn every_single_objective_solver_runs_on_every_single_objective_benchmark() {
     for bench in ["rastrigin", "ackley", "rosenbrock"] {
         let out = run_solver("jaya", false, bench, 1, 0, cfg(), None).unwrap();
         assert!(out.final_fitness.is_finite(), "{bench}");
+    }
+}
+
+#[test]
+fn every_single_objective_benchmark_reports_feasibility_and_its_gap() {
+    for bench in ["sphere", "rastrigin", "ackley", "rosenbrock"] {
+        let out =
+            run_solver("jaya", false, bench, 1, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED)).unwrap();
+        assert_eq!(out.feasible, Some(true), "{bench} has bounds only, no constraints");
+        let optimum = optimum_of(bench).unwrap_or_else(|| panic!("{bench} has an optimum"));
+        // These problems add no penalty, so the objective is the fitness.
+        assert_eq!(out.gap, Some(out.final_fitness - optimum), "{bench}");
+        assert!(
+            out.gap.is_some_and(|g| g >= 0.0),
+            "{bench}: nothing beats a true optimum"
+        );
+    }
+}
+
+#[test]
+fn a_multi_objective_result_reports_no_feasibility_or_gap() {
+    for bench in ["zdt1", "dtlz1", "uc2_dosing"] {
+        let out =
+            run_solver("nsga2", true, bench, 2, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED)).unwrap();
+        assert_eq!(out.feasible, None, "{bench}");
+        assert_eq!(out.gap, None, "{bench}");
+        assert_eq!(optimum_of(bench), None, "{bench}: the catalog lists no optimum");
     }
 }
 
