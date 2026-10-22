@@ -78,6 +78,13 @@ class SourceDataError(ValueError):
     """The input files are wrong; a retry will read the same files."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """API redirects must not forward write credentials to a different server."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 @dataclass
 class SamyamaHttp:
     """A minimal client for `POST /api/query`.
@@ -114,7 +121,8 @@ class SamyamaHttp:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with urllib.request.build_opener(_NoRedirect()).open(
+                    request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read())
         except urllib.error.HTTPError as e:
             message = _error_message(e)
@@ -277,6 +285,14 @@ RETURN collect(id) AS duplicated
 """
 
 
+DUPLICATED_ACCOUNT_IDS = """
+MATCH (a:Account)
+WITH a.id AS id, count(a) AS n
+WHERE n > 1
+RETURN collect(id) AS duplicated
+"""
+
+
 def ensure_schema(client: SamyamaHttp) -> int:
     for statement in SCHEMA_STATEMENTS:
         client.query(statement)
@@ -326,15 +342,14 @@ class Check:
 
 
 def check_accounts(client: SamyamaHttp, rows: Sequence[dict]) -> list[Check]:
-    ids = [r["id"] for r in rows]
+    ids = {r["id"] for r in rows}
+    duplicated = sorted(ids.intersection(client.scalar(DUPLICATED_ACCOUNT_IDS)))
     return [
         Check("accounts present with the file's values", len(rows),
               client.scalar(CHECK_ACCOUNTS, {"rows": list(rows)})),
-        # A second node with the same id -- written by something that used
-        # CREATE rather than MERGE -- passes the check above and fails this one.
-        Check("no account id held by more than one node", len(set(ids)),
-              client.scalar("UNWIND $ids AS id MATCH (a:Account {id: id}) RETURN count(a)",
-                            {"ids": ids})),
+        # Count duplicates by ID: an extra copy of A must not cancel a missing B.
+        Check("no account id held by more than one node", 0, len(duplicated),
+              ", ".join(duplicated[:20])),
     ]
 
 

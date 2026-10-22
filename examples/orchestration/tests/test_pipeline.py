@@ -266,3 +266,67 @@ def test_a_missing_or_wrong_token_is_refused_and_the_right_one_works(secured_eng
         assert e.value.status == 401
     load_all(sp.SamyamaHttp(secured_engine.url, token=secured_engine.token), sample, 500)
     assert_graph_matches(secured_engine, sample)
+
+
+def test_duplicate_and_missing_account_cannot_cancel_each_other(engine, sample):
+    a, b = sample.accounts[:2]
+    _create_account(engine, a)
+    _create_account(engine, a)
+    checked = sp.check_accounts(sp.SamyamaHttp(engine.url), [a, b])
+    # The old total-count check returned two for both checks and passed.
+    assert checked[0].passed
+    failed = sp.failures(checked)
+    assert len(failed) == 1 and "more than one node" in failed[0]
+    assert a["id"] in failed[0]
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirect_cannot_forward_write_credentials(status):
+    import http.server
+    import json
+    import threading
+
+    source_auth, redirected_auth = [], []
+
+    class Receiver(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            redirected_auth.append(self.headers.get("Authorization"))
+            body = json.dumps({"records": [[1]]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_POST = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    receiver = http.server.HTTPServer(("127.0.0.1", 0), Receiver)
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            source_auth.append(self.headers.get("Authorization"))
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(status)
+            self.send_header("Location", f"http://127.0.0.1:{receiver.server_port}/capture")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    source = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+    for server in (source, receiver):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = sp.SamyamaHttp(f"http://127.0.0.1:{source.server_port}", token="test-only-token")
+        with pytest.raises(sp.SamyamaRejected) as error:
+            client.query("RETURN 1")
+        assert error.value.status == status
+        assert source_auth == ["Bearer test-only-token"]
+        assert redirected_auth == []
+    finally:
+        for server in (source, receiver):
+            server.shutdown()
+            server.server_close()
