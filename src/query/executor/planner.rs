@@ -1793,39 +1793,19 @@ impl QueryPlanner {
             && query.load_parquet_clause.is_none()
         {
             if let Some(merge_clause) = &query.merge_clause {
-                let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
-                    .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-                    .collect();
-                let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
-                    .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-                    .collect();
-                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause.on_create_labels.iter()
-                    .map(|l| (l.variable.clone(), l.labels.clone()))
-                    .collect();
-                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause.on_match_labels.iter()
-                    .map(|l| (l.variable.clone(), l.labels.clone()))
-                    .collect();
-
-                // `ON CREATE SET n = {…}` / `n += {…}` (#874).
-                let on_create_entity: Vec<(String, bool, Expression)> = merge_clause
-                    .on_create_entity_set
-                    .iter()
-                    .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                    .collect();
-                let on_match_entity: Vec<(String, bool, Expression)> = merge_clause
-                    .on_match_entity_set
-                    .iter()
-                    .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                    .collect();
+                // `ON CREATE` / `ON MATCH` items in the order written (#1919).
                 let mut operator: OperatorBox = Box::new(
                     MergeOperator::new(
                         merge_clause.pattern.clone(),
-                        on_create,
-                        on_match,
-                        on_create_labels,
-                        on_match_labels,
+                        Vec::new(),
+                        Vec::new(),
+                        merge_labels(&merge_clause.on_create),
+                        merge_labels(&merge_clause.on_match),
                     )
-                    .with_entity_sets(on_create_entity, on_match_entity),
+                    .with_ordered_sets(
+                        merge_writes(&merge_clause.on_create),
+                        merge_writes(&merge_clause.on_match),
+                    ),
                 );
 
                 // `MERGE p = (...)` binds `p` (#876).
@@ -8688,44 +8668,16 @@ impl QueryPlanner {
                     bound.extend(clause_vars);
                 }
                 Clause::Merge(mc) => {
-                    let on_create: Vec<(String, String, Expression)> = mc
-                        .on_create_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let on_match: Vec<(String, String, Expression)> = mc
-                        .on_match_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let on_create_labels: Vec<(String, Vec<Label>)> = mc
-                        .on_create_labels
-                        .iter()
-                        .map(|l| (l.variable.clone(), l.labels.clone()))
-                        .collect();
-                    let on_match_labels: Vec<(String, Vec<Label>)> = mc
-                        .on_match_labels
-                        .iter()
-                        .map(|l| (l.variable.clone(), l.labels.clone()))
-                        .collect();
+                    // `ON CREATE` / `ON MATCH` items in the order written (#1919).
                     operator = Box::new(
                         MergeOperator::new(
                             mc.pattern.clone(),
-                            on_create,
-                            on_match,
-                            on_create_labels,
-                            on_match_labels,
+                            Vec::new(),
+                            Vec::new(),
+                            merge_labels(&mc.on_create),
+                            merge_labels(&mc.on_match),
                         )
-                        .with_entity_sets(
-                            mc.on_create_entity_set
-                                .iter()
-                                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                                .collect(),
-                            mc.on_match_entity_set
-                                .iter()
-                                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                                .collect(),
-                        )
+                        .with_ordered_sets(merge_writes(&mc.on_create), merge_writes(&mc.on_match))
                         .with_input(operator),
                     );
                     // `MERGE p = (...)` binds `p` (#876).
@@ -9390,12 +9342,9 @@ impl QueryPlanner {
         merge_clause: &MergeClause,
         bound_by_match: &[String],
     ) -> OperatorBox {
-        let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
-            .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-            .collect();
-        let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
-            .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-            .collect();
+        // `ON CREATE` / `ON MATCH` items in the order written (#1919).
+        let on_create = merge_writes(&merge_clause.on_create);
+        let on_match = merge_writes(&merge_clause.on_match);
 
         // Extract edge patterns from MERGE clause
         let mut edges_to_merge = Vec::new();
@@ -9482,20 +9431,9 @@ impl QueryPlanner {
         if !edges_to_merge.is_empty() && all_endpoints_bound {
             // Edge MERGE: use MatchMergeEdgeOperator
             use crate::query::executor::operator::MatchMergeEdgeOperator;
-            // `ON CREATE SET n = {…}` / `n += {…}` (#874).
-            let on_create_entity: Vec<(String, bool, Expression)> = merge_clause
-                .on_create_entity_set
-                .iter()
-                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                .collect();
-            let on_match_entity: Vec<(String, bool, Expression)> = merge_clause
-                .on_match_entity_set
-                .iter()
-                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                .collect();
             operator = Box::new(
-                MatchMergeEdgeOperator::new(operator, edges_to_merge, on_create, on_match)
-                    .with_entity_sets(on_create_entity, on_match_entity),
+                MatchMergeEdgeOperator::new(operator, edges_to_merge, Vec::new(), Vec::new())
+                    .with_ordered_sets(on_create, on_match),
             );
             if !merge_named_paths.is_empty() {
                 operator = Box::new(crate::query::executor::operator::BindPathOperator::new(
@@ -9513,36 +9451,15 @@ impl QueryPlanner {
             // the point, could not see the row. That is why
             // `UNWIND [...] AS x MERGE (n:N {v: x})` had nowhere to read
             // `x` from (#642).
-            let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause
-                .on_create_labels
-                .iter()
-                .map(|l| (l.variable.clone(), l.labels.clone()))
-                .collect();
-            let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause
-                .on_match_labels
-                .iter()
-                .map(|l| (l.variable.clone(), l.labels.clone()))
-                .collect();
             operator = Box::new(
                 MergeOperator::new(
                     merge_clause.pattern.clone(),
-                    on_create,
-                    on_match,
-                    on_create_labels,
-                    on_match_labels,
+                    Vec::new(),
+                    Vec::new(),
+                    merge_labels(&merge_clause.on_create),
+                    merge_labels(&merge_clause.on_match),
                 )
-                .with_entity_sets(
-                    merge_clause
-                        .on_create_entity_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect(),
-                    merge_clause
-                        .on_match_entity_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect(),
-                )
+                .with_ordered_sets(on_create, on_match)
                 .with_input(operator),
             );
             if !merge_named_paths.is_empty() {
@@ -10249,6 +10166,33 @@ impl QueryPlanner {
         }
         true
     }
+}
+
+
+/// The property and whole-entity items of an `ON CREATE` / `ON MATCH` block,
+/// as writes in the order written (#1919). Labels are taken separately by
+/// [`merge_labels`]; a property write cannot disturb a label.
+fn merge_writes(ops: &[SetOp]) -> Vec<crate::query::executor::operator::SetWrite> {
+    use crate::query::executor::operator::SetWrite;
+    ops.iter()
+        .filter_map(|op| match op {
+            SetOp::Property(i) => {
+                Some(SetWrite::Property(i.variable.clone(), i.property.clone(), i.value.clone()))
+            }
+            SetOp::Entity(i) => Some(SetWrite::Entity(i.variable.clone(), i.merge, i.value.clone())),
+            SetOp::Labels(_) => None,
+        })
+        .collect()
+}
+
+/// The label items of an `ON CREATE` / `ON MATCH` block.
+fn merge_labels(ops: &[SetOp]) -> Vec<(String, Vec<Label>)> {
+    ops.iter()
+        .filter_map(|op| match op {
+            SetOp::Labels(l) => Some((l.variable.clone(), l.labels.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
