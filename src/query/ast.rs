@@ -115,6 +115,8 @@ pub struct Query {
     pub create_vector_index_clause: Option<CreateVectorIndexClause>,
     pub create_fulltext_index_clause: Option<CreateFullTextIndexClause>,
     pub drop_fulltext_index_clause: Option<DropFullTextIndexClause>,
+    /// `CREATE POINT INDEX` / `DROP POINT INDEX` (#1618).
+    pub point_index_ddl: Option<PointIndexDdl>,
     /// CREATE INDEX clause (optional)
     pub create_index_clause: Option<CreateIndexClause>,
     /// DROP INDEX clause (optional)
@@ -236,6 +238,13 @@ pub struct CreateFullTextIndexClause {
     /// One or more properties. Neo4j's `ON EACH [n.a, n.b]` indexes several,
     /// and the single-property form is the same thing with one entry.
     pub property_keys: Vec<String>,
+}
+
+/// `CREATE POINT INDEX` / `DROP POINT INDEX` (#1618).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointIndexDdl {
+    Create { name: String, label: Label, property: String },
+    Drop { name: String },
 }
 
 /// DROP FULLTEXT INDEX clause
@@ -1059,26 +1068,17 @@ pub struct SetClause {
 impl SetClause {
     /// `n.prop = value` items, in order.
     pub fn items(&self) -> impl Iterator<Item = &SetItem> {
-        self.ops.iter().filter_map(|op| match op {
-            SetOp::Property(i) => Some(i),
-            _ => None,
-        })
+        set_items(&self.ops)
     }
 
     /// `n:Label` items, in order.
     pub fn label_items(&self) -> impl Iterator<Item = &SetLabelItem> {
-        self.ops.iter().filter_map(|op| match op {
-            SetOp::Labels(i) => Some(i),
-            _ => None,
-        })
+        set_label_items(&self.ops)
     }
 
     /// `n = …` and `n += …` items, in order.
     pub fn entity_items(&self) -> impl Iterator<Item = &SetEntityItem> {
-        self.ops.iter().filter_map(|op| match op {
-            SetOp::Entity(i) => Some(i),
-            _ => None,
-        })
+        set_entity_items(&self.ops)
     }
 }
 
@@ -1182,27 +1182,65 @@ pub struct UnwindClause {
 pub struct MergeClause {
     /// Pattern to merge
     pub pattern: Pattern,
-    /// ON CREATE SET items
-    pub on_create_set: Vec<SetItem>,
-    /// ON MATCH SET items
-    pub on_match_set: Vec<SetItem>,
-    /// Labels added by `ON CREATE SET n:Label`.
+    /// `ON CREATE SET` items, in the order they were written.
     ///
-    /// Separate from `on_create_set` for the same reason `SetClause` keeps
-    /// `label_items` apart from `items`: the property form is read by field in
-    /// several places and an enum would touch all of them.
-    pub on_create_labels: Vec<SetLabelItem>,
-    /// Labels added by `ON MATCH SET n:Label`.
-    pub on_match_labels: Vec<SetLabelItem>,
-    /// Whole-entity assignment in `ON CREATE SET n = {…}` / `n += {…}`.
-    ///
-    /// The grammar has always parsed these -- `set_entry` includes
-    /// `set_entity_item` -- but `parse_merge_clause` matched only `set_item`
-    /// and `set_label_item`, so they fell through its `match` and the clause
-    /// the user wrote was **silently discarded** (#874).
-    pub on_create_entity_set: Vec<SetEntityItem>,
-    /// The same for `ON MATCH SET`.
-    pub on_match_entity_set: Vec<SetEntityItem>,
+    /// One ordered sequence per block, as `SetClause` has since #1896. Six
+    /// vectors by kind -- property, whole-entity and label, for each block --
+    /// lost the order between kinds, so `ON CREATE SET n = row.props,
+    /// n.id = row.id` ran the property first and the replace erased it (#1919).
+    /// This was the last field-per-kind split in the SET family; `ForeachBody`
+    /// records the same mistake costing DELETE and REMOVE (#465).
+    pub on_create: Vec<SetOp>,
+    /// `ON MATCH SET` items, in the order they were written.
+    pub on_match: Vec<SetOp>,
+}
+
+impl MergeClause {
+    /// `ON CREATE SET n.prop = value` items, in order.
+    pub fn on_create_set(&self) -> impl Iterator<Item = &SetItem> {
+        set_items(&self.on_create)
+    }
+    /// `ON MATCH SET n.prop = value` items, in order.
+    pub fn on_match_set(&self) -> impl Iterator<Item = &SetItem> {
+        set_items(&self.on_match)
+    }
+    /// `ON CREATE SET n = …` / `n += …` items, in order.
+    pub fn on_create_entity_set(&self) -> impl Iterator<Item = &SetEntityItem> {
+        set_entity_items(&self.on_create)
+    }
+    /// `ON MATCH SET n = …` / `n += …` items, in order.
+    pub fn on_match_entity_set(&self) -> impl Iterator<Item = &SetEntityItem> {
+        set_entity_items(&self.on_match)
+    }
+    /// `ON CREATE SET n:Label` items, in order.
+    pub fn on_create_labels(&self) -> impl Iterator<Item = &SetLabelItem> {
+        set_label_items(&self.on_create)
+    }
+    /// `ON MATCH SET n:Label` items, in order.
+    pub fn on_match_labels(&self) -> impl Iterator<Item = &SetLabelItem> {
+        set_label_items(&self.on_match)
+    }
+}
+
+fn set_items(ops: &[SetOp]) -> impl Iterator<Item = &SetItem> {
+    ops.iter().filter_map(|op| match op {
+        SetOp::Property(i) => Some(i),
+        _ => None,
+    })
+}
+
+fn set_entity_items(ops: &[SetOp]) -> impl Iterator<Item = &SetEntityItem> {
+    ops.iter().filter_map(|op| match op {
+        SetOp::Entity(i) => Some(i),
+        _ => None,
+    })
+}
+
+fn set_label_items(ops: &[SetOp]) -> impl Iterator<Item = &SetLabelItem> {
+    ops.iter().filter_map(|op| match op {
+        SetOp::Labels(i) => Some(i),
+        _ => None,
+    })
 }
 
 /// WITH clause
@@ -1322,6 +1360,7 @@ impl Query {
             || self.create_vector_index_clause.is_some()
             || self.create_fulltext_index_clause.is_some()
             || self.drop_fulltext_index_clause.is_some()
+            || self.point_index_ddl.is_some()
             || self.create_constraint_clause.is_some()
             || self.create_hierarchy_index_clause.is_some()
             || self.drop_hierarchy_index.is_some()
@@ -1393,6 +1432,7 @@ impl Query {
             create_vector_index_clause: None,
             create_fulltext_index_clause: None,
             drop_fulltext_index_clause: None,
+            point_index_ddl: None,
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,

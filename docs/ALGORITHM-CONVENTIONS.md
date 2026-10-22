@@ -210,7 +210,7 @@ drop-in replacement for a from-scratch SGNS-trained node2vec.
 | Algorithm | Cypher name | Directedness | Weights | Self-loops | Disconnected | Tie-breaking | Normalisation |
 |---|---|---|---|---|---|---|---|
 | PCA | pca | No edges: it reads numeric node properties | Node properties, not edge weights; a non-numeric or missing value is the caller's to handle | Not applicable | Not applicable: there is no graph | Components in eigenvalue-descending order; equal eigenvalues give an arbitrary but reproducible basis | Centred by default, scaled on request. **Component sign is not fixed** **(differs)**. Deterministic: a fixed start vector and a seeded RNG |
-| Optimisation solvers | or.solve | Not applicable | Not applicable | Not applicable | Not applicable | Solver-specific; every solver is seed-reproducible (OPT-08) | Solver-specific |
+| Optimisation solvers | or.solve | Not applicable | Not applicable | Not applicable | Not applicable | Solver-specific; every solver is seed-reproducible (OPT-08) | Solver-specific. Every row carries `objective`, `feasible`, `gap` and `total_time_ms` (OPT-09); `fitness` includes the constraint penalty, `objective` does not |
 
 ## Where a convention differs from the obvious one
 
