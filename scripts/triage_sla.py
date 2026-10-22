@@ -165,7 +165,7 @@ class GitHub:
     def __init__(self, repo: str, token: str | None):
         self.repo = repo
         self.token = token
-        self._roles: dict[str, str] = {}
+        self._roles: dict[str, tuple[str, str]] = {}
 
     def _get(self, url: str):
         if not url.startswith("https://"):
@@ -222,8 +222,16 @@ class GitHub:
                 if e.code != 404:   # a deleted account ("ghost") has no role; anything else is real
                     raise
                 data = {}
-            self._roles[login] = data.get("role_name") or data.get("permission") or "none"
-        return self._roles[login] in MAINTAINER_ROLES
+            self._roles[login] = (data.get("role_name") or "", data.get("permission") or "none")
+        role, permission = self._roles[login]
+        if role in MAINTAINER_ROLES or permission in MAINTAINER_ROLES:
+            return True
+        if role not in {"", "none", "read"}:
+            # A custom read-based role can carry additional triage capabilities.
+            # This endpoint does not expose them; refuse an inaccurate report.
+            raise RuntimeError(f"cannot determine triage access for custom role {role!r} "
+                               f"held by {login}; underlying permission is {permission!r}")
+        return False
 
     def policy_effective(self) -> datetime | None:
         info, _ = self._get(f"https://api.github.com/repos/{self.repo}")
@@ -293,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: could not read the issue tracker: {e!r}", file=sys.stderr)
         return 2
     except (OSError, RuntimeError, subprocess.SubprocessError) as e:
-        print(f"error: could not determine policy publication: {e}", file=sys.stderr)
+        print(f"error: could not measure SLA: {e}", file=sys.stderr)
         return 2
 
     report = render(verdicts, effective)

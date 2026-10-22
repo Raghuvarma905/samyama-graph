@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from triage_sla import TZ, Event, Issue, business_days, judge, policy_publication
+from triage_sla import TZ, Event, Issue, GitHub, business_days, judge, policy_publication
 
 # release-bot has write access, as an app installed on the repo can.
 TEAM = {"maint", "release-bot"}
@@ -136,6 +136,25 @@ with tempfile.TemporaryDirectory(prefix="triage-policy-history-") as tmp:
         check("a shallow history cannot silently invent an effective date", True)
     else:
         check("a shallow history cannot silently invent an effective date", False)
+
+# GitHub returns custom role names separately from their underlying access.
+for role, permission, expected in (
+    ("custom-writer", "write", True), ("custom-admin", "admin", True),
+    ("triage", "read", True), ("read", "read", False), ("none", "none", False),
+):
+    api = GitHub("owner/repo", None)
+    api._get = lambda url, r=role, p=permission: ({"role_name": r, "permission": p}, None)
+    check(f"role {role} with underlying {permission} is classified correctly",
+          api.is_maintainer("person") is expected)
+
+api = GitHub("owner/repo", None)
+api._get = lambda url: ({"role_name": "custom-reader", "permission": "read"}, None)
+try:
+    api.is_maintainer("person")
+except RuntimeError:
+    check("ambiguous custom read-based roles cannot silently produce an SLA verdict", True)
+else:
+    check("ambiguous custom read-based roles cannot silently produce an SLA verdict", False)
 
 if FAILURES:
     print(f"\n{len(FAILURES)} failed")
