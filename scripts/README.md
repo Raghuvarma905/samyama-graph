@@ -67,3 +67,9 @@ The shell scripts require Bash. Python tools use the Python 3 standard library;
 checks that build or run Samyama need the repository's Rust toolchain. Dataset
 helpers need network access; the Graphalytics S-size download also needs
 `zstd`. Coverage installs `cargo-llvm-cov` if needed.
+
+The `triage SLA role lookup (workflow token)` CI job also checks the role API
+with the same read permissions as the scheduled SLA workflow. Its read-only
+fixtures default to maintainer `Raghuvarma905` and outside user `octocat`.
+If their roles change, update repository variables `TRIAGE_SLA_MAINTAINER` and
+`TRIAGE_SLA_OUTSIDE_USER`. The token stays in the environment and is never printed.
