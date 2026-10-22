@@ -1381,7 +1381,9 @@ impl Query {
         self.call_subquery.as_deref().is_some_and(|q| q.is_write())
     }
 
-    /// Does any `CALL` in this statement name a procedure that needs write access?
+    /// Does any `CALL` in this statement need write access: a procedure that
+    /// always writes, or an algorithm asked to store its result
+    /// (`writeProperty`, ALGO-06)?
     ///
     /// Both AST shapes are checked: `call_clause` holds the CALL when the query was
     /// parsed into the older shape, `clauses` when it was parsed into the newer one.
@@ -1391,12 +1393,12 @@ impl Query {
         if self
             .call_clause
             .as_ref()
-            .is_some_and(|c| AlgorithmOperator::procedure_is_mutating(&c.procedure_name))
+            .is_some_and(|c| AlgorithmOperator::call_writes(&c.procedure_name, &c.arguments))
         {
             return true;
         }
         self.clauses.iter().any(|c| match c {
-            Clause::Call(call) => AlgorithmOperator::procedure_is_mutating(&call.procedure_name),
+            Clause::Call(call) => AlgorithmOperator::call_writes(&call.procedure_name, &call.arguments),
             _ => false,
         })
     }

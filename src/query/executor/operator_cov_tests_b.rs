@@ -1155,10 +1155,12 @@ fn unknown_config_keys_are_refused_naming_the_rest() {
     let e = algo_err(
         &mut store,
         "algo.pageRank",
-        vec![lmap(&[("writeProperty", pstr("pr")), ("zeta", pint(1))])],
+        // `writeProperty` is a key pageRank reads now (ALGO-06), so the two
+        // unknown ones are a typo and a key nothing reads.
+        vec![lmap(&[("iteratons", pint(5)), ("zeta", pint(1))])],
     );
     assert!(
-        e.contains("unknown config key `writeProperty` (and 1 more: zeta)"),
+        e.contains("unknown config key `iteratons` (and 1 more: zeta)"),
         "{e}"
     );
     assert!(
@@ -6522,4 +6524,109 @@ fn bounded_sorts_trim_and_soft_hints_sort_the_tail_on_demand() {
     let mut zero = SortOperator::new(rows(), vec![(var("x"), true)]);
     zero.try_push_limit(0);
     assert!(drain(&mut zero, &store).is_empty());
+}
+
+// ---------- write-back guards (ALGO-06, #1683) ----------
+//
+// No algorithm in `WRITE_BACK` produces these rows today, so the guards are
+// driven with hand-built results: a guard no test reaches is a guess.
+
+/// An operator for `algo.pageRank` whose results are `rows`, as if it had run.
+fn write_back_op(rows: Vec<Record>) -> AlgorithmOperator {
+    let mut op = AlgorithmOperator::new("algo.pageRank".to_string(), vec![]);
+    op.results = rows;
+    op
+}
+
+fn score_row(node: Option<Value>, score: Value) -> Record {
+    let mut r = Record::new();
+    if let Some(n) = node {
+        r.bind("node".to_string(), n);
+    }
+    r.bind("score".to_string(), score);
+    r
+}
+
+#[test]
+fn write_back_refuses_a_node_that_appears_twice() {
+    let (mut store, ids) = path4();
+    let id = NodeId::new(ids[0] as u64);
+    let mut op = write_back_op(vec![
+        score_row(Some(Value::NodeRef(id)), Value::Property(PropertyValue::Float(1.0))),
+        score_row(Some(Value::NodeRef(id)), Value::Property(PropertyValue::Float(2.0))),
+    ]);
+    let err = op.write_back(&mut store, TENANT, "wb", "score").unwrap_err().to_string();
+    assert!(err.contains("appears in two result rows"), "{err}");
+}
+
+#[test]
+fn write_back_refuses_a_row_with_no_node() {
+    let (mut store, _) = path4();
+    let mut op = write_back_op(vec![score_row(None, Value::Property(PropertyValue::Float(1.0)))]);
+    let err = op.write_back(&mut store, TENANT, "wb", "score").unwrap_err().to_string();
+    assert!(err.contains("no `node`"), "{err}");
+}
+
+#[test]
+fn write_back_refuses_a_value_that_is_not_a_property() {
+    let (mut store, ids) = path4();
+    let id = NodeId::new(ids[0] as u64);
+    let mut op = write_back_op(vec![score_row(Some(Value::NodeRef(id)), Value::NodeRef(id))]);
+    let err = op.write_back(&mut store, TENANT, "wb", "score").unwrap_err().to_string();
+    assert!(err.contains("is not a property value"), "{err}");
+    assert_eq!(store.node_property(id, "wb"), None, "nothing was written");
+}
+
+#[test]
+fn write_back_stores_a_value_on_a_node_given_by_reference() {
+    let (mut store, ids) = path4();
+    let id = NodeId::new(ids[1] as u64);
+    let mut op = write_back_op(vec![score_row(
+        Some(Value::NodeRef(id)),
+        Value::Property(PropertyValue::Float(0.5)),
+    )]);
+    op.write_back(&mut store, TENANT, "wb", "score").unwrap();
+    assert_eq!(store.node_property(id, "wb"), Some(PropertyValue::Float(0.5)));
+}
+
+#[test]
+fn call_writes_reads_the_config_as_well_as_the_name() {
+    let write = vec![lmap(&[("writeProperty", pstr("p"))])];
+    assert!(AlgorithmOperator::call_writes("algo.pageRank", &write));
+    assert!(!AlgorithmOperator::call_writes("algo.pageRank", &[]));
+    assert!(!AlgorithmOperator::call_writes(
+        "algo.pageRank",
+        &[lmap(&[("iterations", pint(3))])]
+    ));
+    // A procedure that always writes still does, config or not.
+    assert!(AlgorithmOperator::call_writes("algo.fastRP", &[]));
+}
+
+#[test]
+fn write_back_refuses_a_row_missing_the_column_rather_than_erasing_the_property() {
+    let (mut store, ids) = path4();
+    let id = NodeId::new(ids[0] as u64);
+    store.set_node_property(TENANT, id, "wb", 7i64).unwrap();
+    let mut row = Record::new();
+    row.bind("node".to_string(), Value::NodeRef(id));
+    let mut op = write_back_op(vec![row]);
+    let err = op.write_back(&mut store, TENANT, "wb", "score").unwrap_err().to_string();
+    assert!(err.contains("no `score` column"), "{err}");
+    assert_eq!(store.node_property(id, "wb"), Some(PropertyValue::Integer(7)));
+}
+
+#[test]
+fn write_back_removes_the_property_for_a_null_result() {
+    let (mut store, ids) = path4();
+    let (a, b) = (NodeId::new(ids[0] as u64), NodeId::new(ids[1] as u64));
+    store.set_node_property(TENANT, a, "wb", 7i64).unwrap();
+    store.set_node_property(TENANT, b, "wb", 7i64).unwrap();
+    // Both shapes a null takes in a result row.
+    let mut op = write_back_op(vec![
+        score_row(Some(Value::NodeRef(a)), Value::Null),
+        score_row(Some(Value::NodeRef(b)), Value::Property(PropertyValue::Null)),
+    ]);
+    op.write_back(&mut store, TENANT, "wb", "score").unwrap();
+    assert_eq!(store.node_property(a, "wb"), None);
+    assert_eq!(store.node_property(b, "wb"), None);
 }
