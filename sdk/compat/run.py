@@ -9,8 +9,8 @@ built from this checkout.
 
     python3 sdk/compat/run.py --bin target/release/samyama
 
-Which versions: the latest published patch of each of the two most recent
-minor releases at or below the version of record (`Cargo.toml`). Two, not
+Which versions: the latest published patch of the minor release in the
+version of record (`Cargo.toml`) and its immediately preceding minor. Two, not
 one, because the version of record does not say which release this build will
 become. Right after `1.12.0` ships, `dev` still reads `1.12.0` and is heading
 for `1.13.0`, whose N-1 is `1.12`; a build that becomes `1.12.1` must still
@@ -89,30 +89,41 @@ def pypi_versions() -> list[Version]:
 
 def npm_versions() -> list[Version]:
     versions = fetch_json(f"https://registry.npmjs.org/{NPM_PACKAGE}")["versions"]
-    return [v for raw, meta in versions.items()
-            if (v := parse(raw)) and not meta.get("deprecated")]
+    # Deprecation is an installation warning, not withdrawal. Existing users
+    # can still hold these SDKs, and an explicit npm version remains installable.
+    return [v for raw in versions if (v := parse(raw))]
 
 
 def latest_of_recent_minors(published: list[Version], ceiling: Version, n: int) -> list[Version]:
-    """The newest patch of each of the `n` newest minors at or below `ceiling`."""
+    """Newest patches of exactly `ceiling`'s minor and its adjacent predecessors.
+
+    Never substitute an older minor for a missing required one. A major boundary
+    needs an explicit compatibility window, rather than guessing from an index.
+    """
+    if n < 1 or ceiling[1] < n - 1:
+        raise ValueError(f"cannot derive {n} adjacent minors within {ceiling[0]}.x "
+                         f"from {show(ceiling)}; define an explicit compatibility window")
+    required = [(ceiling[0], ceiling[1] - offset) for offset in range(n)]
     newest: dict[tuple[int, int], Version] = {}
     for v in published:
-        if v[:2] <= ceiling[:2]:
+        if v[:2] in required:
             key = v[:2]
             newest[key] = max(newest.get(key, v), v)
-    return [newest[k] for k in sorted(newest, reverse=True)[:n]]
+    missing = [f"{major}.{minor}" for major, minor in required if (major, minor) not in newest]
+    if missing:
+        raise ValueError(f"required published minor(s) missing: {', '.join(missing)}; "
+                         "refusing to substitute older SDKs")
+    return [newest[k] for k in required]
 
 
 def resolve() -> dict[str, list[Version]]:
     ceiling = version_of_record()
-    chosen = {
-        "python": latest_of_recent_minors(pypi_versions(), ceiling, MINORS_TESTED),
-        "typescript": latest_of_recent_minors(npm_versions(), ceiling, MINORS_TESTED),
-    }
-    for sdk, versions in chosen.items():
-        if len(versions) < MINORS_TESTED:
-            sys.exit(f"{sdk}: found {len(versions)} published minor(s) at or below "
-                     f"{show(ceiling)}, need {MINORS_TESTED}: {[show(v) for v in versions]}")
+    chosen = {}
+    for sdk, published in (("python", pypi_versions), ("typescript", npm_versions)):
+        try:
+            chosen[sdk] = latest_of_recent_minors(published(), ceiling, MINORS_TESTED)
+        except ValueError as error:
+            sys.exit(f"{sdk}: {error}")
     return chosen
 
 

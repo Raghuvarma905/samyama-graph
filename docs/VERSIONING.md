@@ -68,13 +68,19 @@ minors.
 
 **Checked by** `sdk/compat/run.py`, the `sdk-compat` CI job. It installs the
 SDKs **as published** -- from PyPI and npm, not from this tree -- for the
-latest patch of each of the two most recent minors at or below the version of
-record, and runs a suite through each against a server built from the change
-under review: connecting, status, reads and writes, typed values, nodes and
+latest installable patch of the minor in the version of record and its
+immediately preceding minor, and runs a suite through each against a server
+built from the change under review: connecting, status, reads and writes, typed values, nodes and
 edges, streaming, a read-only call refusing a write, and an error raising. The
 versions are read from `Cargo.toml` and the package indexes on every run, so the
 check moves forward with each release by itself. A version it cannot find fails
 the job rather than skipping it.
+
+Missing either required minor fails the job; an older minor cannot substitute
+for it. Deprecated npm releases remain eligible because users can still install
+and hold them. Yanked PyPI files are excluded; if no installable patch remains
+in a required minor, the job fails. At a major boundary (`x.0.0`), an explicit
+compatibility window must be defined rather than inferred from available SDKs.
 
 Two minors rather than one because the version of record does not say which
 release a build will become: just after 1.12.0 ships, `dev` still reads 1.12.0
@@ -105,7 +111,7 @@ removed in 2.0.0 -- provided 1.15.0 shipped first. If 2.0.0 came after only
 
 - every entry is well-formed, and `deprecated_in` is not later than the version
   of record;
-- a removal is in a later major, with at least two minor releases between the
+- a removal is at a later `MAJOR.0.0`, with at least two minor releases between the
   notice and the removal (the releases are read from `docs/release-notes/`);
 - a deprecated HTTP operation that has not been removed is still in the OpenAPI
   document and marked `deprecated: true` there -- and every operation marked

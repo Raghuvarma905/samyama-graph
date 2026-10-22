@@ -52,6 +52,24 @@ fn show(v: Version) -> String {
     format!("{}.{}.{}", v.0, v.1, v.2)
 }
 
+fn is_later_major_release(since: Version, removed: Version) -> bool {
+    removed.0 > since.0 && removed.1 == 0 && removed.2 == 0
+}
+
+#[test]
+fn removal_rejects_patch_and_minor_releases_even_in_a_later_major() {
+    let since = (1, 13, 0);
+    for removed in [(1, 14, 0), (2, 0, 1), (2, 1, 0), (3, 2, 1)] {
+        assert!(
+            !is_later_major_release(since, removed),
+            "{} is not a later major release", show(removed)
+        );
+    }
+    for removed in [(2, 0, 0), (3, 0, 0)] {
+        assert!(is_later_major_release(since, removed));
+    }
+}
+
 fn version_of_record() -> Version {
     parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is X.Y.Z")
 }
@@ -171,7 +189,7 @@ fn a_removal_waits_for_a_major_and_two_minors_of_notice() {
         let Some(removed) = optional_version(&e, "removed_in") else { continue };
         assert!(removed <= now, "{id}: removed_in {} is later than the version of record", show(removed));
         assert!(
-            removed.0 > since.0,
+            is_later_major_release(since, removed),
             "{id}: removed in {}, deprecated in {} -- removal is a breaking change \
              and only a major release may contain one",
             show(removed),

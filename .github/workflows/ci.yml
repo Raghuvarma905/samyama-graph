@@ -902,8 +902,8 @@ jobs:
   # docs/VERSIONING.md promises that the previous minor's SDKs work against the
   # current server. This installs the Python and TypeScript SDKs AS PUBLISHED --
   # from PyPI and npm, not from this tree -- for the latest patch of each of the
-  # two most recent minors, and runs a suite through each against the release
-  # binary `test` built. The versions are read from Cargo.toml and the package
+  # current and immediately preceding minors, and runs a suite through each
+  # against the release binary `test` built. Versions come from Cargo.toml and package
   # indexes on every run (sdk/compat/run.py); nothing here names one.
   #
   # In `ci-ok`'s needs: a compatibility promise that does not block a merge that
@@ -951,7 +951,9 @@ jobs:
           fi
 
       - name: Run the published SDKs against this build
-        run: python3 sdk/compat/run.py --bin target/release/samyama
+        run: |
+          python3 -m unittest discover -s sdk/compat -p 'test_version_selection.py'
+          python3 sdk/compat/run.py --bin target/release/samyama
 
   # The one check branch protection should require.
   #
