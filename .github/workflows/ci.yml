@@ -442,6 +442,12 @@ jobs:
         # nobody can rely on at the moment it matters.
         run: python3 scripts/test_check_release_gate.py
 
+      - name: The triage-SLA measurement counts neither weekends nor labels
+        # The daily measurement itself lives in triage-sla.yml, because whether
+        # an issue got a reply is not a property of a PR. Its rules are, and a
+        # change that breaks them should fail here, not on some later weekday.
+        run: python3 scripts/test_triage_sla.py
+
       - name: LINT-RATCHET — the clippy warning count may not rise
         id: lint_ratchet
         # Runs even if an earlier gate failed, and the run-all-gates step
@@ -1052,6 +1058,28 @@ jobs:
   # listed in `needs` below, because a suite added without being added here would
   # stop gating silently: the aggregator would go green without ever waiting for
   # it.
+  triage-sla-contract:
+    name: triage SLA role lookup (workflow token)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Match the scheduled SLA workflow. Metadata read is implicit in GitHub's
+    # repository token; the permission endpoint must not need a maintainer PAT.
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline SLA rules
+        run: python3 scripts/test_triage_sla.py
+      - name: Check actual workflow-token role classification
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROLE_MAINTAINER: ${{ vars.TRIAGE_SLA_MAINTAINER || 'Raghuvarma905' }}
+          ROLE_OUTSIDE_USER: ${{ vars.TRIAGE_SLA_OUTSIDE_USER || 'octocat' }}
+        run: >-
+          python3 scripts/check_triage_role_lookup.py --repo "$GITHUB_REPOSITORY"
+          --maintainer "$ROLE_MAINTAINER" --outside-user "$ROLE_OUTSIDE_USER"
+
   ci-ok:
     name: ci-ok
     # always() is load-bearing. Without it a failed dependency SKIPS this job, and
@@ -1060,6 +1088,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - triage-sla-contract
       - supply-chain
       - test
       - docs-gate
