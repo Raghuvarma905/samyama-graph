@@ -47,3 +47,11 @@ the Rust SDK.
   each SDK, what does not survive, and the shared round-trip suite.
 - [`docs/SDK-API-CLI-ARCHITECTURE.md`](../docs/SDK-API-CLI-ARCHITECTURE.md) —
   how the SDKs, the HTTP API and the CLI fit together.
+
+## Compatibility
+
+The SDKs share the server's version number, and the previous minor release's
+Python and TypeScript SDKs work against the current server —
+[`docs/VERSIONING.md`](../docs/VERSIONING.md). [`compat/`](compat/) is the check:
+it installs the SDKs as published on PyPI and npm and runs them against a
+server built from this tree (`python3 sdk/compat/run.py`).

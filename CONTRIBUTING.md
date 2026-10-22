@@ -298,6 +298,12 @@ root `exclude` list; `sdk/typescript` isn't cargo at all) so neither can
 inherit — both are bumped to the same number by hand, or by
 `prepare-release.yml` below.
 
+What the number promises -- which changes a patch, minor or major release may
+contain, the N-1 SDK guarantee, and how something is deprecated and removed --
+is [`docs/VERSIONING.md`](docs/VERSIONING.md). Choose the next version by it,
+and give any deprecation the release makes a **Deprecated** section in its
+notes.
+
 Every publish workflow refuses to run if these numbers disagree with each
 other or with the release tag. Registries do not allow a version to be
 published twice, so this is checked before anything is uploaded rather than

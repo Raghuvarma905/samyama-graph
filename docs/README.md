@@ -1,6 +1,6 @@
 # Samyama Graph — Documentation Index
 
-**Last updated:** 2026-10-14 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
+**Last updated:** 2026-10-20 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
 
 ## Primary sources
 
@@ -59,6 +59,8 @@ eight of eighteen documents (#1450).
 
 - **[SDK-API-CLI-ARCHITECTURE.md](./SDK-API-CLI-ARCHITECTURE.md)** — how the Python / TypeScript SDKs, the CLI, and the HTTP / RESP surfaces connect.
 - **[AGENT-CONTRACT.md](./AGENT-CONTRACT.md)** — the versioned MCP tool contract: schemas, error format, pagination, result envelopes, idempotency.
+- **[VERSIONING.md](./VERSIONING.md)** — what a version number promises: semver for the HTTP API, RESP and the SDKs, the N-1 SDK guarantee and the CI job that checks it, and two minor releases of notice before anything is removed.
+- **[deprecations.json](./deprecations.json)** — every deprecation: when it was announced, what replaces it, and when it was removed; checked by `tests/deprecations_follow_the_policy.rs`.
 - **[API-PARITY.md](./API-PARITY.md)** — generated capability-by-surface matrix (HTTP, RESP, Rust / Python / TypeScript SDKs, MCP); regenerate with `cargo run --release --example feature_matrix`.
 - **[CONSTRAINED-CLIENTS.md](./CONSTRAINED-CLIENTS.md)** — writing to an Edge node from an ESP32 or Arduino-class device over RESP, and why that surface has no authentication.
 - **[BENCHMARKS.md](./BENCHMARKS.md)** — LDBC SNB Interactive results (SF1 and SF10).
