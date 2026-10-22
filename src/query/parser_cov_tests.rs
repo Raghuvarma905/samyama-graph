@@ -537,12 +537,12 @@ fn merge_statement_with_every_action() {
                 ON MATCH SET n.c = 3, n = {k: 1}, n:Seen \
                 SET n.d = 4 REMOVE n.e RETURN n");
     let m = q.merge_clause.as_ref().unwrap();
-    assert_eq!(m.on_create_set.len(), 1);
-    assert_eq!(m.on_create_entity_set.len(), 1);
-    assert_eq!(m.on_create_labels.len(), 1);
-    assert_eq!(m.on_match_set.len(), 1);
-    assert_eq!(m.on_match_entity_set.len(), 1);
-    assert_eq!(m.on_match_labels.len(), 1);
+    assert_eq!(m.on_create_set().count(), 1);
+    assert_eq!(m.on_create_entity_set().count(), 1);
+    assert_eq!(m.on_create_labels().count(), 1);
+    assert_eq!(m.on_match_set().count(), 1);
+    assert_eq!(m.on_match_entity_set().count(), 1);
+    assert_eq!(m.on_match_labels().count(), 1);
     assert_eq!(q.set_clauses.len(), 1);
     assert_eq!(q.remove_clauses.len(), 1);
     assert!(q.return_clause.is_some());
@@ -554,12 +554,12 @@ fn inline_merge_with_every_action() {
                 ON CREATE SET b.x = 1, b += {y: 2}, b:C \
                 ON MATCH SET b.z = 1, b = {z: 2}, b:D RETURN b");
     let m = q.merge_clause.as_ref().unwrap();
-    assert_eq!(m.on_create_set.len(), 1);
-    assert_eq!(m.on_create_entity_set.len(), 1);
-    assert_eq!(m.on_create_labels.len(), 1);
-    assert_eq!(m.on_match_set.len(), 1);
-    assert_eq!(m.on_match_entity_set.len(), 1);
-    assert_eq!(m.on_match_labels.len(), 1);
+    assert_eq!(m.on_create_set().count(), 1);
+    assert_eq!(m.on_create_entity_set().count(), 1);
+    assert_eq!(m.on_create_labels().count(), 1);
+    assert_eq!(m.on_match_set().count(), 1);
+    assert_eq!(m.on_match_entity_set().count(), 1);
+    assert_eq!(m.on_match_labels().count(), 1);
 }
 
 #[test]
