@@ -422,10 +422,13 @@ paths:
     get:
       operationId: getIndex
       summary: Bundled visualizer
+      deprecated: true
       description: >
         The bundled single-page visualizer. Deprecated in favour of the hosted
         Studio; documented because it is served, and an undocumented served
-        endpoint is an undocumented surface.
+        endpoint is an undocumented surface. Deprecated since 1.7.0; under
+        docs/VERSIONING.md it can first be removed in 2.0.0 (see
+        docs/deprecations.json).
       responses:
         '200':
           description: HTML page
