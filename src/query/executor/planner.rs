@@ -1686,6 +1686,14 @@ impl QueryPlanner {
             });
         }
 
+        if let Some(ddl) = &query.point_index_ddl {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::point_ops::PointIndexDdlOperator::new(ddl.clone())),
+                output_columns: vec![],
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
         if let Some(clause) = &query.drop_fulltext_index_clause {
             return Ok(ExecutionPlan {
                 root: Box::new(DropFullTextIndexOperator::new(clause.index_name.clone())),
@@ -1793,39 +1801,19 @@ impl QueryPlanner {
             && query.load_parquet_clause.is_none()
         {
             if let Some(merge_clause) = &query.merge_clause {
-                let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
-                    .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-                    .collect();
-                let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
-                    .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-                    .collect();
-                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause.on_create_labels.iter()
-                    .map(|l| (l.variable.clone(), l.labels.clone()))
-                    .collect();
-                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause.on_match_labels.iter()
-                    .map(|l| (l.variable.clone(), l.labels.clone()))
-                    .collect();
-
-                // `ON CREATE SET n = {…}` / `n += {…}` (#874).
-                let on_create_entity: Vec<(String, bool, Expression)> = merge_clause
-                    .on_create_entity_set
-                    .iter()
-                    .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                    .collect();
-                let on_match_entity: Vec<(String, bool, Expression)> = merge_clause
-                    .on_match_entity_set
-                    .iter()
-                    .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                    .collect();
+                // `ON CREATE` / `ON MATCH` items in the order written (#1919).
                 let mut operator: OperatorBox = Box::new(
                     MergeOperator::new(
                         merge_clause.pattern.clone(),
-                        on_create,
-                        on_match,
-                        on_create_labels,
-                        on_match_labels,
+                        Vec::new(),
+                        Vec::new(),
+                        merge_labels(&merge_clause.on_create),
+                        merge_labels(&merge_clause.on_match),
                     )
-                    .with_entity_sets(on_create_entity, on_match_entity),
+                    .with_ordered_sets(
+                        merge_writes(&merge_clause.on_create),
+                        merge_writes(&merge_clause.on_match),
+                    ),
                 );
 
                 // `MERGE p = (...)` binds `p` (#876).
@@ -3798,6 +3786,54 @@ impl QueryPlanner {
             )));
         }
 
+        if call_clause.procedure_name.eq_ignore_ascii_case("db.index.point.nearest") {
+            // (label, property, point, k) YIELD node, distance (#1618).
+            let args = &call_clause.arguments;
+            if args.len() != 4 {
+                return Err(ExecutionError::PlanningError(
+                    "db.index.point.nearest takes (label, property, point, k)".to_string(),
+                ));
+            }
+            let lit = |e: &Expression, what: &str| -> ExecutionResult<String> {
+                match e {
+                    Expression::Literal(PropertyValue::String(s)) => Ok(s.clone()),
+                    _ => Err(ExecutionError::PlanningError(format!(
+                        "db.index.point.nearest: the {what} must be a string literal"
+                    ))),
+                }
+            };
+            let label = lit(&args[0], "label")?;
+            let property = lit(&args[1], "property")?;
+            let centre = match super::operator::eval_expression(&args[2], &super::Record::new(), store)? {
+                super::Value::Property(v) => v,
+                _ => {
+                    return Err(ExecutionError::PlanningError(
+                        "db.index.point.nearest: the third argument must be a point".to_string(),
+                    ))
+                }
+            };
+            let k = match &args[3] {
+                Expression::Literal(PropertyValue::Integer(i)) if *i >= 0 => *i as usize,
+                _ => {
+                    return Err(ExecutionError::PlanningError(
+                        "db.index.point.nearest: k must be a non-negative integer literal".to_string(),
+                    ))
+                }
+            };
+            let mut node_var = "node".to_string();
+            let mut distance_var = None;
+            for item in &call_clause.yield_items {
+                if item.name == "node" {
+                    node_var = item.alias.clone().unwrap_or_else(|| item.name.clone());
+                } else if item.name == "distance" {
+                    distance_var = Some(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+                }
+            }
+            return Ok(Box::new(super::point_ops::PointNearestOperator::new(
+                label, property, centre, k, node_var, distance_var,
+            )));
+        }
+
         if call_clause.procedure_name == "db.index.vector.queryNodes" {
             // Two spellings of the same call, because the name is Neo4j's (#1041):
             //
@@ -4699,6 +4735,10 @@ impl QueryPlanner {
                     Some(end) => scan.with_other_end(end),
                     None => scan,
                 })
+            } else if let Some(op) = point_index_scan(&start_var, &path.start.labels, &remaining_predicates, store) {
+                // A spatial predicate on an R-tree-indexed property (#1618).
+                // The predicate stays in the filter: the region is a superset.
+                op
             } else {
                 Box::new(NodeScanOperator::new(
                     start_var.clone(),
@@ -5675,6 +5715,8 @@ impl QueryPlanner {
                 Some(end) => scan.with_other_end(end),
                 None => scan,
             })
+        } else if let Some(op) = point_index_scan(&anchor_var, &anchor.labels, &candidates, store) {
+            op
         } else {
             Box::new(NodeScanOperator::new(anchor_var.clone(), anchor.labels.clone()))
         };
@@ -6401,6 +6443,11 @@ impl QueryPlanner {
     }
 
     /// Collect variables referenced by an expression
+    /// The variables an expression reads, for callers outside the planner.
+    pub(crate) fn collect_vars(expr: &Expression, vars: &mut HashSet<String>) {
+        Self::collect_expression_variables(expr, vars)
+    }
+
     fn collect_expression_variables(expr: &Expression, vars: &mut HashSet<String>) {
         match expr {
             Expression::Variable(v) => { vars.insert(v.clone()); }
@@ -7512,6 +7559,34 @@ fn propagate_shared_variable_labels(clauses: &[MatchClause]) -> Vec<MatchClause>
         }
     }
     result
+}
+
+/// A `PointIndexScan` for `var` when one of `preds` confines a property of
+/// `var` that a point index covers under one of its labels (#1618). The
+/// predicate is left where it is, so the scan can only narrow the work.
+fn point_index_scan(
+    var: &str,
+    labels: &[Label],
+    preds: &[Expression],
+    store: &GraphStore,
+) -> Option<OperatorBox> {
+    if store.point_index.is_empty() {
+        return None;
+    }
+    for pred in preds.iter().flat_map(flatten_and_predicates) {
+        let Some((property, region)) = super::point_ops::spatial_region(var, &pred, store) else { continue };
+        for label in labels {
+            if store.point_index.name_for(label.as_str(), &property).is_some() {
+                return Some(Box::new(super::point_ops::PointIndexScanOperator::new(
+                    var.to_string(),
+                    label.clone(),
+                    property,
+                    region,
+                )));
+            }
+        }
+    }
+    None
 }
 
 /// What remains of a closing segment after a fused cyclic close bound it
@@ -8688,44 +8763,16 @@ impl QueryPlanner {
                     bound.extend(clause_vars);
                 }
                 Clause::Merge(mc) => {
-                    let on_create: Vec<(String, String, Expression)> = mc
-                        .on_create_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let on_match: Vec<(String, String, Expression)> = mc
-                        .on_match_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let on_create_labels: Vec<(String, Vec<Label>)> = mc
-                        .on_create_labels
-                        .iter()
-                        .map(|l| (l.variable.clone(), l.labels.clone()))
-                        .collect();
-                    let on_match_labels: Vec<(String, Vec<Label>)> = mc
-                        .on_match_labels
-                        .iter()
-                        .map(|l| (l.variable.clone(), l.labels.clone()))
-                        .collect();
+                    // `ON CREATE` / `ON MATCH` items in the order written (#1919).
                     operator = Box::new(
                         MergeOperator::new(
                             mc.pattern.clone(),
-                            on_create,
-                            on_match,
-                            on_create_labels,
-                            on_match_labels,
+                            Vec::new(),
+                            Vec::new(),
+                            merge_labels(&mc.on_create),
+                            merge_labels(&mc.on_match),
                         )
-                        .with_entity_sets(
-                            mc.on_create_entity_set
-                                .iter()
-                                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                                .collect(),
-                            mc.on_match_entity_set
-                                .iter()
-                                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                                .collect(),
-                        )
+                        .with_ordered_sets(merge_writes(&mc.on_create), merge_writes(&mc.on_match))
                         .with_input(operator),
                     );
                     // `MERGE p = (...)` binds `p` (#876).
@@ -9390,12 +9437,9 @@ impl QueryPlanner {
         merge_clause: &MergeClause,
         bound_by_match: &[String],
     ) -> OperatorBox {
-        let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
-            .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-            .collect();
-        let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
-            .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-            .collect();
+        // `ON CREATE` / `ON MATCH` items in the order written (#1919).
+        let on_create = merge_writes(&merge_clause.on_create);
+        let on_match = merge_writes(&merge_clause.on_match);
 
         // Extract edge patterns from MERGE clause
         let mut edges_to_merge = Vec::new();
@@ -9485,20 +9529,9 @@ impl QueryPlanner {
         if !edges_to_merge.is_empty() && all_endpoints_bound {
             // Edge MERGE: use MatchMergeEdgeOperator
             use crate::query::executor::operator::MatchMergeEdgeOperator;
-            // `ON CREATE SET n = {…}` / `n += {…}` (#874).
-            let on_create_entity: Vec<(String, bool, Expression)> = merge_clause
-                .on_create_entity_set
-                .iter()
-                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                .collect();
-            let on_match_entity: Vec<(String, bool, Expression)> = merge_clause
-                .on_match_entity_set
-                .iter()
-                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                .collect();
             operator = Box::new(
-                MatchMergeEdgeOperator::new(operator, edges_to_merge, on_create, on_match)
-                    .with_entity_sets(on_create_entity, on_match_entity)
+                MatchMergeEdgeOperator::new(operator, edges_to_merge, Vec::new(), Vec::new())
+                    .with_ordered_sets(on_create, on_match)
                     .with_property_exprs(edge_property_exprs),
             );
             if !merge_named_paths.is_empty() {
@@ -9517,36 +9550,15 @@ impl QueryPlanner {
             // the point, could not see the row. That is why
             // `UNWIND [...] AS x MERGE (n:N {v: x})` had nowhere to read
             // `x` from (#642).
-            let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause
-                .on_create_labels
-                .iter()
-                .map(|l| (l.variable.clone(), l.labels.clone()))
-                .collect();
-            let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause
-                .on_match_labels
-                .iter()
-                .map(|l| (l.variable.clone(), l.labels.clone()))
-                .collect();
             operator = Box::new(
                 MergeOperator::new(
                     merge_clause.pattern.clone(),
-                    on_create,
-                    on_match,
-                    on_create_labels,
-                    on_match_labels,
+                    Vec::new(),
+                    Vec::new(),
+                    merge_labels(&merge_clause.on_create),
+                    merge_labels(&merge_clause.on_match),
                 )
-                .with_entity_sets(
-                    merge_clause
-                        .on_create_entity_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect(),
-                    merge_clause
-                        .on_match_entity_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect(),
-                )
+                .with_ordered_sets(on_create, on_match)
                 .with_input(operator),
             );
             if !merge_named_paths.is_empty() {
@@ -10253,6 +10265,33 @@ impl QueryPlanner {
         }
         true
     }
+}
+
+
+/// The property and whole-entity items of an `ON CREATE` / `ON MATCH` block,
+/// as writes in the order written (#1919). Labels are taken separately by
+/// [`merge_labels`]; a property write cannot disturb a label.
+fn merge_writes(ops: &[SetOp]) -> Vec<crate::query::executor::operator::SetWrite> {
+    use crate::query::executor::operator::SetWrite;
+    ops.iter()
+        .filter_map(|op| match op {
+            SetOp::Property(i) => {
+                Some(SetWrite::Property(i.variable.clone(), i.property.clone(), i.value.clone()))
+            }
+            SetOp::Entity(i) => Some(SetWrite::Entity(i.variable.clone(), i.merge, i.value.clone())),
+            SetOp::Labels(_) => None,
+        })
+        .collect()
+}
+
+/// The label items of an `ON CREATE` / `ON MATCH` block.
+fn merge_labels(ops: &[SetOp]) -> Vec<(String, Vec<Label>)> {
+    ops.iter()
+        .filter_map(|op| match op {
+            SetOp::Labels(l) => Some((l.variable.clone(), l.labels.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -11012,6 +11051,7 @@ mod tests {
             create_vector_index_clause: None,
             create_fulltext_index_clause: None,
             drop_fulltext_index_clause: None,
+            point_index_ddl: None,
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,

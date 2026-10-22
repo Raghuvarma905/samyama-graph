@@ -2560,7 +2560,6 @@ fn set_property_operator_paths() {
         ),
         ("n".to_string(), "node".to_string(), var("m")),
         ("n".to_string(), "edge".to_string(), var("r")),
-        ("n".to_string(), "err".to_string(), var("unbound")),
         ("r".to_string(), "w".to_string(), li(9)),
         ("s".to_string(), "ignored".to_string(), li(9)),
         ("missing".to_string(), "ignored".to_string(), li(9)),
@@ -2608,8 +2607,6 @@ fn set_property_operator_paths() {
     }
     assert_eq!(store.node_property(a, "node"), Some(pint(bi)));
     assert_eq!(store.node_property(a, "edge"), Some(pint(ei)));
-    // An expression that fails to evaluate stores nothing.
-    assert_eq!(store.node_property(a, "err"), None);
     assert_eq!(
         store.get_edge(e).unwrap().properties.get("w"),
         Some(&pint(9))
@@ -2617,6 +2614,16 @@ fn set_property_operator_paths() {
     assert_eq!(store.node_property(b, "z"), Some(pint(1)));
     assert_eq!(store.node_property(b, "k"), Some(pint(5)));
     let _ = ai;
+
+    // An expression that fails to evaluate is the statement's error, and
+    // nothing is written. It used to become null, and a null SET removes the
+    // property, so the failure deleted `k` and reported success (#1897).
+    let mut op = SetPropertyOperator::new(
+        Box::new(MaterializedOperator::new(vec![row.clone()])),
+        vec![("m".to_string(), "k".to_string(), var("unbound"))],
+    );
+    assert!(op.next_mut(&mut store, TENANT).is_err());
+    assert_eq!(store.node_property(b, "k"), Some(pint(5)), "k is left as it was");
 
     // Null removes, on nodes and on edges.
     let mut op = SetPropertyOperator::new(

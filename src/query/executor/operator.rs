@@ -72,7 +72,9 @@ use crate::query::executor::{ExecutionError, ExecutionResult, Record, Value, Rec
 use crate::graph::PropertyValue;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use rayon::prelude::*;
-use samyama_optimization::common::{Problem, SolverConfig, MultiObjectiveProblem};
+use samyama_optimization::common::{
+    duration_ms, gap_to_best_known, is_feasible, MultiObjectiveProblem, Problem, SolverConfig,
+};
 use samyama_optimization::algorithms::{JayaSolver, RaoSolver, RaoVariant, TLBOSolver, FireflySolver, CuckooSolver, GWOSolver, GASolver, SASolver, BatSolver, ABCSolver, GSASolver, NSGA2Solver, MOTLBOSolver, HSSolver, FPASolver, PSOSolver, DESolver, BMRSolver, BWRSolver, BMWRSolver, QOJayaSolver, SAMPJayaSolver, EHRJayaSolver, ITLBOSolver, GOTLBOSolver, QORaoSolver, SAPHRSolver, MOBMWRSolver, MOBMWRVariant, MORaoDESolver};
 use ndarray::Array1;
 
@@ -3086,10 +3088,6 @@ fn as_point(v: &Value, who: &str) -> ExecutionResult<Point> {
     Ok(Point { x, y, geographic })
 }
 
-/// Mean earth radius, metres. The value WGS-84 uses for a spherical
-/// approximation.
-const EARTH_RADIUS_M: f64 = 6_371_008.8;
-
 /// Distance between two points.
 ///
 /// Haversine on a sphere for geographic points, in **metres**; Euclidean for
@@ -3109,12 +3107,10 @@ fn point_distance(a: &Point, b: &Point) -> ExecutionResult<f64> {
     if !a.geographic {
         return Ok(((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt());
     }
-    let (lat1, lat2) = (a.y.to_radians(), b.y.to_radians());
-    let dlat = (b.y - a.y).to_radians();
-    let dlon = (b.x - a.x).to_radians();
-    let h = (dlat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
-    Ok(2.0 * EARTH_RADIUS_M * h.sqrt().asin())
+    // The mean earth radius WGS-84 uses for a spherical approximation, and
+    // the same function the point index sizes its boxes with (#1618), so an
+    // indexed distance bound and this one cannot disagree.
+    Ok(crate::index::point::haversine_m((a.x, a.y), (b.x, b.y)))
 }
 
 /// The fewest arguments each function can be called with.
@@ -6530,17 +6526,10 @@ fn format_edge_to_create(edge: &EdgeToCreate) -> String {
 /// MERGE carries none. Returned as an `Option` so a caller can `extend` with it.
 fn format_merge_sets(
     label: &str,
-    items: &[(String, String, Expression)],
-    entity_items: &[(String, bool, Expression)],
+    writes: &[SetWrite],
     label_items: &[(String, Vec<Label>)],
 ) -> Option<String> {
-    let mut sets: Vec<String> = items
-        .iter()
-        .map(|(v, p, e)| format!("{}.{} = {}", v, p, format_expression(e)))
-        .collect();
-    sets.extend(entity_items.iter().map(|(v, merge, e)| {
-        format!("{} {} {}", v, if *merge { "+=" } else { "=" }, format_expression(e))
-    }));
+    let mut sets: Vec<String> = writes.iter().map(format_set_write).collect();
     sets.extend(label_items.iter().map(|(v, labels)| {
         format!("{}{}", v, labels.iter().map(|l| format!(":{}", l.as_str())).collect::<String>())
     }));
@@ -15784,6 +15773,13 @@ impl PhysicalOperator for ShowIndexesOperator {
                         (label, property, format!("FULLTEXT[{name}]"))
                     }),
             );
+            rows.extend(
+                store
+                    .point_index
+                    .listing()
+                    .into_iter()
+                    .map(|(name, label, property)| (label, property, format!("POINT[{name}]"))),
+            );
             // Both registries are hash maps, so the listing order is otherwise
             // arbitrary and differs run to run.
             rows.sort();
@@ -16970,11 +16966,10 @@ pub struct MatchMergeEdgeOperator {
     /// edges without the property -- two rows for one pair wrote one edge,
     /// with no `id`, and reported success. #642 fixed the node half.
     property_exprs: Vec<Option<HashMap<String, Expression>>>,
-    on_create_set: Vec<(String, String, Expression)>,
-    on_match_set: Vec<(String, String, Expression)>,
-    /// Whole-entity `ON CREATE`/`ON MATCH SET`; see `MergeOperator` (#874).
-    on_create_entity_set: Vec<(String, bool, Expression)>,
-    on_match_entity_set: Vec<(String, bool, Expression)>,
+    /// `ON CREATE SET` property and whole-entity writes, in the order written;
+    /// see `MergeOperator` (#874, #1919).
+    on_create_writes: Vec<SetWrite>,
+    on_match_writes: Vec<SetWrite>,
     done: bool,
     results: Vec<Record>,
     result_index: usize,
@@ -16987,28 +16982,33 @@ impl MatchMergeEdgeOperator {
         on_create_set: Vec<(String, String, Expression)>,
         on_match_set: Vec<(String, String, Expression)>,
     ) -> Self {
+        let writes = |items: Vec<(String, String, Expression)>| {
+            items.into_iter().map(|(v, p, e)| SetWrite::Property(v, p, e)).collect()
+        };
         Self {
             input,
             edges_to_merge,
             property_exprs: Vec::new(),
-            on_create_set,
-            on_match_set,
-            on_create_entity_set: Vec::new(),
-            on_match_entity_set: Vec::new(),
+            on_create_writes: writes(on_create_set),
+            on_match_writes: writes(on_match_set),
             done: false,
             results: Vec::new(),
             result_index: 0,
         }
     }
 
-    /// Attach the whole-entity `ON CREATE`/`ON MATCH SET` items (#874).
+    /// Attach the whole-entity `ON CREATE`/`ON MATCH SET` items (#874),
+    /// after the property items. [`MatchMergeEdgeOperator::with_ordered_sets`]
+    /// keeps the order between the two kinds.
     pub fn with_entity_sets(
         mut self,
         on_create: Vec<(String, bool, Expression)>,
         on_match: Vec<(String, bool, Expression)>,
     ) -> Self {
-        self.on_create_entity_set = on_create;
-        self.on_match_entity_set = on_match;
+        self.on_create_writes
+            .extend(on_create.into_iter().map(|(v, m, e)| SetWrite::Entity(v, m, e)));
+        self.on_match_writes
+            .extend(on_match.into_iter().map(|(v, m, e)| SetWrite::Entity(v, m, e)));
         self
     }
 
@@ -17017,6 +17017,54 @@ impl MatchMergeEdgeOperator {
     pub fn with_property_exprs(mut self, exprs: Vec<Option<HashMap<String, Expression>>>) -> Self {
         self.property_exprs = exprs;
         self
+    }
+    /// The `ON CREATE` / `ON MATCH` writes, applied in exactly this order
+    /// (#1919). Replaces whatever `new` and `with_entity_sets` were given.
+    pub fn with_ordered_sets(mut self, on_create: Vec<SetWrite>, on_match: Vec<SetWrite>) -> Self {
+        self.on_create_writes = on_create;
+        self.on_match_writes = on_match;
+        self
+    }
+
+    /// Apply `writes` to the merged relationship, in order.
+    ///
+    /// Only the writes naming the relationship variable (or the internal
+    /// `_edge`) touch it, as before.
+    fn apply_writes(
+        writes: &[SetWrite],
+        edge_var: Option<&str>,
+        target: &Value,
+        record: &Record,
+        store: &mut GraphStore,
+        tenant_id: &str,
+    ) -> ExecutionResult<()> {
+        let Value::EdgeRef(edge_id, ..) = target else { return Ok(()) };
+        let names_edge = |var: &str| edge_var == Some(var) || var == "_edge";
+        for write in writes {
+            match write {
+                SetWrite::Property(var, prop, expr) if names_edge(var) => {
+                    let val = eval_expression(expr, record, store)?;
+                    // Setting null removes the property (#874).
+                    match val {
+                        Value::Property(PropertyValue::Null) | Value::Null => {
+                            store.remove_edge_property(*edge_id, prop);
+                        }
+                        Value::Property(pv) => {
+                            store
+                                .set_edge_property(*edge_id, prop.clone(), pv)
+                                .map_err(write_error)?;
+                        }
+                        _ => {}
+                    }
+                }
+                SetWrite::Entity(var, merge, expr) if names_edge(var) => {
+                    let value = eval_expression(expr, record, store)?;
+                    apply_entity_assignment(target, &value, *merge, store, tenant_id)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -17091,38 +17139,21 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
                         let edge_id = *edge_id;
                         let mut result_record = record.clone();
                         {
-                        // Edge exists — apply ON MATCH SET
-                        for (var, prop, expr) in &self.on_match_set {
-                            if edge_var.as_deref() == Some(var) || var == "_edge" {
-                                let val = eval_expression(expr, &result_record, store)?;
-                                // Setting null removes the property (#874).
-                                match val {
-                                    Value::Property(PropertyValue::Null) | Value::Null => {
-                                        store.remove_edge_property(edge_id, prop);
-                                    }
-                                    Value::Property(pv) => {
-                                        store
-                                            .set_edge_property(edge_id, prop.clone(), pv)
-                                            .map_err(write_error)?;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        // Edge exists — apply ON MATCH SET, in the order written.
                         let matched_target = Value::EdgeRef(
                             edge_id,
                             source_id,
                             target_id,
                             edge_type.clone(),
                         );
-                        for (var, merge, expr) in &self.on_match_entity_set {
-                            if edge_var.as_deref() == Some(var) || var == "_edge" {
-                                let value = eval_expression(expr, &result_record, store)?;
-                                apply_entity_assignment(
-                                    &matched_target, &value, *merge, store, tenant_id,
-                                )?;
-                            }
-                        }
+                        Self::apply_writes(
+                            &self.on_match_writes,
+                            edge_var.as_deref(),
+                            &matched_target,
+                            &result_record,
+                            store,
+                            tenant_id,
+                        )?;
                         if let Some(ref ev) = edge_var {
                             if let Some(edge) = store.get_edge(edge_id) {
                                 result_record.bind(ev.clone(), Value::Edge(edge_id, Box::new(edge.clone())));
@@ -17144,37 +17175,22 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
                                 .map_err(write_error)?;
                         }
 
-                        for (var, prop, expr) in &self.on_create_set {
-                            if edge_var.as_deref() == Some(var) || var == "_edge" {
-                                let val = eval_expression(expr, &result_record, store)?;
-                                // Setting null removes the property (#874).
-                                match val {
-                                    Value::Property(PropertyValue::Null) | Value::Null => {
-                                        store.remove_edge_property(edge_id, prop);
-                                    }
-                                    Value::Property(pv) => {
-                                        store
-                                            .set_edge_property(edge_id, prop.clone(), pv)
-                                            .map_err(write_error)?;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-
-                        // `ON CREATE SET r = a` / `r += {…}` (#874).
+                        // ON CREATE SET, `r = a` / `r += {…}` included (#874), in
+                        // the order written (#1919).
                         let target = Value::EdgeRef(
                             edge_id,
                             source_id,
                             target_id,
                             edge_type.clone(),
                         );
-                        for (var, merge, expr) in &self.on_create_entity_set {
-                            if edge_var.as_deref() == Some(var) || var == "_edge" {
-                                let value = eval_expression(expr, &result_record, store)?;
-                                apply_entity_assignment(&target, &value, *merge, store, tenant_id)?;
-                            }
-                        }
+                        Self::apply_writes(
+                            &self.on_create_writes,
+                            edge_var.as_deref(),
+                            &target,
+                            &result_record,
+                            store,
+                            tenant_id,
+                        )?;
 
                         if let Some(ref ev) = edge_var {
                             if let Some(edge) = store.get_edge(edge_id) {
@@ -17230,18 +17246,8 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
                 }
             })
             .collect();
-        parts.extend(format_merge_sets(
-            "ON CREATE SET",
-            &self.on_create_set,
-            &self.on_create_entity_set,
-            &[],
-        ));
-        parts.extend(format_merge_sets(
-            "ON MATCH SET",
-            &self.on_match_set,
-            &self.on_match_entity_set,
-            &[],
-        ));
+        parts.extend(format_merge_sets("ON CREATE SET", &self.on_create_writes, &[]));
+        parts.extend(format_merge_sets("ON MATCH SET", &self.on_match_writes, &[]));
         OperatorDescription {
             name: "MatchMergeEdge".to_string(),
             details: parts.join(" "),
@@ -19453,6 +19459,60 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
         Ok(())
     }
+
+    /// `bestKnown` (or `best_known`) from an `or.solve` config: the objective
+    /// value the caller knows to be the best, which `gap` is measured against
+    /// (OPT-09, #1776).
+    ///
+    /// An integer is taken as the number it is. Anything else that is present
+    /// -- a string, a list, a NaN or an infinity -- is refused rather than
+    /// dropped: a dropped key would report `gap: null` exactly as an absent one
+    /// does, and the caller could not tell the two apart (#1341).
+    fn or_solve_best_known(config: &HashMap<String, PropertyValue>) -> ExecutionResult<Option<f64>> {
+        let Some(value) = config.get("bestKnown").or_else(|| config.get("best_known")) else {
+            return Ok(None);
+        };
+        let number = match value {
+            PropertyValue::Float(f) => *f,
+            PropertyValue::Integer(i) => *i as f64,
+            other => {
+                return Err(ExecutionError::bad_argument(format!(
+                    "or.solve: `bestKnown` must be a number, got {other:?}"
+                )))
+            }
+        };
+        if !number.is_finite() {
+            return Err(ExecutionError::bad_argument(format!(
+                "or.solve: `bestKnown` must be finite, got {number}"
+            )));
+        }
+        Ok(Some(number))
+    }
+
+    /// Bind the four result-envelope columns every `or.solve` row carries
+    /// (OPT-09, #1776), so the single- and multi-objective branches cannot
+    /// drift apart on their names:
+    ///
+    /// - `objective`: the objective value of the solution written back, without
+    ///   the penalty that `fitness` includes (a list for multi-objective);
+    /// - `feasible`: whether that solution satisfies every constraint;
+    /// - `gap`: `objective - bestKnown`, or `null` when no best known value was
+    ///   supplied (no solver here can prove a bound);
+    /// - `total_time_ms`: wall-clock time of the solve alone, in milliseconds,
+    ///   the same name `/optimize/solve` reports it under.
+    fn bind_result_envelope(
+        record: &mut Record,
+        objective: Value,
+        feasible: Value,
+        gap: Value,
+        total_time_ms: f64,
+    ) {
+        record.bind("objective".to_string(), objective);
+        record.bind("feasible".to_string(), feasible);
+        record.bind("gap".to_string(), gap);
+        record.bind("total_time_ms".to_string(), Value::Property(PropertyValue::Float(total_time_ms)));
+    }
+
     fn execute_or_solve(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<()> {
         if self.args.is_empty() {
              return Err(ExecutionError::bad_argument("algo.or.solve requires a config map".to_string()));
@@ -19469,8 +19529,9 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         // reported success. Both spellings are accepted now, and anything else
         // is refused (#1341).
         Self::reject_unknown_config_keys(&self.args, "or.solve", &[
-            "algorithm", "budget", "costProperties", "costProperty", "cost_properties",
-            "cost_property", "label", "lowerBound", "max", "maxIterations", "max_iterations",
+            "algorithm", "bestKnown", "best_known", "budget", "costProperties", "costProperty",
+            "cost_properties", "cost_property", "label", "lowerBound", "max", "maxIterations",
+            "max_iterations",
             "minTotal", "min", "min_total", "populationSize", "population_size",
             "property", "upperBound",
         ])?;
@@ -19518,6 +19579,21 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
         let budget = config_map.get("budget").and_then(|v| v.as_float());
         let min_total = cfg_f("minTotal", "min_total");
+
+        let best_known = Self::or_solve_best_known(config_map)?;
+        let is_multi_objective =
+            Self::MULTI_OBJECTIVE_SOLVERS.contains(&algorithm) || cost_props.len() > 1;
+        // A gap is a distance between two numbers; a Pareto front has a vector
+        // per point and no single best known value. Ignoring the key would
+        // report `gap: null` for a value the caller did supply. Checked before
+        // the graph is read, so the refusal does not depend on the data.
+        if is_multi_objective && best_known.is_some() {
+            return Err(ExecutionError::bad_argument(
+                "or.solve: `bestKnown` applies to single-objective solves only; \
+                 a multi-objective result has no scalar gap"
+                    .to_string(),
+            ));
+        }
 
         let pop_size = cfg_i("populationSize", "population_size").unwrap_or(50) as usize;
         let max_iter = cfg_i("maxIterations", "max_iterations").unwrap_or(100) as usize;
@@ -19585,13 +19661,15 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         // branch, which has no arm for them, and hit the #1341 "no
         // implementation wired" guard — a dispatch bug that did not exist.
         // They are implemented; they were unroutable.
-        if Self::MULTI_OBJECTIVE_SOLVERS.contains(&algorithm) || cost_props.len() > 1 {
+        if is_multi_objective {
+            let started = std::time::Instant::now();
             let res = match algorithm {
                 "MOTLBO" => MOTLBOSolver::new(solver_config).solve(&problem),
                 "MOBMWR" => MOBMWRSolver::new(solver_config, MOBMWRVariant::MOBMR).solve(&problem),
                 "MORaoDE" => MORaoDESolver::new(solver_config).solve(&problem),
                 _ => NSGA2Solver::new(solver_config).solve(&problem), // Default multi
             };
+            let total_time_ms = duration_ms(started.elapsed());
 
             // Write back first individual from Pareto Front
             if let Some(best) = res.pareto_front.first() {
@@ -19615,9 +19693,30 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             }
             record.bind("algorithm".to_string(), Value::Property(PropertyValue::String(algorithm.to_string())));
             record.bind("front_size".to_string(), Value::Property(PropertyValue::Integer(res.pareto_front.len() as i64)));
+            // The result envelope (OPT-09, #1776), for the point written back.
+            // Feasibility is read from `Problem::penalty`, not from the front's
+            // `constraint_violation`: this problem gives the multi-objective
+            // solvers no penalties, so that field is 0 even when the point
+            // breaks the budget, and reading it would report every point
+            // feasible. `objective` is the raw objective vector, which here is
+            // `fitness` itself: no penalty is added to it.
+            let (objective, feasible) = match res.pareto_front.first() {
+                Some(best) => (
+                    Value::Property(PropertyValue::Array(
+                        best.fitness.iter().map(|&f| PropertyValue::Float(f)).collect(),
+                    )),
+                    Value::Property(PropertyValue::Boolean(is_feasible(Problem::penalty(
+                        &problem,
+                        &best.variables,
+                    )))),
+                ),
+                None => (Value::Null, Value::Null),
+            };
+            Self::bind_result_envelope(&mut record, objective, feasible, Value::Null, total_time_ms);
             self.results.push(record);
 
         } else {
+            let started = std::time::Instant::now();
             let result = match algorithm {
                 "Rao1" => RaoSolver::new(solver_config, RaoVariant::Rao1).solve(&problem),
                 "Rao2" => RaoSolver::new(solver_config, RaoVariant::Rao2).solve(&problem),
@@ -19662,6 +19761,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                     )))
                 }
             };
+            let total_time_ms = duration_ms(started.elapsed());
 
             // 4. Write back results
             for (i, &val) in result.best_variables.iter().enumerate() {
@@ -19702,7 +19802,24 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             // Yield history as an array for plotting
             let history_props: Vec<PropertyValue> = result.history.into_iter().map(PropertyValue::Float).collect();
             record.bind("history".to_string(), Value::Property(PropertyValue::Array(history_props)));
-            
+
+            // The result envelope (OPT-09, #1776). `fitness` is objective plus
+            // penalty, so on its own it cannot say whether the answer obeys the
+            // budget and minimum: these columns separate the two.
+            let objective = problem.objective(&result.best_variables);
+            let feasible = is_feasible(problem.penalty(&result.best_variables));
+            let gap = match best_known {
+                Some(best) => Value::Property(PropertyValue::Float(gap_to_best_known(objective, best))),
+                None => Value::Null,
+            };
+            Self::bind_result_envelope(
+                &mut record,
+                Value::Property(PropertyValue::Float(objective)),
+                Value::Property(PropertyValue::Boolean(feasible)),
+                gap,
+                total_time_ms,
+            );
+
             self.results.push(record);
         }
 
@@ -20644,6 +20761,16 @@ fn apply_entity_assignment(
     Ok(())
 }
 
+/// A write as EXPLAIN prints it: `n.k = 7`, `n = {…}`, `n += {…}`.
+fn format_set_write(w: &SetWrite) -> String {
+    match w {
+        SetWrite::Property(v, p, e) => format!("{}.{} = {}", v, p, format_expression(e)),
+        SetWrite::Entity(v, merge, e) => {
+            format!("{} {} {}", v, if *merge { "+=" } else { "=" }, format_expression(e))
+        }
+    }
+}
+
 /// One write of a `SET` clause, as `SetPropertyOperator` applies it.
 #[derive(Debug, Clone)]
 pub enum SetWrite {
@@ -20758,8 +20885,12 @@ impl PhysicalOperator for SetPropertyOperator {
             // Evaluate every property write's value first, before anything is
             // written, so `SET a.x = a.y, a.y = a.x` swaps. A whole-entity
             // write is evaluated where it stands, as it always was.
+            //
+            // An evaluation error is the statement's error. It used to become
+            // `Null`, and a null SET *removes* the property: a call that failed
+            // reported success and deleted what was there (#1897).
             let evaluated: Vec<Option<PropertyValue>> = self.writes.iter().map(|w| {
-                let SetWrite::Property(_, _, expr) = w else { return None };
+                let SetWrite::Property(_, _, expr) = w else { return Ok(None) };
                 let val = match eval_expression(expr, &record, store) {
                     Ok(v) => match v {
                         Value::Property(pv) => pv,
@@ -20807,10 +20938,10 @@ impl PhysicalOperator for SetPropertyOperator {
                         Value::Edge(id, _) => PropertyValue::Integer(id.as_u64() as i64),
                         Value::Path { .. } => PropertyValue::Null,
                     },
-                    Err(_) => PropertyValue::Null,
+                    Err(e) => return Err(e),
                 };
-                Some(val)
-            }).collect();
+                Ok(Some(val))
+            }).collect::<ExecutionResult<_>>()?;
 
             // A property is a scalar or a list of scalars. `SET a.maplist =
             // [{num: 1}]` stored an `Array([Map(..)])` -- something
@@ -20889,16 +21020,7 @@ impl PhysicalOperator for SetPropertyOperator {
     }
 
     fn describe(&self) -> OperatorDescription {
-        let sets: Vec<String> = self
-            .writes
-            .iter()
-            .map(|w| match w {
-                SetWrite::Property(v, p, e) => format!("{}.{} = {}", v, p, format_expression(e)),
-                SetWrite::Entity(v, merge, e) => {
-                    format!("{} {} {}", v, if *merge { "+=" } else { "=" }, format_expression(e))
-                }
-            })
-            .collect();
+        let sets: Vec<String> = self.writes.iter().map(format_set_write).collect();
         OperatorDescription {
             name: "SetProperty".to_string(),
             details: sets.join(", "),
@@ -21524,20 +21646,19 @@ pub struct MergeOperator {
     /// existing bindings so `... WITH a MERGE (a)-[:R]->(b)` can see `a`.
     input: Option<OperatorBox>,
     pattern: Pattern,
-    on_create_set: Vec<(String, String, Expression)>,
-    on_match_set: Vec<(String, String, Expression)>,
+    /// `ON CREATE SET` property and whole-entity writes, in the order written.
+    ///
+    /// One list, applied in order: kept as one vector per kind, every
+    /// `n.k = v` ran before every `n = {…}`, so `ON CREATE SET n = row.props,
+    /// n.id = row.id` lost `id` (#1919). Whole-entity writes were silently
+    /// discarded before #874.
+    on_create_writes: Vec<SetWrite>,
+    /// The same for `ON MATCH SET`.
+    on_match_writes: Vec<SetWrite>,
     /// `(variable, labels)` from `ON CREATE SET n:Label`.
     on_create_labels: Vec<(String, Vec<Label>)>,
     /// `(variable, labels)` from `ON MATCH SET n:Label`.
     on_match_labels: Vec<(String, Vec<Label>)>,
-    /// `(variable, is_merge, value)` from `ON CREATE SET n = {…}` / `n += {…}`.
-    ///
-    /// The grammar always parsed these; `parse_merge_clause` matched only
-    /// `set_item` and `set_label_item`, so they fell through and the clause was
-    /// silently discarded (#874).
-    on_create_entity_set: Vec<(String, bool, Expression)>,
-    /// The same for `ON MATCH SET`.
-    on_match_entity_set: Vec<(String, bool, Expression)>,
     executed: bool,
     /// Rows this MERGE still owes its caller.
     ///
@@ -21554,13 +21675,27 @@ impl MergeOperator {
     ///
     /// A builder rather than two more `new` parameters, so the existing call
     /// sites keep compiling and the addition stays reviewable (#874).
+    ///
+    /// Appended after the property items, so this cannot express an order
+    /// between the two kinds; [`MergeOperator::with_ordered_sets`] can.
     pub fn with_entity_sets(
         mut self,
         on_create: Vec<(String, bool, Expression)>,
         on_match: Vec<(String, bool, Expression)>,
     ) -> Self {
-        self.on_create_entity_set = on_create;
-        self.on_match_entity_set = on_match;
+        self.on_create_writes
+            .extend(on_create.into_iter().map(|(v, m, e)| SetWrite::Entity(v, m, e)));
+        self.on_match_writes
+            .extend(on_match.into_iter().map(|(v, m, e)| SetWrite::Entity(v, m, e)));
+        self
+    }
+
+    /// The `ON CREATE` / `ON MATCH` property and whole-entity writes, applied
+    /// in exactly this order. Replaces whatever `new` and `with_entity_sets`
+    /// were given.
+    pub fn with_ordered_sets(mut self, on_create: Vec<SetWrite>, on_match: Vec<SetWrite>) -> Self {
+        self.on_create_writes = on_create;
+        self.on_match_writes = on_match;
         self
     }
 
@@ -21571,15 +21706,16 @@ impl MergeOperator {
         on_create_labels: Vec<(String, Vec<Label>)>,
         on_match_labels: Vec<(String, Vec<Label>)>,
     ) -> Self {
+        let writes = |items: Vec<(String, String, Expression)>| {
+            items.into_iter().map(|(v, p, e)| SetWrite::Property(v, p, e)).collect()
+        };
         Self {
             input: None,
             pattern,
-            on_create_set,
-            on_match_set,
+            on_create_writes: writes(on_create_set),
+            on_match_writes: writes(on_match_set),
             on_create_labels,
             on_match_labels,
-            on_create_entity_set: Vec::new(),
-            on_match_entity_set: Vec::new(),
             executed: false,
             pending: std::collections::VecDeque::new(),
         }
@@ -21906,10 +22042,8 @@ impl MergeOperator {
                     Value::Path { nodes: assignment.clone(), edges: matched_edges },
                 );
             }
-            let sets = self.on_match_set.clone();
-            self.apply_sets(&sets, &record, store, tenant_id)?;
-            let entity_sets = self.on_match_entity_set.clone();
-            self.apply_entity_sets(&entity_sets, &record, store, tenant_id)?;
+            let writes = self.on_match_writes.clone();
+            self.apply_writes(&writes, &record, store, tenant_id)?;
             let labels = self.on_match_labels.clone();
             Self::apply_labels(&labels, &record, store, tenant_id)?;
             return Ok(Some(record));
@@ -21968,10 +22102,8 @@ impl MergeOperator {
             );
         }
 
-        let sets = self.on_create_set.clone();
-self.apply_sets(&sets, &record, store, tenant_id)?;
-        let entity_sets = self.on_create_entity_set.clone();
-        self.apply_entity_sets(&entity_sets, &record, store, tenant_id)?;
+        let writes = self.on_create_writes.clone();
+        self.apply_writes(&writes, &record, store, tenant_id)?;
         Ok(Some(record))
     }
 
@@ -22061,47 +22193,45 @@ self.apply_sets(&sets, &record, store, tenant_id)?;
     }
 
     /// Apply ON CREATE / ON MATCH SET items for any variable bound by the pattern.
-    fn apply_sets(
+    /// `ON CREATE` / `ON MATCH` writes, one after another, as written.
+    ///
+    /// Each value is evaluated where it stands, after the writes before it,
+    /// as MERGE's set items always were.
+    fn apply_writes(
         &self,
-        sets: &[(String, String, Expression)],
+        writes: &[SetWrite],
         record: &Record,
         store: &mut GraphStore,
         tenant_id: &str,
     ) -> ExecutionResult<()> {
-        for (var, prop, expr) in sets {
-            let Some(node_id) = record.get(var).and_then(|v| v.node_id()) else {
-                continue;
-            };
-            let val = eval_expression(expr, record, store)?;
-            // `SET n.prop = null` removes the property (#874), the same rule
-            // the plain `SET` clause follows.
-            match val {
-                Value::Property(PropertyValue::Null) | Value::Null => {
-                    store.remove_node_property(node_id, prop);
+        for write in writes {
+            match write {
+                SetWrite::Property(var, prop, expr) => {
+                    let Some(node_id) = record.get(var).and_then(|v| v.node_id()) else {
+                        continue;
+                    };
+                    let val = eval_expression(expr, record, store)?;
+                    // `SET n.prop = null` removes the property (#874), the same
+                    // rule the plain `SET` clause follows.
+                    match val {
+                        Value::Property(PropertyValue::Null) | Value::Null => {
+                            store.remove_node_property(node_id, prop);
+                        }
+                        Value::Property(pv) => {
+                            store
+                                .set_node_property(tenant_id, node_id, prop.clone(), pv)
+                                .map_err(write_error)?;
+                        }
+                        _ => {}
+                    }
                 }
-                Value::Property(pv) => {
-                    store
-                        .set_node_property(tenant_id, node_id, prop.clone(), pv)
-                        .map_err(write_error)?;
+                // `ON CREATE SET n = {…}` / `n += {…}` (#874).
+                SetWrite::Entity(var, merge, expr) => {
+                    let Some(target) = record.get(var).cloned() else { continue };
+                    let value = eval_expression(expr, record, store)?;
+                    apply_entity_assignment(&target, &value, *merge, store, tenant_id)?;
                 }
-                _ => {}
             }
-        }
-        Ok(())
-    }
-
-    /// `ON CREATE SET n = {…}` / `n += {…}` (#874).
-    fn apply_entity_sets(
-        &self,
-        sets: &[(String, bool, Expression)],
-        record: &Record,
-        store: &mut GraphStore,
-        tenant_id: &str,
-    ) -> ExecutionResult<()> {
-        for (var, merge, expr) in sets {
-            let Some(target) = record.get(var).cloned() else { continue };
-            let value = eval_expression(expr, record, store)?;
-            apply_entity_assignment(&target, &value, *merge, store, tenant_id)?;
         }
         Ok(())
     }
@@ -22217,20 +22347,11 @@ impl PhysicalOperator for MergeOperator {
             node_id = existing_id;
             record.bind(start_var.clone(), Value::NodeRef(node_id));
 
-            for (var, prop, expr) in &self.on_match_set {
-                if var == &start_var {
-                    let val = eval_expression(expr, &record, store)?;
-                    if let Value::Property(pv) = val {
-                        store
-                            .set_node_property(tenant_id, node_id, prop.clone(), pv)
-                            .map_err(write_error)?;
-                    }
-                }
-            }
-            // `ON MATCH SET n += {...}` / `n = {...}`: the create branch applied
-            // these and this one never did, so the update was silently lost (#1560).
-            let entity_sets = self.on_match_entity_set.clone();
-            self.apply_entity_sets(&entity_sets, &record, store, tenant_id)?;
+            // Property and whole-entity writes together, in the order written
+            // (#1919). `ON MATCH SET n += {...}` / `n = {...}` was once not
+            // applied on this branch at all (#1560).
+            let writes = self.on_match_writes.clone();
+            self.apply_writes(&writes, &record, store, tenant_id)?;
             Self::apply_labels(&self.on_match_labels, &record, store, tenant_id)?;
 
             // The rest of the matches, each its own row. ON MATCH SET applies
@@ -22238,17 +22359,7 @@ impl PhysicalOperator for MergeOperator {
             for extra in matched.iter().skip(1) {
                 let mut r = record.clone();
                 r.bind(start_var.clone(), Value::NodeRef(*extra));
-                for (var, prop, expr) in &self.on_match_set {
-                    if var == &start_var {
-                        let val = eval_expression(expr, &r, store)?;
-                        if let Value::Property(pv) = val {
-                            store
-                                .set_node_property(tenant_id, *extra, prop.clone(), pv)
-                                .map_err(write_error)?;
-                        }
-                    }
-                }
-                self.apply_entity_sets(&entity_sets, &r, store, tenant_id)?;
+                self.apply_writes(&writes, &r, store, tenant_id)?;
                 Self::apply_labels(&self.on_match_labels, &r, store, tenant_id)?;
                 self.pending.push_back(r);
             }
@@ -22271,24 +22382,8 @@ impl PhysicalOperator for MergeOperator {
 
             record.bind(start_var.clone(), Value::NodeRef(node_id));
 
-            for (var, prop, expr) in &self.on_create_set {
-                if var == &start_var {
-                    let val = eval_expression(expr, &record, store)?;
-                    match val {
-                        Value::Property(PropertyValue::Null) | Value::Null => {
-                            store.remove_node_property(node_id, prop);
-                        }
-                        Value::Property(pv) => {
-                            store
-                                .set_node_property(tenant_id, node_id, prop.clone(), pv)
-                                .map_err(write_error)?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let entity_sets = self.on_create_entity_set.clone();
-            self.apply_entity_sets(&entity_sets, &record, store, tenant_id)?;
+            let writes = self.on_create_writes.clone();
+            self.apply_writes(&writes, &record, store, tenant_id)?;
             Self::apply_labels(&self.on_create_labels, &record, store, tenant_id)?;
         }
 
@@ -22313,14 +22408,12 @@ impl PhysicalOperator for MergeOperator {
         let mut parts = vec![format_pattern(&self.pattern)];
         parts.extend(format_merge_sets(
             "ON CREATE SET",
-            &self.on_create_set,
-            &self.on_create_entity_set,
+            &self.on_create_writes,
             &self.on_create_labels,
         ));
         parts.extend(format_merge_sets(
             "ON MATCH SET",
-            &self.on_match_set,
-            &self.on_match_entity_set,
+            &self.on_match_writes,
             &self.on_match_labels,
         ));
         OperatorDescription {

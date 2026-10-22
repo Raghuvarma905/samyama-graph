@@ -320,8 +320,8 @@ numbers above is that the two can be checked against each other.
   in cleartext. A non-loopback bind now warns about that separately from the
   credential warning.
 
-  At-rest encryption for storage and snapshots is the other half of REL-09 and
-  does not exist.
+  At-rest encryption of the RocksDB data directory is the other half of REL-09
+  and does not exist. Snapshots can be encrypted (above); the live store cannot.
 
   The "accepts any origin" half of #1328 was fixed earlier: CORS matches an
   explicit allowlist and the Private Network Access header is echoed only to an

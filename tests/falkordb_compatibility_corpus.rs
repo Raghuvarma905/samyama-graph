@@ -24,8 +24,13 @@ const CORPUS_PATH: &str = "benchmarks/compat/falkordb-idioms.cypher";
 /// every assertion below would pass vacuously.
 const MIN_CORPUS_QUERIES: usize = 50;
 
-/// Accepted when this was recorded (2026-10-17): 38 of 53.
-const ACCEPTED_FLOOR: usize = 38;
+/// Accepted when this was recorded (2026-10-17): 38 of 53. Lowered to 37 on
+/// 2026-10-19 by #1897: `SET p.embedding = vecf32(...)` used to be counted as
+/// accepted, and the engine then reported success and stored nothing. It is now
+/// refused at compile time. The count went down because the honesty went up --
+/// which is the one direction this floor is not meant to guard against, so the
+/// drop is recorded here rather than absorbed.
+const ACCEPTED_FLOOR: usize = 37;
 
 /// Idioms the engine refuses at plan time today, each with why. Matched as a
 /// prefix of the query.
@@ -72,6 +77,10 @@ const KNOWN_REFUSALS: &[(&str, &str)] = &[
     ("MATCH (a:Person {name: 'Bob'}) RETURN toJSON", "no toJSON"),
     ("RETURN typeOf", "valueType here"),
     ("RETURN intern", "a FalkorDB memory hint with no equivalent"),
+    (
+        "MATCH (p:Person {name: 'Alice'}) SET p.embedding = vecf32",
+        "no vecf32, and the SET value is now checked for unknown functions (#1897)",
+    ),
 ];
 
 fn corpus() -> Vec<String> {
