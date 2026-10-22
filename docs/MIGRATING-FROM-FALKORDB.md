@@ -43,8 +43,11 @@ queries before you count them.
 The running count is measured, not maintained by hand. Start FalkorDB and
 Samyama with one shared import directory, then run
 [`scripts/falkordb_corpus_run.py`](../scripts/falkordb_corpus_run.py); its
-docstring has the commands. It seeds the same graph on both, runs every idiom in
-file order, and prints each one that fails, with the error. On 2026-10-20 the
+docstring has the commands. Use a dedicated, newly started `--ephemeral` Samyama
+server for each run: the script refuses existing nodes, indexes or constraints
+before changing either engine or the import CSV. Deleting nodes alone does not
+reset schema. It resets the dedicated FalkorDB `corpus` graph, seeds the same
+graph on both, runs every idiom in file order, and prints each failure and error. On 2026-10-20 the
 figures above did not move from the first measurement, but two idioms swapped
 places: `LOAD CSV … MERGE` now runs
 ([#1895](https://github.com/samyama-ai/samyama-graph/issues/1895)), and

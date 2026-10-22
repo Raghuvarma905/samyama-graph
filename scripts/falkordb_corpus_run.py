@@ -9,8 +9,10 @@ reproduce it. This is that measurement, written down.
 
 What it does, in order:
 
-1. Wipes and seeds the same small graph on both servers (SEED, below), and
-   writes `people.csv` into the shared import directory.
+1. Requires an empty Samyama graph with no indexes or constraints, resets the
+   dedicated FalkorDB corpus graph, seeds both servers (SEED, below), and
+   writes `people.csv` into the shared import directory. Restart the dedicated
+   ephemeral Samyama server before each run; deleting nodes leaves schema behind.
 2. Runs every corpus query **in file order, on one graph**: the corpus builds
    on itself (an index is created, then queried, then dropped), so running each
    query on a fresh graph would refuse things a user's script would not.
@@ -38,7 +40,7 @@ Then:
 
 Exit status: 0 when every query ran on FalkorDB (the corpus is valid), 1 when
 one did not (the corpus holds a query its own source engine refuses), 2 when a
-server could not be reached.
+server could not be reached or the Samyama server was not fresh.
 """
 
 from __future__ import annotations
@@ -146,6 +148,30 @@ def error_of(reply) -> str | None:
     return None
 
 
+def ensure_fresh_samyama(conn: Conn) -> None:
+    """Refuse leftover data or schema before modifying either engine or the CSV."""
+    for query in ("MATCH (n) RETURN count(n)", "SHOW INDEXES", "SHOW CONSTRAINTS"):
+        reply = conn.call("GRAPH.QUERY", SAMYAMA_GRAPH, query)
+        error = error_of(reply)
+        if error:
+            raise RuntimeError(f"could not inspect Samyama ({query}): {error}")
+        # Samyama RESP results contain a header followed directly by data rows.
+        if (not isinstance(reply, list) or not reply
+                or not isinstance(reply[0], list) or not reply[0]
+                or not all(isinstance(row, list) for row in reply[1:])):
+            raise RuntimeError(f"unexpected Samyama response to {query}")
+        rows = reply[1:]
+        if query.startswith("MATCH"):
+            if len(rows) != 1 or len(rows[0]) != 1 or type(rows[0][0]) is not int:
+                raise RuntimeError("unexpected Samyama node count response")
+            occupied = rows[0][0] != 0
+        else:
+            occupied = bool(rows)
+        if occupied:
+            raise RuntimeError("Samyama contains data or schema; restart a dedicated "
+                               "--ephemeral server before each corpus run")
+
+
 def run(conn: Conn, graph: str, queries: list[str]) -> list[str | None]:
     return [error_of(conn.call("GRAPH.QUERY", graph, q)) for q in queries]
 
@@ -161,16 +187,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     queries = split_queries(args.corpus.read_text())
-    (args.import_dir / "people.csv").write_text(PEOPLE_CSV)
 
     try:
         fk, sg = Conn(args.falkordb), Conn(args.samyama)
+        ensure_fresh_samyama(sg)
+        (args.import_dir / "people.csv").write_text(PEOPLE_CSV)
         fk.call("GRAPH.DELETE", FALKOR_GRAPH)   # an error if absent, which is fine
         for conn, graph in ((fk, FALKOR_GRAPH), (sg, SAMYAMA_GRAPH)):
-            if graph == SAMYAMA_GRAPH:
-                e = error_of(conn.call("GRAPH.QUERY", graph, "MATCH (n) DETACH DELETE n"))
-                if e:
-                    raise RuntimeError(f"could not clear Samyama: {e}")
             e = error_of(conn.call("GRAPH.QUERY", graph, SEED))
             if e:
                 raise RuntimeError(f"could not seed {graph}: {e}")
