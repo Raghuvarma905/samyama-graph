@@ -20,7 +20,8 @@ use samyama_optimization::algorithms::{
     RaoSolver, RaoVariant, SAMPJayaSolver, SAPHRSolver, TLBOSolver,
 };
 use samyama_optimization::common::{
-    MultiObjectiveProblem, Problem, SimpleProblem, SolverConfig,
+    duration_ms, gap_to_best_known, is_feasible, MultiObjectiveProblem, Problem, SimpleProblem,
+    SolverConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, convert::Infallible, pin::Pin, sync::Arc};
@@ -378,16 +379,14 @@ enum SseEvent {
         /// under a millisecond and rounding it to 0 would read as "not measured"
         /// (#1798, where the field was the constant 0).
         total_time_ms: f64,
+        /// Whether the best solution satisfies its problem's constraints
+        /// (OPT-09, #1776); see [`SolverOutcome::feasible`] for when it is null.
+        feasible: Option<bool>,
+        /// `final_fitness` minus the benchmark's known optimum (OPT-09, #1776);
+        /// null when the benchmark has no single known optimum.
+        gap: Option<f64>,
     },
     Error { message: String },
-}
-
-/// Milliseconds in a second, for reporting a `Duration` in milliseconds.
-const MILLIS_PER_SEC: f64 = 1_000.0;
-
-/// A duration in milliseconds, keeping the sub-millisecond part.
-fn as_millis_f64(elapsed: std::time::Duration) -> f64 {
-    elapsed.as_secs_f64() * MILLIS_PER_SEC
 }
 
 pub fn router() -> Router<Arc<OptimizeState>> {
@@ -529,8 +528,8 @@ async fn start_solve(
         });
 
         match compute.await {
-            Ok((Ok(SolverOutcome { history, final_fitness, final_pareto }), elapsed)) => {
-                let total_time_ms = as_millis_f64(elapsed);
+            Ok((Ok(SolverOutcome { history, final_fitness, final_pareto, feasible, gap }), elapsed)) => {
+                let total_time_ms = duration_ms(elapsed);
                 let iterations = history.len();
                 let last_iter = iterations.saturating_sub(1);
                 for (iter, best) in history.iter().enumerate() {
@@ -551,7 +550,15 @@ async fn start_solve(
                     }
                 }
                 let _ = event_tx
-                    .send(SseEvent::Done { final_fitness, iterations, final_pareto, seed, total_time_ms })
+                    .send(SseEvent::Done {
+                        final_fitness,
+                        iterations,
+                        final_pareto,
+                        seed,
+                        total_time_ms,
+                        feasible,
+                        gap,
+                    })
                     .await;
             }
             Ok((Err(e), _)) => {
@@ -572,6 +579,20 @@ struct SolverOutcome {
     /// Final Pareto front, one entry per non-dominated individual, each a vector
     /// of objective values. None for single-objective runs.
     final_pareto: Option<Vec<Vec<f64>>>,
+    /// Whether the best solution satisfies the problem's constraints
+    /// (OPT-09, #1776), read from `Problem::penalty`.
+    ///
+    /// None for multi-objective runs, deliberately. UC2 adds its
+    /// contraindication penalty to every objective instead of reporting it
+    /// through `MultiObjectiveProblem::penalties`, so each front point's
+    /// `constraint_violation` is 0 whether or not it is penalised (#1795).
+    /// Reading that field would report a penalised point as feasible; null
+    /// says the surface cannot tell, which is true.
+    feasible: Option<bool>,
+    /// The best solution's objective minus the benchmark's known optimum
+    /// (OPT-09, #1776). None when the catalog lists no optimum, which is every
+    /// multi-objective benchmark: a front has no single optimum to subtract.
+    gap: Option<f64>,
 }
 
 /// Apply the request's seed to a solver, if one was given.
@@ -667,7 +688,13 @@ fn run_solver(
             }
             other => return Err(format!("benchmark {} is not multi-objective", other)),
         };
-        Ok(SolverOutcome { history: hist, final_fitness: final_f, final_pareto: Some(pareto) })
+        Ok(SolverOutcome {
+            history: hist,
+            final_fitness: final_f,
+            final_pareto: Some(pareto),
+            feasible: None,
+            gap: None,
+        })
     } else {
         let bench = benchmark_catalog().into_iter().find(|b| b.id == bench_id)
             .ok_or_else(|| format!("unknown benchmark: {bench_id}"))?;
@@ -695,10 +722,13 @@ fn run_solver(
             "ga"        => seeded!(GASolver::new(cfg), seed).solve(&problem),
             other       => return Err(format!("algorithm {} not supported on single-objective benchmarks", other)),
         };
+        let objective = problem.objective(&result.best_variables);
         Ok(SolverOutcome {
             final_fitness: result.best_fitness,
             history: result.history,
             final_pareto: None,
+            feasible: Some(is_feasible(problem.penalty(&result.best_variables))),
+            gap: bench.optimum.map(|optimum| gap_to_best_known(objective, optimum)),
         })
     }
 }
@@ -730,7 +760,7 @@ async fn stream_solve(
                     "pareto_front": pareto_front,
                 }))
                 .unwrap(),
-            SseEvent::Done { final_fitness, iterations, final_pareto, seed, total_time_ms } => Event::default()
+            SseEvent::Done { final_fitness, iterations, final_pareto, seed, total_time_ms, feasible, gap } => Event::default()
                 .event("done")
                 .json_data(serde_json::json!({
                     "final_fitness": final_fitness,
@@ -740,6 +770,9 @@ async fn stream_solve(
                     // Echo the seed that produced this result: a published number
                     // should carry what is needed to re-derive it (#1478).
                     "seed": seed,
+                    // The rest of the result envelope (OPT-09, #1776).
+                    "feasible": feasible,
+                    "gap": gap,
                 }))
                 .unwrap(),
             SseEvent::Error { message } => Event::default()
