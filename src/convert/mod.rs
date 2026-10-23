@@ -354,8 +354,8 @@ pub fn write_path(
                 .map_err(engine)?;
             FormatReport::SgsnapWrite(stats)
         }
-        Format::Csv => write_csv_dir(store, path)?,
-        Format::GraphMl => write_file_atomically(path, |f| write_graphml(store, f))?,
+        Format::Csv => write_csv_dir(store, path, opts)?,
+        Format::GraphMl => write_file_atomically(path, opts, |f| write_graphml(store, f))?,
         other => return Err(ConvertError::CannotWrite(other)),
     };
     check_lossless(&report, opts)?;
@@ -454,7 +454,11 @@ fn csv_losses(r: &crate::export::csv::GraphCsvReport) -> Vec<Dropped> {
 /// The whole graph as a CSV directory at `dir`, whole or not at all: written
 /// into `<dir>.tmp` and renamed into place. A `dir` that exists and is not
 /// empty is refused rather than mixed with or overwritten.
-fn write_csv_dir(store: &GraphStore, dir: &Path) -> Result<FormatReport, ConvertError> {
+fn write_csv_dir(
+    store: &GraphStore,
+    dir: &Path,
+    opts: &Options,
+) -> Result<FormatReport, ConvertError> {
     let io = |path: &Path, source: std::io::Error| ConvertError::Io {
         path: path.into(),
         source,
@@ -467,58 +471,82 @@ fn write_csv_dir(store: &GraphStore, dir: &Path) -> Result<FormatReport, Convert
             )));
         }
     }
-    let mut tmp = dir.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|e| io(&tmp, e))?;
-    let report = match crate::export::csv::write_graph_dir(store, &tmp) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(io(&tmp, e));
-        }
-    };
+    // Staged in a directory of its own, uniquely named beside `dir` so the
+    // rename stays on one filesystem. Nothing that already exists is deleted
+    // or reused, and the staging directory removes itself on any early return.
+    let parent = staging_parent(dir).map_err(|e| io(dir, e))?;
+    let staging = tempfile::Builder::new()
+        .prefix(&staging_prefix(dir))
+        .suffix(".tmp")
+        .tempdir_in(&parent)
+        .map_err(|e| io(&parent, e))?;
+    let report = crate::export::csv::write_graph_dir(store, staging.path())
+        .map_err(|e| io(staging.path(), e))?;
+    let dropped = csv_losses(&report);
+    let report = FormatReport::CsvWrite { report, dropped };
+    // Refused before the directory appears, so a lossy export leaves no output.
+    check_lossless(&report, opts)?;
     // An empty directory the caller made is replaced; a non-empty one was
     // refused above.
     let _ = std::fs::remove_dir(dir);
-    std::fs::rename(&tmp, dir).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&tmp);
+    let staged = staging.keep();
+    std::fs::rename(&staged, dir).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staged);
         io(dir, e)
     })?;
-    let dropped = csv_losses(&report);
-    Ok(FormatReport::CsvWrite { report, dropped })
+    Ok(report)
 }
 
 /// Write a single-file format through `<path>.tmp`, renamed into place only
 /// once complete, so a failure never leaves a partial file at `path`.
 fn write_file_atomically(
     path: &Path,
+    opts: &Options,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<FormatReport, ConvertError>,
 ) -> Result<FormatReport, ConvertError> {
     let io = |p: &Path, source: std::io::Error| ConvertError::Io {
         path: p.into(),
         source,
     };
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let result = (|| {
-        let file = std::fs::File::create(&tmp).map_err(|e| io(&tmp, e))?;
-        let mut out = std::io::BufWriter::new(file);
-        let report = write(&mut out)?;
-        let file = out.into_inner().map_err(|e| io(&tmp, e.into_error()))?;
-        file.sync_all().map_err(|e| io(&tmp, e))?;
-        std::fs::rename(&tmp, path).map_err(|e| io(path, e))?;
-        Ok(report)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    let parent = staging_parent(path).map_err(|e| io(path, e))?;
+    // A new, uniquely named file beside `path`: an existing `<path>.tmp` or a
+    // symlink is never truncated or followed, and concurrent conversions do
+    // not share a staging file. It is removed on any early return.
+    let staging = tempfile::Builder::new()
+        .prefix(&staging_prefix(path))
+        .suffix(".tmp")
+        .tempfile_in(&parent)
+        .map_err(|e| io(&parent, e))?;
+    let (file, staged) = staging.into_parts();
+    let mut out = std::io::BufWriter::new(file);
+    let report = write(&mut out)?;
+    let file = out.into_inner().map_err(|e| io(&staged, e.into_error()))?;
+    file.sync_all().map_err(|e| io(&staged, e))?;
+    // Refused before the rename, so a lossy export leaves `path` as it was.
+    check_lossless(&report, opts)?;
+    staged.persist(path).map_err(|e| io(path, e.error))?;
+    Ok(report)
+}
+
+/// The directory a staged output is created in: `path`'s own parent, created
+/// if missing, so the final rename never crosses a filesystem.
+fn staging_parent(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    std::fs::create_dir_all(&parent)?;
+    Ok(parent)
+}
+
+/// `.<name>.` -- a hidden prefix naming the output a staging entry belongs to.
+fn staging_prefix(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(".{name}.")
 }
 
 /// Convert the file at `input` to the file at `output`, each in the format its

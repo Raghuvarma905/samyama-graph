@@ -118,7 +118,7 @@ fn graphml_parses_back_with_its_counts_and_types_and_reports_the_widening() {
         .iter()
         .find(|d| d.what == "attributes_widened_to_string");
     assert!(widened.unwrap().detail.contains("node.flag"), "{widened:?}");
-    assert!(!dir.path().join("out/graph.graphml.tmp").exists());
+    assert!(no_staging_left(&dir.path().join("out")));
 }
 
 /// A CSV file as its header and rows, split on commas outside quotes.
@@ -244,4 +244,72 @@ fn a_csv_export_refuses_a_directory_that_is_not_empty() {
     std::fs::create_dir(&empty).unwrap();
     convert(&input, &empty, &Options::default()).unwrap();
     assert!(empty.join("nodes_Movie.csv").exists());
+}
+
+/// True when `dir` holds no staging entry (`*.tmp`) left by a conversion.
+fn no_staging_left(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+}
+
+/// `require_lossless` refuses a lossy GraphML or CSV export before it is
+/// published (review on #1942). The fixture's `flag` attribute is a boolean on
+/// one node and an integer on another, so both exports are lossy every time.
+#[test]
+fn a_refused_lossy_export_leaves_the_destination_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture(dir.path());
+    let strict = Options {
+        require_lossless: true,
+        ..Options::default()
+    };
+
+    // GraphML: an existing file keeps its bytes, an absent one stays absent.
+    let existing = dir.path().join("existing.graphml");
+    std::fs::write(&existing, b"previous contents").unwrap();
+    let err = convert(&input, &existing, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert_eq!(std::fs::read(&existing).unwrap(), b"previous contents");
+    let absent = dir.path().join("absent.graphml");
+    let err = convert(&input, &absent, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert!(!absent.exists());
+
+    // CSV: no directory appears, and an empty one the caller made survives.
+    let csv = dir.path().join("csv_out");
+    let err = convert(&input, &csv, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert!(!csv.exists());
+    let empty = dir.path().join("csv_empty");
+    std::fs::create_dir(&empty).unwrap();
+    let err = convert(&input, &empty, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert!(empty.is_dir());
+
+    assert!(no_staging_left(dir.path()));
+}
+
+/// A file or directory named `<output>.tmp` belongs to the user, not to the
+/// conversion: it is neither deleted, truncated nor reused (review on #1942).
+#[test]
+fn an_existing_dot_tmp_beside_the_output_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture(dir.path());
+
+    let csv = dir.path().join("graph");
+    let csv_tmp = dir.path().join("graph.tmp");
+    std::fs::create_dir(&csv_tmp).unwrap();
+    std::fs::write(csv_tmp.join("notes.txt"), b"mine").unwrap();
+    convert(&input, &csv, &Options::default()).unwrap();
+    assert!(csv.join("nodes_Movie.csv").exists());
+    assert_eq!(std::fs::read(csv_tmp.join("notes.txt")).unwrap(), b"mine");
+
+    let graphml = dir.path().join("g.graphml");
+    let graphml_tmp = dir.path().join("g.graphml.tmp");
+    std::fs::write(&graphml_tmp, b"mine").unwrap();
+    convert(&input, &graphml, &Options::default()).unwrap();
+    assert!(graphml.exists());
+    assert_eq!(std::fs::read(&graphml_tmp).unwrap(), b"mine");
 }
