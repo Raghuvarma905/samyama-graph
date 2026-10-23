@@ -1,7 +1,7 @@
 # `examples/`
 Every program in this directory, what it does, and what data it needs.
 
-`cargo run --release --example <name>` runs any of the `.rs` files (the two non-Rust
+`cargo run --release --example <name>` runs any of the `.rs` files (the four non-Rust
 programs say how below). The names are an interface: `scripts/run_all_examples.sh`,
 `scripts/verify-sweep.sh`, `scripts/regression-test.sh`, `.github/workflows/ci.yml` and
 external knowledge-graph repositories invoke them by name, so they do not get renamed.
@@ -9,7 +9,7 @@ external knowledge-graph repositories invoke them by name, so they do not get re
 **Start here** if you are new: the demos on built-in data. They need nothing but a
 checkout.
 
-**Most of this directory is internal.** Of the 127 programs, 60 are performance
+**Most of this directory is internal.** Of the 129 programs, 60 are performance
 investigations, conformance checks or maintainer tools — written to answer one question
 about the engine, usually once, often to kill a hypothesis. They print verdicts and
 timings, not results you can use. Those sections say *Internal* in their opening line;
@@ -29,6 +29,7 @@ Purposes below are taken from each file's own header comment.
 | [Conformance and correctness checks](#conformance-and-correctness-checks) | 32 | No - internal |
 | [Maintainer tools](#maintainer-tools) | 3 | No - internal |
 | [Hardware client sketch](#hardware-client-sketch) | 1 | No - internal |
+| [Orchestration reference pipelines](#orchestration-reference-pipelines) | 2 | Yes |
 
 Helper code shared between programs lives in `examples/common/`, which holds no
 runnable program. A dataset's loader and its benchmarks share `common/<dataset>_common.rs`,
@@ -234,6 +235,14 @@ not need them.
 | Program | What it does | Data it needs |
 |---|---|---|
 | `esp32/samyama_esp32.ino` | Writes to a Samyama Edge node from an ESP32 over RESP (API-15). RESP rather than HTTP because a TLS stack, a JSON encoder and a chunked reader are most of an ESP32's flash and all of its RAM headroom. Nothing here heap-allocates. | Arduino/ESP32 toolchain and a reachable Samyama RESP endpoint. |
+
+## Orchestration reference pipelines
+Not Cargo examples. Python, run by Airflow or Dagster against a running server; both share the load steps in `orchestration/samyama_pipeline.py`. How to run them: [`docs/ORCHESTRATION.md`](../docs/ORCHESTRATION.md). `orchestration/tests/` runs both against a real server, and the `orchestration` CI job runs those tests.
+
+| Program | What it does | Data it needs |
+|---|---|---|
+| `orchestration/samyama_airflow_dag.py` | Airflow 3 DAG (INT-10): constraint, then accounts and transfers upserted in batches with bound parameters, then a validation task that compares the graph with the files. Retries only failures a retry can fix. | `orchestration/sample/` (synthetic, bundled), or your own CSVs as DAG params; a server named by an Airflow Connection. |
+| `orchestration/samyama_dagster.py` | The same load as Dagster assets, with blocking asset checks: transfers are not loaded on top of accounts that fail theirs. | `orchestration/sample/`, or your own CSVs in the `source_files` resource; `SAMYAMA_URL` and optionally `SAMYAMA_TOKEN`. |
 
 ## Terms used in the file headers
 

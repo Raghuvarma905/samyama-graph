@@ -1,6 +1,6 @@
 # Samyama Graph — Documentation Index
 
-**Last updated:** 2026-10-14 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
+**Last updated:** 2026-10-20 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
 
 ## Primary sources
 
@@ -48,6 +48,9 @@ eight of eighteen documents (#1450).
 - **[FAILURE-MODES.md](./FAILURE-MODES.md)** — how the engine behaves when things go wrong.
 - **[SOC2-CONTROL-SET.md](./SOC2-CONTROL-SET.md)** — SOC 2 gap analysis (documented, not certified): access control, audit, change management, backup and incident response, each control with its evidence and its gap.
 - **[BI-CONNECTIVITY.md](./BI-CONNECTIVITY.md)** — connecting BI tools.
+- **[ORCHESTRATION.md](./ORCHESTRATION.md)** — loading the graph from a scheduled pipeline: a retry-safe, parameter-bound load with validation, as reference pipelines for Airflow and Dagster that the test suite runs against a real server.
+- **[ORCHESTRATION-AIRFLOW.md](./ORCHESTRATION-AIRFLOW.md)** — how to run the reference DAG in Airflow 3: credential, Connection, params, what a failure means.
+- **[ORCHESTRATION-DAGSTER.md](./ORCHESTRATION-DAGSTER.md)** — how to run the reference assets and checks in Dagster.
 
 ### Data, provenance and privacy
 
@@ -59,6 +62,8 @@ eight of eighteen documents (#1450).
 
 - **[SDK-API-CLI-ARCHITECTURE.md](./SDK-API-CLI-ARCHITECTURE.md)** — how the Python / TypeScript SDKs, the CLI, and the HTTP / RESP surfaces connect.
 - **[AGENT-CONTRACT.md](./AGENT-CONTRACT.md)** — the versioned MCP tool contract: schemas, error format, pagination, result envelopes, idempotency.
+- **[VERSIONING.md](./VERSIONING.md)** — what a version number promises: semver for the HTTP API, RESP and the SDKs, the N-1 SDK guarantee and the CI job that checks it, and two minor releases of notice before anything is removed.
+- **[deprecations.json](./deprecations.json)** — every deprecation: when it was announced, what replaces it, and when it was removed; checked by `tests/deprecations_follow_the_policy.rs`.
 - **[API-PARITY.md](./API-PARITY.md)** — generated capability-by-surface matrix (HTTP, RESP, Rust / Python / TypeScript SDKs, MCP); regenerate with `cargo run --release --example feature_matrix`.
 - **[CONSTRAINED-CLIENTS.md](./CONSTRAINED-CLIENTS.md)** — writing to an Edge node from an ESP32 or Arduino-class device over RESP, and why that surface has no authentication.
 - **[BENCHMARKS.md](./BENCHMARKS.md)** — LDBC SNB Interactive results (SF1 and SF10).
