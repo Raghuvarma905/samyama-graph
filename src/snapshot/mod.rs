@@ -125,6 +125,24 @@ pub fn write_file(
     path: impl AsRef<std::path::Path>,
     opts: &WriteOptions,
 ) -> Result<ExportStats, Box<dyn std::error::Error>> {
+    write_file_if(store, path, opts, |_| true).map(|(stats, _)| stats)
+}
+
+/// [`write_file`], with `keep` deciding from the finished export's
+/// [`ExportStats`] whether it replaces `path`.
+///
+/// `keep` runs after the temporary file is complete and before the rename. If
+/// it returns `false` the temporary file is removed and `path` is left as it
+/// was, existing or absent; the stats come back with `false`. This is how a
+/// caller refuses a lossy export (`samyama convert --require-lossless`)
+/// without having already overwritten the destination, which may be the
+/// conversion's own input.
+pub fn write_file_if(
+    store: &GraphStore,
+    path: impl AsRef<std::path::Path>,
+    opts: &WriteOptions,
+    keep: impl FnOnce(&ExportStats) -> bool,
+) -> Result<(ExportStats, bool), Box<dyn std::error::Error>> {
     let path = path.as_ref();
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     if let Some(dir) = dir {
@@ -148,6 +166,10 @@ pub fn write_file(
             return Err(e);
         }
     };
+    if !keep(&stats) {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok((stats, false));
+    }
     std::fs::rename(&tmp, path)?;
     // The rename is durable only once the directory entry is. Unix lets a
     // directory be opened and synced; elsewhere this is best left to the OS.
@@ -155,7 +177,7 @@ pub fn write_file(
     if let Ok(d) = std::fs::File::open(dir.unwrap_or_else(|| std::path::Path::new("."))) {
         let _ = d.sync_all();
     }
-    Ok(stats)
+    Ok((stats, true))
 }
 
 /// Export at an explicit gzip level (0-9).

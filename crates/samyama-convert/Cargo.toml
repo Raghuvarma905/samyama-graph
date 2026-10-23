@@ -1,0 +1,21 @@
+[package]
+name = "samyama-convert"
+version.workspace = true
+edition = "2021"
+authors = ["Samyama Graph Database Team"]
+description = "Convert graph file formats to and from Samyama's .sgsnap, offline, with a loss report"
+license = "Apache-2.0"
+repository = "https://github.com/samyama-ai/samyama-graph"
+readme = "README.md"
+keywords = ["graph", "database", "convert", "rdf", "neo4j"]
+categories = ["database", "encoding", "command-line-utilities"]
+
+[dependencies]
+# No default features: a library must not bring the server's allocator (ADR-038),
+# the same rule crates/samyama-sdk follows.
+samyama = { path = "../..", version = "1.12.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"

@@ -1,10 +1,10 @@
 name: Publish Crates to crates.io
 
-# Publishes all six workspace crates when a GitHub Release is published, in
+# Publishes all seven workspace crates when a GitHub Release is published, in
 # dependency order (leaves first):
 #
 #   samyama-gpu -> samyama-graph-algorithms, samyama-optimization
-#               -> samyama -> samyama-sdk -> samyama-cli
+#               -> samyama -> samyama-convert, samyama-sdk -> samyama-cli
 #
 # Until #1056 only the first three were published. The engine, the SDK and the
 # CLI were held back because `samyama` carried a *versioned* dev-dependency on
@@ -46,7 +46,7 @@ env:
   # order is stated once. A crate may only appear after everything it depends
   # on (normal and build dependencies; path-only dev-dependencies are stripped
   # at packaging and do not count).
-  CRATES: samyama-gpu samyama-graph-algorithms samyama-optimization samyama samyama-sdk samyama-cli
+  CRATES: samyama-gpu samyama-graph-algorithms samyama-optimization samyama samyama-convert samyama-sdk samyama-cli
 
 jobs:
   publish:
@@ -93,7 +93,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # The engine crate links 412 test binaries, and this job builds them and
-      # then packages six crates on the same disk. The hosted image ships
+      # then packages seven crates on the same disk. The hosted image ships
       # several GB of toolchains this job never uses; reclaiming them is what
       # buys the headroom. v1.11.0 ran out of disk here twice -- see the note
       # on "Test every crate" -- so this is not precautionary.
@@ -226,7 +226,7 @@ jobs:
             df -h /home/runner | tail -1 | sed "s|^|disk after $crate: |"
           done
 
-      # Packages all six in one invocation and builds each .crate from its
+      # Packages all seven in one invocation and builds each .crate from its
       # unpacked contents — exactly what crates.io will serve. Given several
       # `-p`, cargo (>= 1.90) orders them itself and resolves each crate's
       # workspace siblings from a local overlay of the ones it has just
@@ -250,7 +250,7 @@ jobs:
       #
       # Only uploads happen inside the token's lifetime: the tests and the
       # verification builds ran above. Each `cargo publish` blocks until the
-      # index confirms the upload, so six crates is six short waits. If that
+      # index confirms the upload, so seven crates is seven short waits. If that
       # ever grows tight, re-run this step mid-job rather than widening the
       # token lifetime — crates.io does not offer one.
       #
