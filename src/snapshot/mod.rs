@@ -322,6 +322,22 @@ pub fn export_tenant_with_compression(
         GzEncoder::new(writer, Compression::new(compression_level.min(9))),
     );
 
+    // The store's sources go forward with its data (#1911). When the graph
+    // changed after they were recorded, they describe where it started, not
+    // what it is now: said in the loss report rather than claimed silently.
+    let sources = store.snapshot_sources().to_vec();
+    let mut dropped = dropped;
+    if !sources.is_empty() && !store.snapshot_sources_are_current() {
+        dropped.push(crate::snapshot::format::Dropped {
+            what: "sources_may_be_stale".to_string(),
+            count: sources.len() as u64,
+            detail: "The graph changed after it was converted from the sources in this \
+                     header, so they say where the data started, not that it still \
+                     matches them."
+                .to_string(),
+        });
+    }
+
     // Write header (v2)
     let header = SnapshotHeader {
         format: "sgsnap".to_string(),
@@ -337,6 +353,7 @@ pub fn export_tenant_with_compression(
         queries: None,
         read_only: false,
         results: None,
+        sources,
     };
     let header_json = serde_json::to_string(&header)?;
     gz.write_all(header_json.as_bytes())?;
@@ -893,6 +910,10 @@ fn import_tenant_inner(
         .next()
         .ok_or("empty snapshot file: missing header")??;
     let header: SnapshotHeader = serde_json::from_str(&header_line)?;
+    // Judged before this import writes anything: whether sources the store
+    // already holds still describe its data (#1911). Afterwards the import's
+    // own writes would make them all look changed.
+    let earlier_sources_current = store.snapshot_sources_are_current();
 
     if header.format != "sgsnap" {
         return Err(format!(
@@ -1430,6 +1451,24 @@ fn import_tenant_inner(
         }
     };
 
+    // Where this data came from travels with it, so the next export says so
+    // (#1911). Recorded last, once nothing else in the import can change the
+    // graph: the store compares against this point to tell whether the data
+    // still is what the sources describe.
+    // A snapshot whose export already flagged its sources as possibly stale
+    // stays flagged: importing it does not make it match them again.
+    if !header.sources.is_empty() {
+        let incoming_stale = header
+            .dropped
+            .iter()
+            .any(|d| d.what == "sources_may_be_stale");
+        store.record_snapshot_sources(
+            header.sources.clone(),
+            earlier_sources_current,
+            incoming_stale,
+        );
+    }
+
     Ok(ImportStats {
         node_count: imported_node_count,
         edge_count: imported_edge_count,
@@ -1963,6 +2002,7 @@ mod tests {
             queries: None,
             read_only: false,
             results: None,
+            sources: Vec::new(),
         };
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         let header_json = serde_json::to_string(&header).unwrap();
@@ -1993,6 +2033,7 @@ mod tests {
             queries: None,
             read_only: false,
             results: None,
+            sources: Vec::new(),
         };
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         let header_json = serde_json::to_string(&header).unwrap();

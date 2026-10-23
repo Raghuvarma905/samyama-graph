@@ -1398,6 +1398,18 @@ pub struct GraphStore {
     /// is `Relaxed`: a reader that sees a stale epoch re-executes the query,
     /// which is the safe direction.
     epoch: std::sync::atomic::AtomicU64,
+    /// Where this graph's data came from, from the `.sgsnap` headers it was
+    /// imported from or a converter that built it (#1911). Written back into
+    /// the header of every export.
+    snapshot_sources: Vec<crate::snapshot::format::SnapshotSource>,
+    /// The data epoch when `snapshot_sources` was last added to. An export at
+    /// a later epoch flags the sources as possibly stale.
+    snapshot_sources_epoch: u64,
+    /// Set once some recorded source is known not to describe the data any
+    /// more -- it arrived flagged, or the graph changed before more sources
+    /// were added -- and kept until `clear`, so adding sources never makes a
+    /// stale one current again.
+    snapshot_sources_stale: bool,
 }
 
 
@@ -1477,6 +1489,9 @@ impl GraphStore {
             catalog: GraphCatalog::new(),
             statistics_cache: std::sync::RwLock::new(None),
             epoch: std::sync::atomic::AtomicU64::new(0),
+            snapshot_sources: Vec::new(),
+            snapshot_sources_epoch: 0,
+            snapshot_sources_stale: false,
         }
     }
 
@@ -4855,6 +4870,52 @@ NodeDeleted { .. } => {
         self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Where this graph's data came from (#1911). Empty for a graph built by
+    /// queries alone.
+    pub fn snapshot_sources(&self) -> &[crate::snapshot::format::SnapshotSource] {
+        &self.snapshot_sources
+    }
+
+    /// Record inputs this graph's data now comes from: the file a converter
+    /// just read. Appended, so two inputs into one graph keep both. The new
+    /// sources are taken as describing the graph as it is now; the ones
+    /// already held keep their state, so if the graph changed since they were
+    /// recorded, they stay flagged as possibly stale.
+    pub fn add_snapshot_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
+    ) {
+        let earlier_current = self.snapshot_sources_are_current();
+        self.record_snapshot_sources(sources, earlier_current, false);
+    }
+
+    /// [`add_snapshot_sources`](Self::add_snapshot_sources) for a caller that
+    /// changed the graph itself before recording, as an import does: whether
+    /// the sources already held were still current is judged by the caller
+    /// before its own writes (`earlier_current`), and `incoming_stale` says the
+    /// new sources arrived already flagged. Either one keeps the flag set.
+    pub fn record_snapshot_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
+        earlier_current: bool,
+        incoming_stale: bool,
+    ) {
+        if !earlier_current || incoming_stale {
+            self.snapshot_sources_stale = true;
+        }
+        self.snapshot_sources.extend(sources);
+        self.snapshot_sources_epoch = self.epoch();
+    }
+
+    /// Whether every recorded source still describes the data: none was
+    /// flagged, and the data is unchanged since they were last recorded.
+    /// `false` means an export should say they may be stale. True for a graph
+    /// with no sources, which has nothing to be stale.
+    pub fn snapshot_sources_are_current(&self) -> bool {
+        self.snapshot_sources.is_empty()
+            || (!self.snapshot_sources_stale && self.epoch() == self.snapshot_sources_epoch)
+    }
+
     /// Declare that query-visible data changed.
     ///
     /// `&self` rather than `&mut self` so the paths that hand out an interior
@@ -6426,6 +6487,8 @@ NodeDeleted { .. } => {
     /// Clear all data from the graph
     pub fn clear(&mut self) {
         self.invalidate_statistics_cache();
+        self.snapshot_sources.clear();
+        self.snapshot_sources_stale = false;
         self.nodes.clear();
         self.edge_type_table.clear();
         self.edge_type_to_id.clear();
@@ -7464,6 +7527,8 @@ mod tests {
             ("txn_create_node", "reserves an id inside the transaction; the node enters the store at commit_transaction, which bumps (#1200)"),
             ("begin_session_transaction", "opens the session transaction and advances the version; no row changes, and the statements that follow bump on their own paths (#1200 step 6)"),
             ("commit_session_transaction", "drops the rollback journal, keeping every write already applied and already bumped; rollback_session_transaction, which does change rows, bumps (#1200 step 6)"),
+            ("add_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
+            ("record_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
         ];
 
         let src = std::fs::read_to_string(concat!(
