@@ -424,8 +424,11 @@ pub fn write(
 
 /// Write `store` to the file at `path`, in the format its extension names.
 ///
-/// `.sgsnap` goes through `snapshot::write_file`: parent directories are
-/// created, and the file appears whole or not at all.
+/// `.sgsnap` goes through `snapshot::write_file_if`: parent directories are
+/// created, and the file appears whole or not at all. With
+/// [`Options::require_lossless`], a lossy export is refused before it replaces
+/// `path`, so an existing file is left unchanged and an absent one stays
+/// absent.
 pub fn write_path(
     store: &GraphStore,
     path: &Path,
@@ -433,9 +436,14 @@ pub fn write_path(
 ) -> Result<FormatReport, ConvertError> {
     let format = Format::from_path(path).ok_or_else(|| ConvertError::UnknownFormat(path.into()))?;
     let report = match format {
-        Format::Sgsnap => FormatReport::SgsnapWrite(
-            crate::snapshot::write_file(store, path, &Default::default()).map_err(engine)?,
-        ),
+        Format::Sgsnap => {
+            let (stats, _kept) =
+                crate::snapshot::write_file_if(store, path, &Default::default(), |stats| {
+                    !opts.require_lossless || stats.dropped.is_empty()
+                })
+                .map_err(engine)?;
+            FormatReport::SgsnapWrite(stats)
+        }
         other => return Err(ConvertError::CannotWrite(other)),
     };
     check_lossless(&report, opts)?;

@@ -151,3 +151,48 @@ fn an_unsupported_output_is_refused_before_the_input_is_read() {
     .unwrap_err();
     assert!(matches!(err, ConvertError::UnknownFormat(_)), "{err}");
 }
+
+/// `require_lossless` refuses before the destination is replaced (review on
+/// #1938). A graph with an edge always reports `edge_creation_timestamps` on
+/// export, so the strict write below is lossy every time.
+#[test]
+fn a_refused_lossy_write_leaves_the_destination_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let strict = Options {
+        require_lossless: true,
+        ..Options::default()
+    };
+    let lossy = graph();
+
+    // An existing destination keeps its bytes.
+    let existing = dir.path().join("existing.sgsnap");
+    std::fs::write(&existing, b"previous contents").unwrap();
+    let err = samyama_convert::write_path(&lossy, &existing, &strict).unwrap_err();
+    assert!(
+        matches!(err, ConvertError::Lossy(ref d) if !d.is_empty()),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&existing).unwrap(), b"previous contents");
+
+    // An absent destination stays absent.
+    let absent = dir.path().join("absent.sgsnap");
+    let err = samyama_convert::write_path(&lossy, &absent, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert!(!absent.exists());
+
+    // An in-place conversion does not overwrite its own input.
+    let input = dir.path().join("in_place.sgsnap");
+    samyama::snapshot::write_file(&lossy, &input, &Default::default()).unwrap();
+    let before = std::fs::read(&input).unwrap();
+    let err = convert(&input, &input, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+
+    // No temporary file is left behind by any of them.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
