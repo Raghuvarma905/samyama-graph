@@ -174,6 +174,74 @@ take on trust; with them it can be checked against their own edges.
 | Propagation ranking | propagationRanking | As temporal reachability, which it delegates to | Ignored | As temporal reachability | As temporal reachability | Arrival time ascending, then node id ascending | None |
 | Symptom explanation | symptomExplanation | In-edges, backward in time | Ignored: timestamps are used instead | Only the symptom under consideration is skipped | Nodes explaining nothing are omitted | Symptoms explained descending, then latest onset descending, then node id ascending | None: a count, a timestamp and the binding walk |
 
+## Write-back
+
+`writeProperty` stores each node's result as a node property (ALGO-06):
+
+```cypher
+CALL algo.pageRank({writeProperty: 'rank'}) YIELD node, score
+RETURN node.name, node.rank, score
+```
+
+It is accepted by every algorithm that returns exactly one value per node, and
+stores the column below. The call still returns the same rows a plain call
+returns, and `node` in those rows carries the written property.
+
+| Algorithm | Procedure | Column stored |
+|---|---|---|
+| PageRank | pageRank | score |
+| ArticleRank | articleRank | score |
+| Katz | katz | score |
+| Personalised PageRank | personalizedPageRank | score |
+| Degree, closeness, betweenness, harmonic, eigenvector centrality | degree, closeness, betweenness, harmonic, eigenvector | score |
+| Core number | kcore | score |
+| Average neighbour degree | averageNeighborDegree | score |
+| Weakly connected components | wcc | componentId |
+| Strongly connected components | scc | componentId |
+| Label propagation | cdlp | communityId |
+| Louvain | louvain | communityId |
+| Local clustering coefficient | lcc | coefficient |
+| Square clustering | squareClustering | coefficient |
+| Eccentricity | eccentricity | eccentricity |
+| Bipartite sides | bipartite | side |
+| Greedy colouring | colouring | colour |
+| Effective size, Burt's constraint | effectiveSize, constraint | value |
+| Bellman-Ford | bellmanFord | distance |
+
+The list is `AlgorithmOperator::WRITE_BACK`; `tests/algorithm_write_back.rs`
+runs every entry, under every alias, and fails if this table misses one.
+
+What it does, exactly:
+
+- **It is a write.** The call is routed like a `SET`: through the write
+  executor, journalled for persistence, refused by `GRAPH.RO_QUERY` and by
+  `read_only` requests.
+- **All or nothing.** Each value is set the way `SET` sets it, so indexes and
+  constraints apply. A value the store refuses (a unique constraint, say)
+  fails the statement, and the statement is undone whole.
+- **Computed first, written after.** The algorithm finishes on the graph as it
+  was before any value is written.
+- **Only the nodes it returns.** A label filter, a source node or an
+  unreachable node limits the rows, and nodes with no row are left as they
+  were. Re-running Bellman-Ford from a different source leaves the old
+  distance on a node the new source cannot reach.
+- **A null result removes the property**, as `SET n.p = null` does: a node
+  with no eccentricity keeps no stale value from an earlier run.
+
+What it refuses, before anything is written:
+
+- an algorithm with no single value per node (paths, pairs, node sets,
+  whole-graph numbers, `hits` with its two scores) -- write its rows with
+  `SET`;
+- a `writeProperty` that is not a non-empty string;
+- `gds.<name>.stream({writeProperty: ...})`: stream mode does not write;
+- `mutate` / `mutateProperty`: it writes into a graph projection, and there
+  are no projections yet (ALGO-05).
+
+Config is read from a literal map. A config map passed as a parameter
+(`$config`) is not read by any algorithm here, so a `writeProperty` inside one
+is not honoured either.
+
 ## Embeddings
 
 **`gds.fastRP` and `gds.node2vec` are the one exception to "`gds.*` is the
@@ -187,9 +255,9 @@ name like `gds.alpha.triangles` is.
 
 Both write a vector as a node property (`writeProperty`, default `embedding`)
 rather than only streaming it -- ML-06 asks for the result "stored as vector
-properties", and every other algorithm here leaves persistence to the
-caller's own `SET`, so this is a deliberate exception documented at the call
-site. Both require write access (`CALL ... YIELD node, embedding` through
+properties". They write whether or not `writeProperty` is given, which the
+algorithms under "Write-back" above do only when asked; that is the
+deliberate exception, documented at the call site. Both require write access (`CALL ... YIELD node, embedding` through
 `MutQueryExecutor`) for that reason, and both are seeded and reproducible: no
 call to a clock or a process RNG, every random draw is a pure function of
 `(seed, node index, dimension index)` computed with SplitMix64.

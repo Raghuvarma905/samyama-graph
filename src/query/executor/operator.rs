@@ -17430,8 +17430,9 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// a request it honoured.
     ///
     /// The allowed list is the keys the function actually reads. `writeProperty`
-    /// and `mutate` are not among them anywhere, which is ALGO-06 being unbuilt
-    /// -- and unbuilt is a thing a caller can be told.
+    /// is accepted by every algorithm that can store one value per node, and
+    /// validated in `write_back_plan` (ALGO-06); `mutate` is refused with the
+    /// reason, because there are no graph projections to mutate.
     /// Every solver `or.solve` can actually run.
     ///
     /// Fourteen of the twenty-nine in `samyama-optimization` used to be absent
@@ -17500,6 +17501,215 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         Self::mutating_procedure_refusal(name).is_some()
     }
 
+    /// The config key that asks an algorithm to store its result on each node
+    /// (ALGO-06, #1683): `CALL algo.pageRank({writeProperty: 'rank'})`.
+    pub const WRITE_PROPERTY_KEY: &'static str = "writeProperty";
+
+    /// Does this `CALL` write to the graph, given its arguments as well as its
+    /// name?
+    ///
+    /// A name alone is not enough any more: `algo.pageRank()` reads and
+    /// `algo.pageRank({writeProperty: 'rank'})` writes. `Query::is_write()`
+    /// asks this, so a write-back call is routed to the write executor (and
+    /// persisted, and refused by `GRAPH.RO_QUERY` and `read_only`) the same as
+    /// a `SET`. Any `writeProperty`, even an invalid one, counts: the refusal
+    /// for an invalid one then comes from the write path, with its reason,
+    /// instead of a read executor saying only that it cannot write.
+    pub fn call_writes(name: &str, args: &[Expression]) -> bool {
+        Self::procedure_is_mutating(name) || Self::config_has_key(args, Self::WRITE_PROPERTY_KEY)
+    }
+
+    /// Whether any literal config map among `args` holds `key`.
+    ///
+    /// Config is read from literal maps only, everywhere in this operator, so
+    /// this sees exactly what the algorithm will see.
+    fn config_has_key(args: &[Expression], key: &str) -> bool {
+        args.iter().any(|arg| {
+            matches!(arg, Expression::Literal(PropertyValue::Map(m)) if m.contains_key(key))
+        })
+    }
+
+    /// Every algorithm that returns exactly one value per node, by canonical
+    /// name and alias, and the column whose value `writeProperty` stores.
+    ///
+    /// The names are the dispatch's own spellings. Paths, pairs, node sets and
+    /// whole-graph numbers are deliberately absent: they have no single value
+    /// for a node to hold. `fastRP` and `node2vec` are absent too, because
+    /// they write their own embedding. Public so the write-back tests drive
+    /// every entry rather than a copy of the list.
+    pub const WRITE_BACK: &'static [(&'static [&'static str], &'static str)] = &[
+        (&["pagerank"], "score"),
+        (&["articlerank"], "score"),
+        (&["katz", "katzcentrality"], "score"),
+        (&["personalizedpagerank", "personalisedpagerank"], "score"),
+        (&["degree", "degreecentrality"], "score"),
+        (&["closeness", "closenesscentrality"], "score"),
+        (&["betweenness", "betweennesscentrality"], "score"),
+        (&["harmonic", "harmoniccentrality"], "score"),
+        (&["eigenvector", "eigenvectorcentrality"], "score"),
+        (&["kcore", "corenumber"], "score"),
+        (&["averageneighbordegree", "averageneighbourdegree"], "score"),
+        (&["wcc"], "componentId"),
+        (&["scc"], "componentId"),
+        (&["cdlp", "labelpropagation"], "communityId"),
+        (&["louvain"], "communityId"),
+        (&["lcc"], "coefficient"),
+        (&["squareclustering"], "coefficient"),
+        (&["eccentricity"], "eccentricity"),
+        (&["bipartite", "bipartitesets"], "side"),
+        (&["colouring", "coloring", "greedycolouring"], "colour"),
+        (&["effectivesize"], "value"),
+        (&["constraint", "burtconstraint"], "value"),
+        (&["bellmanford"], "distance"),
+    ];
+
+    /// The column `writeProperty` stores for this canonical name, if any.
+    fn write_back_column(canonical: &str) -> Option<&'static str> {
+        Self::WRITE_BACK
+            .iter()
+            .find(|(names, _)| names.contains(&canonical))
+            .map(|(_, column)| *column)
+    }
+
+    /// The property to write and the column it comes from, when this call
+    /// asks for a write-back; `None` when it does not.
+    ///
+    /// Refused, before anything runs, when the request cannot be honoured: a
+    /// `writeProperty` that is not a non-empty string, a GDS `.stream` call
+    /// (stream mode does not write), and an algorithm with no one value per
+    /// node. Each of those used to be accepted by some algorithm and ignored.
+    fn write_back_plan(&self) -> ExecutionResult<Option<(String, &'static str)>> {
+        if Self::procedure_is_mutating(&self.name) {
+            return Ok(None);
+        }
+        let mut requested = None;
+        for arg in &self.args {
+            if let Expression::Literal(PropertyValue::Map(m)) = arg {
+                match m.get(Self::WRITE_PROPERTY_KEY) {
+                    None => {}
+                    Some(PropertyValue::String(p)) if !p.trim().is_empty() => {
+                        requested = Some(p.clone())
+                    }
+                    Some(other) => {
+                        return Err(ExecutionError::bad_argument(format!(
+                            "{}: `{}` must be a non-empty property name, got {other:?}",
+                            self.name,
+                            Self::WRITE_PROPERTY_KEY
+                        )))
+                    }
+                }
+            }
+        }
+        let Some(property) = requested else {
+            return Ok(None);
+        };
+        let lower = self.name.to_lowercase();
+        if lower.starts_with("gds.") && lower.ends_with(&format!(".{}", Self::GDS_STREAMING_MODE)) {
+            return Err(ExecutionError::bad_argument(format!(
+                "`{}` is a stream call, and GDS's stream mode does not write. Call `algo.{}` with \
+                 `{}` to store the result on each node.",
+                self.name,
+                Self::canonical_name(&self.name),
+                Self::WRITE_PROPERTY_KEY
+            )));
+        }
+        match Self::write_back_column(&Self::canonical_name(&self.name)) {
+            Some(column) => Ok(Some((property, column))),
+            None => Err(ExecutionError::bad_argument(format!(
+                "{} does not support `{}`: it does not return one value per node, so there is \
+                 no value to store on each node. Write its rows yourself with SET.",
+                self.name,
+                Self::WRITE_PROPERTY_KEY
+            ))),
+        }
+    }
+
+    /// Store each result row's `column` value on its node as `property`.
+    ///
+    /// Runs after the algorithm has finished, so the result is computed from
+    /// the graph as it was and is never read back mid-way. Each value goes
+    /// through `set_node_property`, the call `SET` makes, so indexes,
+    /// constraints, the write log and the statement's undo all apply: a
+    /// value the store refuses (a unique constraint, say) fails the statement,
+    /// and the statement is undone whole, with no node half-written.
+    ///
+    /// A null value removes the property, as `SET n.p = null` does: a node
+    /// with no eccentricity keeps no stale one from an earlier run.
+    ///
+    /// The `node` values in the rows are then re-read with their properties,
+    /// so a row's node carries what was written, `RETURN node` as well as
+    /// `RETURN node.<property>`.
+    fn write_back(
+        &mut self,
+        store: &mut GraphStore,
+        tenant_id: &str,
+        property: &str,
+        column: &str,
+    ) -> ExecutionResult<()> {
+        let mut written = std::collections::HashSet::new();
+        for record in &self.results {
+            let id = match record.get("node") {
+                Some(Value::Node(id, _)) | Some(Value::NodeRef(id)) => *id,
+                _ => {
+                    return Err(ExecutionError::RuntimeError(format!(
+                        "{}: a result row has no `node` to write `{property}` on",
+                        self.name
+                    )))
+                }
+            };
+            let value = match record.get(column) {
+                Some(Value::Property(p)) => p.clone(),
+                Some(Value::Null) => PropertyValue::Null,
+                // A missing column is a `WRITE_BACK` entry naming the wrong
+                // one. Writing null for it would remove the property from
+                // every node, silently, so it is refused instead.
+                None => {
+                    return Err(ExecutionError::RuntimeError(format!(
+                        "{}: a result row has no `{column}` column to store as `{property}`",
+                        self.name
+                    )))
+                }
+                Some(other) => {
+                    return Err(ExecutionError::RuntimeError(format!(
+                        "{}: `{column}` is not a property value ({other:?}), so it cannot be \
+                         stored as `{property}`",
+                        self.name
+                    )))
+                }
+            };
+            if !written.insert(id) {
+                return Err(ExecutionError::RuntimeError(format!(
+                    "{}: node {} appears in two result rows, so `{property}` has no single \
+                     value to hold",
+                    self.name,
+                    id.as_u64()
+                )));
+            }
+            store
+                .set_node_property(tenant_id, id, property, value)
+                .map_err(|e| {
+                    ExecutionError::GraphError(format!(
+                        "{}: failed to write `{property}` on node {}: {e}",
+                        self.name,
+                        id.as_u64()
+                    ))
+                })?;
+        }
+        for record in &mut self.results {
+            if let Some(Value::Node(id, _)) = record.get("node").cloned() {
+                if let Some(node) = store.get_node(id) {
+                    // `get_node` alone carries no properties (they live in
+                    // the property store), so they are merged in, as `MATCH`
+                    // does when it returns a node.
+                    let mut node = node.clone();
+                    node.properties = store.node_properties_merged(id);
+                    record.bind("node".to_string(), Value::Node(id, Box::new(node)));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Is this a name `or.solve` will run, rather than quietly substitute?
     fn is_known_solver(name: &str) -> bool {
         Self::SOLVERS.iter().any(|s| s.eq_ignore_ascii_case(name))
@@ -17512,15 +17722,21 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     ) -> ExecutionResult<()> {
         for arg in args {
             if let Expression::Literal(PropertyValue::Map(m)) = arg {
-                let mut unknown: Vec<&String> =
-                    m.keys().filter(|k| !allowed.contains(&k.as_str())).collect();
+                // `writeProperty` is every write-back algorithm's key, and
+                // `write_back_plan` has already refused it where it cannot
+                // be honoured, so it is not repeated in each list.
+                let mut unknown: Vec<&String> = m
+                    .keys()
+                    .filter(|k| {
+                        k.as_str() != Self::WRITE_PROPERTY_KEY && !allowed.contains(&k.as_str())
+                    })
+                    .collect();
                 unknown.sort();
                 if let Some(first) = unknown.first() {
                     return Err(ExecutionError::bad_argument(format!(
                         "{call}: unknown config key `{first}`{}. This algorithm reads: {}. \
                          Keys it does not read were previously accepted and ignored, so a \
-                         request like `writeProperty` looked like it worked; write-back \
-                         modes are not implemented (ALGO-06).",
+                         request like `iteratons` looked like it worked.{}",
                         if unknown.len() > 1 {
                             format!(" (and {} more: {})", unknown.len() - 1,
                                     unknown[1..].iter().map(|k| k.as_str())
@@ -17529,6 +17745,13 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                             String::new()
                         },
                         allowed.join(", "),
+                        if unknown.iter().any(|k| k.starts_with("mutate")) {
+                            " `mutate` mode writes into a graph projection, and this engine \
+                             has no projections yet (ALGO-05, ALGO-06); `writeProperty` \
+                             stores the result on the nodes instead."
+                        } else {
+                            ""
+                        },
                     )));
                 }
             }
@@ -20213,6 +20436,16 @@ impl PhysicalOperator for AlgorithmOperator {
             if let Some(why) = Self::mutating_procedure_refusal(&self.name) {
                 return Err(ExecutionError::RuntimeError(why.to_string()));
             }
+            // Likewise a write-back call (ALGO-06), which `Query::is_write()`
+            // routes to the write executor.
+            if let Some((property, _)) = self.write_back_plan()? {
+                return Err(ExecutionError::RuntimeError(format!(
+                    "{} with `{}` requires write access (MutQueryExecutor): it writes `{property}` \
+                     on every node it returns",
+                    self.name,
+                    Self::WRITE_PROPERTY_KEY
+                )));
+            }
             match Self::canonical_name(&self.name).as_str() {
                 "pagerank" => self.execute_pagerank(store)?,
                 "shortestpath" => self.execute_shortest_path(store)?,
@@ -20300,6 +20533,9 @@ impl PhysicalOperator for AlgorithmOperator {
 
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
          if !self.executed {
+            // Refused before the algorithm runs, so a request that cannot be
+            // honoured costs nothing.
+            let write_back = self.write_back_plan()?;
             match Self::canonical_name(&self.name).as_str() {
                 "or.solve" => self.execute_or_solve(store, tenant_id)?,
                 "fastrp" => self.execute_fastrp(store, tenant_id)?,
@@ -20380,6 +20616,9 @@ impl PhysicalOperator for AlgorithmOperator {
                 "reciprocity" => self.execute_reciprocity(store)?,
                 _ => return Err(Self::unknown_algorithm(&self.name)),
             }
+            if let Some((property, column)) = write_back {
+                self.write_back(store, tenant_id, &property, column)?;
+            }
             self.apply_yield_aliases();
             self.executed = true;
         }
@@ -20394,7 +20633,7 @@ impl PhysicalOperator for AlgorithmOperator {
     }
 
     fn is_mutating(&self) -> bool {
-        Self::procedure_is_mutating(&self.name)
+        Self::call_writes(&self.name, &self.args)
     }
 
     fn reset(&mut self) {
