@@ -383,9 +383,9 @@ fn neo4j_losses(r: &crate::migrate::neo4j_json::ImportReport) -> Vec<Dropped> {
     );
     push(
         "unknown_record_types",
-        r.unknown_record_types.len(),
+        r.records_skipped,
         format!(
-            "Records of these types were skipped: {}.",
+            "Records whose type this importer does not know were skipped; their types: {}.",
             r.unknown_record_types.join(", ")
         ),
     );
