@@ -115,6 +115,8 @@ pub struct Query {
     pub create_vector_index_clause: Option<CreateVectorIndexClause>,
     pub create_fulltext_index_clause: Option<CreateFullTextIndexClause>,
     pub drop_fulltext_index_clause: Option<DropFullTextIndexClause>,
+    /// `CREATE POINT INDEX` / `DROP POINT INDEX` (#1618).
+    pub point_index_ddl: Option<PointIndexDdl>,
     /// CREATE INDEX clause (optional)
     pub create_index_clause: Option<CreateIndexClause>,
     /// DROP INDEX clause (optional)
@@ -236,6 +238,13 @@ pub struct CreateFullTextIndexClause {
     /// One or more properties. Neo4j's `ON EACH [n.a, n.b]` indexes several,
     /// and the single-property form is the same thing with one entry.
     pub property_keys: Vec<String>,
+}
+
+/// `CREATE POINT INDEX` / `DROP POINT INDEX` (#1618).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointIndexDdl {
+    Create { name: String, label: Label, property: String },
+    Drop { name: String },
 }
 
 /// DROP FULLTEXT INDEX clause
@@ -1351,6 +1360,7 @@ impl Query {
             || self.create_vector_index_clause.is_some()
             || self.create_fulltext_index_clause.is_some()
             || self.drop_fulltext_index_clause.is_some()
+            || self.point_index_ddl.is_some()
             || self.create_constraint_clause.is_some()
             || self.create_hierarchy_index_clause.is_some()
             || self.drop_hierarchy_index.is_some()
@@ -1381,7 +1391,9 @@ impl Query {
         self.call_subquery.as_deref().is_some_and(|q| q.is_write())
     }
 
-    /// Does any `CALL` in this statement name a procedure that needs write access?
+    /// Does any `CALL` in this statement need write access: a procedure that
+    /// always writes, or an algorithm asked to store its result
+    /// (`writeProperty`, ALGO-06)?
     ///
     /// Both AST shapes are checked: `call_clause` holds the CALL when the query was
     /// parsed into the older shape, `clauses` when it was parsed into the newer one.
@@ -1391,12 +1403,12 @@ impl Query {
         if self
             .call_clause
             .as_ref()
-            .is_some_and(|c| AlgorithmOperator::procedure_is_mutating(&c.procedure_name))
+            .is_some_and(|c| AlgorithmOperator::call_writes(&c.procedure_name, &c.arguments))
         {
             return true;
         }
         self.clauses.iter().any(|c| match c {
-            Clause::Call(call) => AlgorithmOperator::procedure_is_mutating(&call.procedure_name),
+            Clause::Call(call) => AlgorithmOperator::call_writes(&call.procedure_name, &call.arguments),
             _ => false,
         })
     }
@@ -1422,6 +1434,7 @@ impl Query {
             create_vector_index_clause: None,
             create_fulltext_index_clause: None,
             drop_fulltext_index_clause: None,
+            point_index_ddl: None,
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,

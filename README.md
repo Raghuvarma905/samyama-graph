@@ -324,6 +324,8 @@ Contributions are welcome — bug reports, docs, tests, and code. See
 **[CONTRIBUTING.md](CONTRIBUTING.md)** for setup, build/test commands and the
 pull request workflow. Found a bug? [Open an issue](https://github.com/samyama-ai/samyama-graph/issues/new/choose).
 Questions? [Join the community chat](https://chat.whatsapp.com/Jjjkb3uWRDi1YMdfffaD9d).
+Every issue gets a first response within 2 business days ([SUPPORT.md](SUPPORT.md));
+what is accepted for a date is in [ROADMAP.md](ROADMAP.md).
 
 ## License
 

@@ -1,0 +1,16 @@
+{
+  "policy": "docs/VERSIONING.md",
+  "policy_applies_from": "1.13.0",
+  "deprecations": [
+    {
+      "id": "bundled-visualizer",
+      "surface": "http",
+      "what": "GET / -- the bundled single-page visualizer served by the HTTP port",
+      "http": { "method": "get", "path": "/" },
+      "deprecated_in": "1.7.0",
+      "replacement": "the hosted studio at https://graph.samyama.cloud, which connects to this server from the browser",
+      "removed_in": null,
+      "note": "Deprecated before this policy existed (#259, first shipped in 1.7.0). Announced on the page itself, in the OpenAPI description of getIndex and in the server's startup line; the 1.7.0 release notes do not mention it. The page said it 'will be removed in an upcoming release' without naming one; under this policy the earliest removal is 2.0.0."
+    }
+  ]
+}

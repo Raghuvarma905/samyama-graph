@@ -31,7 +31,7 @@
 //! ```
 
 use samyama::graph::{GraphStore, Label, PropertyValue};
-use samyama::query::executor::MutQueryExecutor;
+use samyama::query::executor::{MutQueryExecutor, QueryExecutor};
 use samyama::query::parser::parse_query;
 
 /// A small weighted, directed graph with triangles and two components, so an
@@ -255,10 +255,12 @@ fn main() {
     // reporting "algorithms work" would answer a different question.
     //
     // `stream` is the calling convention every `algo.*` procedure already uses
-    // -- the results come back as rows. `write` and `mutate` are refused, and
-    // the engine says so itself rather than accepting the key and ignoring it,
-    // which is what it used to do: `algo.pageRank({writeProperty: 'pr'})`
-    // looked like it worked and wrote nothing.
+    // -- the results come back as rows. `write` stores the result on each node
+    // (#1683). It used to be accepted and ignored, so `algo.pageRank(
+    // {writeProperty: 'pr'})` looked like it worked and wrote nothing; a call
+    // that succeeds is therefore not enough, and `write` counts only if the
+    // property is then on the nodes. `mutate` needs graph projections and is
+    // refused.
     let mode_probes: [(&str, &str); 3] = [
         ("stream", "CALL algo.pageRank() YIELD node, score RETURN count(*) AS n"),
         ("write", "CALL algo.pageRank({writeProperty: 'pr'}) YIELD node, score RETURN count(*) AS n"),
@@ -273,6 +275,20 @@ fn main() {
                 Ok(_) => String::new(),
                 Err(e) => format!("{e}"),
             },
+        };
+        let outcome = if outcome.is_empty() && mode == "write" {
+            let check = parse_query("MATCH (n) WHERE n.pr IS NOT NULL RETURN count(n) AS n")
+                .expect("parse the write check");
+            match QueryExecutor::new(&store).execute(&check) {
+                Ok(r) if r.records.first().and_then(|rec| rec.get("n"))
+                    .and_then(|v| v.as_property())
+                    .and_then(|p| p.as_integer())
+                    .is_some_and(|n| n > 0) => String::new(),
+                Ok(_) => "the call succeeded and no node has the property".to_string(),
+                Err(e) => format!("{e}"),
+            }
+        } else {
+            outcome
         };
         if outcome.is_empty() {
             modes_working.push(mode);

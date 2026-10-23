@@ -1686,6 +1686,14 @@ impl QueryPlanner {
             });
         }
 
+        if let Some(ddl) = &query.point_index_ddl {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::point_ops::PointIndexDdlOperator::new(ddl.clone())),
+                output_columns: vec![],
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
         if let Some(clause) = &query.drop_fulltext_index_clause {
             return Ok(ExecutionPlan {
                 root: Box::new(DropFullTextIndexOperator::new(clause.index_name.clone())),
@@ -3778,6 +3786,54 @@ impl QueryPlanner {
             )));
         }
 
+        if call_clause.procedure_name.eq_ignore_ascii_case("db.index.point.nearest") {
+            // (label, property, point, k) YIELD node, distance (#1618).
+            let args = &call_clause.arguments;
+            if args.len() != 4 {
+                return Err(ExecutionError::PlanningError(
+                    "db.index.point.nearest takes (label, property, point, k)".to_string(),
+                ));
+            }
+            let lit = |e: &Expression, what: &str| -> ExecutionResult<String> {
+                match e {
+                    Expression::Literal(PropertyValue::String(s)) => Ok(s.clone()),
+                    _ => Err(ExecutionError::PlanningError(format!(
+                        "db.index.point.nearest: the {what} must be a string literal"
+                    ))),
+                }
+            };
+            let label = lit(&args[0], "label")?;
+            let property = lit(&args[1], "property")?;
+            let centre = match super::operator::eval_expression(&args[2], &super::Record::new(), store)? {
+                super::Value::Property(v) => v,
+                _ => {
+                    return Err(ExecutionError::PlanningError(
+                        "db.index.point.nearest: the third argument must be a point".to_string(),
+                    ))
+                }
+            };
+            let k = match &args[3] {
+                Expression::Literal(PropertyValue::Integer(i)) if *i >= 0 => *i as usize,
+                _ => {
+                    return Err(ExecutionError::PlanningError(
+                        "db.index.point.nearest: k must be a non-negative integer literal".to_string(),
+                    ))
+                }
+            };
+            let mut node_var = "node".to_string();
+            let mut distance_var = None;
+            for item in &call_clause.yield_items {
+                if item.name == "node" {
+                    node_var = item.alias.clone().unwrap_or_else(|| item.name.clone());
+                } else if item.name == "distance" {
+                    distance_var = Some(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+                }
+            }
+            return Ok(Box::new(super::point_ops::PointNearestOperator::new(
+                label, property, centre, k, node_var, distance_var,
+            )));
+        }
+
         if call_clause.procedure_name == "db.index.vector.queryNodes" {
             // Two spellings of the same call, because the name is Neo4j's (#1041):
             //
@@ -3923,11 +3979,29 @@ impl QueryPlanner {
             // user already trusts, so it is refused -- but refused with the
             // reason, because "Unknown procedure" sends the reader looking for
             // an algorithm that is in fact right there (INT-04).
+            //
+            // `write` has an equivalent here, under its own name: it returns
+            // the rows rather than GDS's one summary row, so it is not aliased
+            // onto `.write`; the refusal names it (ALGO-06).
+            let instead = if mode.eq_ignore_ascii_case("write") {
+                format!(
+                    "To store the result on each node, call `algo.{bare}({{{}: \
+                     'name'}})`; it streams the rows as well.",
+                    AlgorithmOperator::WRITE_PROPERTY_KEY
+                )
+            } else {
+                format!("Call `gds.{bare}.stream` or `algo.{bare}` and write the result yourself with SET.")
+            };
             Err(ExecutionError::unknown_procedure(format!(
                 "`{}` is not supported: this engine streams results, and GDS's \
-                 `{}` mode writes them. Call `gds.{}.stream` or `algo.{}` and \
-                 write the result yourself with SET.",
-                call_clause.procedure_name, mode, bare, bare
+                 `{}` mode {}. {instead}",
+                call_clause.procedure_name,
+                mode,
+                match mode.to_ascii_lowercase().as_str() {
+                    "write" => "returns a summary row instead",
+                    "mutate" => "writes them into a graph projection, and there are no projections here yet",
+                    _ => "returns a summary instead of the rows",
+                }
             )))
         } else if call_clause.procedure_name.starts_with("algo.")
             || call_clause.procedure_name.starts_with("gds.")
@@ -4679,6 +4753,10 @@ impl QueryPlanner {
                     Some(end) => scan.with_other_end(end),
                     None => scan,
                 })
+            } else if let Some(op) = point_index_scan(&start_var, &path.start.labels, &remaining_predicates, store) {
+                // A spatial predicate on an R-tree-indexed property (#1618).
+                // The predicate stays in the filter: the region is a superset.
+                op
             } else {
                 Box::new(NodeScanOperator::new(
                     start_var.clone(),
@@ -5655,6 +5733,8 @@ impl QueryPlanner {
                 Some(end) => scan.with_other_end(end),
                 None => scan,
             })
+        } else if let Some(op) = point_index_scan(&anchor_var, &anchor.labels, &candidates, store) {
+            op
         } else {
             Box::new(NodeScanOperator::new(anchor_var.clone(), anchor.labels.clone()))
         };
@@ -6381,6 +6461,11 @@ impl QueryPlanner {
     }
 
     /// Collect variables referenced by an expression
+    /// The variables an expression reads, for callers outside the planner.
+    pub(crate) fn collect_vars(expr: &Expression, vars: &mut HashSet<String>) {
+        Self::collect_expression_variables(expr, vars)
+    }
+
     fn collect_expression_variables(expr: &Expression, vars: &mut HashSet<String>) {
         match expr {
             Expression::Variable(v) => { vars.insert(v.clone()); }
@@ -7492,6 +7577,34 @@ fn propagate_shared_variable_labels(clauses: &[MatchClause]) -> Vec<MatchClause>
         }
     }
     result
+}
+
+/// A `PointIndexScan` for `var` when one of `preds` confines a property of
+/// `var` that a point index covers under one of its labels (#1618). The
+/// predicate is left where it is, so the scan can only narrow the work.
+fn point_index_scan(
+    var: &str,
+    labels: &[Label],
+    preds: &[Expression],
+    store: &GraphStore,
+) -> Option<OperatorBox> {
+    if store.point_index.is_empty() {
+        return None;
+    }
+    for pred in preds.iter().flat_map(flatten_and_predicates) {
+        let Some((property, region)) = super::point_ops::spatial_region(var, &pred, store) else { continue };
+        for label in labels {
+            if store.point_index.name_for(label.as_str(), &property).is_some() {
+                return Some(Box::new(super::point_ops::PointIndexScanOperator::new(
+                    var.to_string(),
+                    label.clone(),
+                    property,
+                    region,
+                )));
+            }
+        }
+    }
+    None
 }
 
 /// What remains of a closing segment after a fused cyclic close bound it
@@ -9348,6 +9461,8 @@ impl QueryPlanner {
 
         // Extract edge patterns from MERGE clause
         let mut edges_to_merge = Vec::new();
+        // Each edge's non-literal properties, by position in `edges_to_merge`.
+        let mut edge_property_exprs = Vec::new();
         // `MERGE p = (a)-[:R]->(b)` binds `p` (#876). An anonymous
         // relationship inside a named path is given a synthetic handle, for
         // the same reason `CREATE` gives one to an anonymous node: the path
@@ -9396,6 +9511,7 @@ impl QueryPlanner {
                         edge_var,
                         undirected,
                     ));
+                    edge_property_exprs.push(edge.property_exprs.clone());
                 }
                 current_var = target_var;
             }
@@ -9433,7 +9549,8 @@ impl QueryPlanner {
             use crate::query::executor::operator::MatchMergeEdgeOperator;
             operator = Box::new(
                 MatchMergeEdgeOperator::new(operator, edges_to_merge, Vec::new(), Vec::new())
-                    .with_ordered_sets(on_create, on_match),
+                    .with_ordered_sets(on_create, on_match)
+                    .with_property_exprs(edge_property_exprs),
             );
             if !merge_named_paths.is_empty() {
                 operator = Box::new(crate::query::executor::operator::BindPathOperator::new(
@@ -10952,6 +11069,7 @@ mod tests {
             create_vector_index_clause: None,
             create_fulltext_index_clause: None,
             drop_fulltext_index_clause: None,
+            point_index_ddl: None,
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,
