@@ -165,6 +165,11 @@ converted file explains itself and can be converted back:
   were recorded. An export at a later epoch -- the graph changed after it was
   converted -- keeps the sources and adds `sources_may_be_stale` to `dropped`,
   so the header says where the data started, not that it still matches.
+- **Once stale, stale.** The flag is kept until the graph is cleared: an
+  import of a snapshot whose header already carries `sources_may_be_stale`
+  stays flagged, and adding sources after an edit does not make the earlier
+  ones current. Two imports with no edit between them stay current, because an
+  import judges the sources already held before its own writes.
 - **Shown by `samyama verify`**, one line per source.
 
 Properties are encoded as JSON values. Edge records ("stub edges") carry only `id, src, tgt, type, props` — endpoint/type metadata, no creation timestamps in v2.

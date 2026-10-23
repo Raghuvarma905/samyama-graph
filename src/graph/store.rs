@@ -1405,6 +1405,11 @@ pub struct GraphStore {
     /// The data epoch when `snapshot_sources` was last added to. An export at
     /// a later epoch flags the sources as possibly stale.
     snapshot_sources_epoch: u64,
+    /// Set once some recorded source is known not to describe the data any
+    /// more -- it arrived flagged, or the graph changed before more sources
+    /// were added -- and kept until `clear`, so adding sources never makes a
+    /// stale one current again.
+    snapshot_sources_stale: bool,
 }
 
 
@@ -1486,6 +1491,7 @@ impl GraphStore {
             epoch: std::sync::atomic::AtomicU64::new(0),
             snapshot_sources: Vec::new(),
             snapshot_sources_epoch: 0,
+            snapshot_sources_stale: false,
         }
     }
 
@@ -4870,22 +4876,44 @@ NodeDeleted { .. } => {
         &self.snapshot_sources
     }
 
-    /// Record inputs this graph's data now comes from: an imported snapshot's
-    /// sources, or the file a converter just read. Appended, so two imports
-    /// into one graph keep both, and taken as describing the graph as it is
-    /// now.
+    /// Record inputs this graph's data now comes from: the file a converter
+    /// just read. Appended, so two inputs into one graph keep both. The new
+    /// sources are taken as describing the graph as it is now; the ones
+    /// already held keep their state, so if the graph changed since they were
+    /// recorded, they stay flagged as possibly stale.
     pub fn add_snapshot_sources(
         &mut self,
         sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
     ) {
+        let earlier_current = self.snapshot_sources_are_current();
+        self.record_snapshot_sources(sources, earlier_current, false);
+    }
+
+    /// [`add_snapshot_sources`](Self::add_snapshot_sources) for a caller that
+    /// changed the graph itself before recording, as an import does: whether
+    /// the sources already held were still current is judged by the caller
+    /// before its own writes (`earlier_current`), and `incoming_stale` says the
+    /// new sources arrived already flagged. Either one keeps the flag set.
+    pub fn record_snapshot_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
+        earlier_current: bool,
+        incoming_stale: bool,
+    ) {
+        if !earlier_current || incoming_stale {
+            self.snapshot_sources_stale = true;
+        }
         self.snapshot_sources.extend(sources);
         self.snapshot_sources_epoch = self.epoch();
     }
 
-    /// Whether the data is unchanged since the sources were last recorded.
-    /// `false` means an export should say they may be stale.
+    /// Whether every recorded source still describes the data: none was
+    /// flagged, and the data is unchanged since they were last recorded.
+    /// `false` means an export should say they may be stale. True for a graph
+    /// with no sources, which has nothing to be stale.
     pub fn snapshot_sources_are_current(&self) -> bool {
-        self.epoch() == self.snapshot_sources_epoch
+        self.snapshot_sources.is_empty()
+            || (!self.snapshot_sources_stale && self.epoch() == self.snapshot_sources_epoch)
     }
 
     /// Declare that query-visible data changed.
@@ -6460,6 +6488,7 @@ NodeDeleted { .. } => {
     pub fn clear(&mut self) {
         self.invalidate_statistics_cache();
         self.snapshot_sources.clear();
+        self.snapshot_sources_stale = false;
         self.nodes.clear();
         self.edge_type_table.clear();
         self.edge_type_to_id.clear();
@@ -7499,6 +7528,7 @@ mod tests {
             ("begin_session_transaction", "opens the session transaction and advances the version; no row changes, and the statements that follow bump on their own paths (#1200 step 6)"),
             ("commit_session_transaction", "drops the rollback journal, keeping every write already applied and already bumped; rollback_session_transaction, which does change rows, bumps (#1200 step 6)"),
             ("add_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
+            ("record_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
         ];
 
         let src = std::fs::read_to_string(concat!(

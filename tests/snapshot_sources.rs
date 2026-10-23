@@ -139,3 +139,51 @@ fn a_failed_import_records_no_sources() {
     assert!(samyama::snapshot::import_tenant(&mut target, bytes.as_slice()).is_err());
     assert!(target.snapshot_sources().is_empty());
 }
+
+/// A snapshot exported as possibly stale stays flagged through another import
+/// and export: importing it does not make it match its sources again (review
+/// on #1940).
+#[test]
+fn a_stale_flag_survives_an_import_and_export_round_trip() {
+    let mut s = graph("A");
+    s.add_snapshot_sources([source("cso.ttl")]);
+    s.create_node("Added");
+    let first = export(&s);
+    assert!(stale(&header(&first)), "{:?}", header(&first).dropped);
+
+    let second = export(&import(&first));
+    assert_eq!(header(&second).sources, vec![source("cso.ttl")]);
+    assert!(stale(&header(&second)), "{:?}", header(&second).dropped);
+}
+
+/// Import A, change the graph, import B: A no longer describes the data, so
+/// adding B does not make the pair current (review on #1940). Two imports with
+/// no edit between them stay current, which
+/// `two_imports_into_one_graph_keep_both_sources` pins.
+#[test]
+fn an_edit_between_two_imports_keeps_the_first_sources_stale() {
+    let mut a = graph("A");
+    a.add_snapshot_sources([source("cso.ttl")]);
+    let mut b = graph("B");
+    b.add_snapshot_sources([source("acm-ccs.ttl")]);
+
+    let mut merged = GraphStore::new();
+    samyama::snapshot::import_tenant(&mut merged, export(&a).as_slice()).unwrap();
+    merged.create_node("Edited");
+    samyama::snapshot::import_tenant(&mut merged, export(&b).as_slice()).unwrap();
+    let h = header(&export(&merged));
+    assert_eq!(h.sources, vec![source("cso.ttl"), source("acm-ccs.ttl")]);
+    assert!(stale(&h), "{:?}", h.dropped);
+}
+
+/// The same rule through the store directly: sources added after an edit do
+/// not make earlier, now-stale sources current.
+#[test]
+fn adding_sources_after_an_edit_keeps_the_earlier_ones_stale() {
+    let mut s = graph("A");
+    s.add_snapshot_sources([source("cso.ttl")]);
+    s.create_node("Edited");
+    s.add_snapshot_sources([source("acm-ccs.ttl")]);
+    assert!(!s.snapshot_sources_are_current());
+    assert!(stale(&header(&export(&s))));
+}

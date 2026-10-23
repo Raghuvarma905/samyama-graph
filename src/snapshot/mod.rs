@@ -888,6 +888,10 @@ fn import_tenant_inner(
         .next()
         .ok_or("empty snapshot file: missing header")??;
     let header: SnapshotHeader = serde_json::from_str(&header_line)?;
+    // Judged before this import writes anything: whether sources the store
+    // already holds still describe its data (#1911). Afterwards the import's
+    // own writes would make them all look changed.
+    let earlier_sources_current = store.snapshot_sources_are_current();
 
     if header.format != "sgsnap" {
         return Err(format!(
@@ -1429,8 +1433,18 @@ fn import_tenant_inner(
     // (#1911). Recorded last, once nothing else in the import can change the
     // graph: the store compares against this point to tell whether the data
     // still is what the sources describe.
+    // A snapshot whose export already flagged its sources as possibly stale
+    // stays flagged: importing it does not make it match them again.
     if !header.sources.is_empty() {
-        store.add_snapshot_sources(header.sources.clone());
+        let incoming_stale = header
+            .dropped
+            .iter()
+            .any(|d| d.what == "sources_may_be_stale");
+        store.record_snapshot_sources(
+            header.sources.clone(),
+            earlier_sources_current,
+            incoming_stale,
+        );
     }
 
     Ok(ImportStats {
