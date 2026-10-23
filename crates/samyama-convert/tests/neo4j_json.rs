@@ -220,3 +220,85 @@ fn placeholder_keeps_the_relationship_against_an_unresolved_node() {
         .and_then(|n| n.properties.get("neo4j_id").cloned());
     assert_eq!(held, Some(PropertyValue::String("99".into())));
 }
+
+/// Floats, lists (mixed and nested) and nested maps survive the conversion
+/// exactly, on nodes and on relationships, and a file that carries only these
+/// converts losslessly (review on #1941).
+#[test]
+fn floats_lists_nested_maps_and_relationship_properties_are_preserved() {
+    use std::collections::HashMap;
+    use PropertyValue as P;
+
+    let text = r#"{"type":"node","id":"a","labels":["Item"],"properties":{"name":"a","price":2.5,"delta":-0.125,"count":3,"mixed":[1,2.5,"x",true,[1,2]],"nested":{"inner":{"list":[1,{"deep":2.5}]},"n":7}}}
+{"type":"node","id":"b","labels":["Item"],"properties":{"name":"b"}}
+{"type":"relationship","id":"r","label":"LINKS","start":{"id":"a"},"end":{"id":"b"},"properties":{"weight":0.75,"tags":["p","q"],"meta":{"since":2019,"score":1.5}}}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("values.json");
+    std::fs::write(&input, text).unwrap();
+    let output = dir.path().join("values.sgsnap");
+
+    let report = convert(&input, &output, &Options::default()).unwrap();
+    assert!(
+        report.input.dropped().is_empty(),
+        "{:?}",
+        report.input.dropped()
+    );
+
+    let map = |pairs: Vec<(&str, PropertyValue)>| {
+        P::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<HashMap<_, _>>(),
+        )
+    };
+    let a = props_of(&output, "a");
+    assert_eq!(a.get("price"), Some(&P::Float(2.5)));
+    assert_eq!(a.get("delta"), Some(&P::Float(-0.125)));
+    assert_eq!(a.get("count"), Some(&P::Integer(3)));
+    assert_eq!(
+        a.get("mixed"),
+        Some(&P::Array(vec![
+            P::Integer(1),
+            P::Float(2.5),
+            P::String("x".into()),
+            P::Boolean(true),
+            P::Array(vec![P::Integer(1), P::Integer(2)]),
+        ]))
+    );
+    assert_eq!(
+        a.get("nested"),
+        Some(&map(vec![
+            (
+                "inner",
+                map(vec![(
+                    "list",
+                    P::Array(vec![P::Integer(1), map(vec![("deep", P::Float(2.5))])]),
+                )]),
+            ),
+            ("n", P::Integer(7)),
+        ]))
+    );
+
+    let mut s = GraphStore::new();
+    samyama::snapshot::import_tenant(&mut s, std::fs::File::open(&output).unwrap()).unwrap();
+    let edges = s.all_edges();
+    assert_eq!(edges.len(), 1);
+    let props = s.edge_properties_merged(edges[0].id);
+    assert_eq!(props.get("weight"), Some(&P::Float(0.75)));
+    assert_eq!(
+        props.get("tags"),
+        Some(&P::Array(vec![
+            P::String("p".into()),
+            P::String("q".into())
+        ]))
+    );
+    assert_eq!(
+        props.get("meta"),
+        Some(&map(vec![
+            ("since", P::Integer(2019)),
+            ("score", P::Float(1.5))
+        ]))
+    );
+}
