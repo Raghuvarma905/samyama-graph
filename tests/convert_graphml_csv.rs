@@ -411,3 +411,44 @@ fn an_integer_a_double_cannot_hold_keeps_its_column_as_exact_text() {
     ));
     assert!(!refused.exists());
 }
+
+/// An empty string and an absent property are different fields: `""` and
+/// nothing at all, which is how `neo4j-admin` tells them apart (review on
+/// #1942). A null cannot be stored, so absent is the only "no value".
+#[test]
+fn an_empty_string_is_quoted_and_an_absent_property_is_left_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = GraphStore::new();
+    let full = s.create_node("Tag");
+    s.set_node_property("default", full, "id", 1i64).unwrap();
+    s.set_node_property("default", full, "note", "x").unwrap();
+    let empty = s.create_node("Tag");
+    s.set_node_property("default", empty, "id", 2i64).unwrap();
+    s.set_node_property("default", empty, "note", "").unwrap();
+    let absent = s.create_node("Tag");
+    s.set_node_property("default", absent, "id", 3i64).unwrap();
+    let input = dir.path().join("empty.sgsnap");
+    samyama::snapshot::write_file(&s, &input, &Default::default()).unwrap();
+
+    let out = dir.path().join("csv");
+    convert(&input, &out, &Options::default()).unwrap();
+    let text = std::fs::read_to_string(out.join("nodes_Tag.csv")).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let (id_col, note_col) = (
+        header.iter().position(|h| h.starts_with("id:")).unwrap(),
+        header.iter().position(|h| h.starts_with("note:")).unwrap(),
+    );
+    let note_by_id: BTreeMap<String, String> = lines
+        .map(|l| {
+            let cells: Vec<&str> = l.split(',').collect();
+            (cells[id_col].to_string(), cells[note_col].to_string())
+        })
+        .collect();
+    assert_eq!(note_by_id["1"], "x", "{text}");
+    assert_eq!(note_by_id["2"], "\"\"", "an empty string is quoted: {text}");
+    assert_eq!(
+        note_by_id["3"], "",
+        "an absent property is an empty field: {text}"
+    );
+}

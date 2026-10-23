@@ -456,9 +456,20 @@ pub fn write_graph_dir(
         for (fixed, props) in t.fixed.iter().zip(&t.props) {
             let mut row: Vec<String> = fixed.iter().map(|f| quote(f)).collect();
             for k in types.keys() {
+                // neo4j-admin reads an unquoted empty field as "no property"
+                // and a quoted `""` as the empty string, so the two are kept
+                // apart: absent or null is unquoted and empty, and a value
+                // whose text is empty is written `""` (review on #1942).
                 row.push(match props.get(k) {
-                    Some(v) => quote(&graph_cell(v, &mut report)),
-                    None => String::new(),
+                    None | Some(crate::graph::PropertyValue::Null) => String::new(),
+                    Some(v) => {
+                        let text = graph_cell(v, &mut report);
+                        if text.is_empty() {
+                            "\"\"".to_string()
+                        } else {
+                            quote(&text)
+                        }
+                    }
                 });
             }
             writeln!(out, "{}", row.join(","))?;
