@@ -378,9 +378,13 @@ fn import_relationship(
 }
 
 /// Create an `Unresolved` node for each endpoint of `record` the file never
-/// defined, so the relationship can be created against it. An endpoint with no
-/// id at all is left alone: there is nothing to hold, and the relationship
-/// stays dangling.
+/// defined, so the relationship can be created against it.
+///
+/// Only when **both** endpoints carry an id. With one missing there is nothing
+/// to hold for it, the relationship cannot be created whatever is done for the
+/// other end, and a placeholder made for that other end would be an orphan
+/// node in the graph, there only because of a record that was discarded
+/// (review on #1941). The relationship stays dangling and is counted as such.
 fn resolve_with_placeholders(
     record: &Json,
     store: &mut GraphStore,
@@ -388,11 +392,14 @@ fn resolve_with_placeholders(
     node_ids: &mut HashMap<String, NodeId>,
     report: &mut ImportReport,
 ) -> Result<(), ImportError> {
-    for key in ["start", "end"] {
-        let Some(v) = record.get(key) else { continue };
-        let Some(id) = v.get("id").and_then(json_id).or_else(|| json_id(v)) else {
-            continue;
-        };
+    let endpoint = |key: &str| -> Option<String> {
+        let v = record.get(key)?;
+        v.get("id").and_then(json_id).or_else(|| json_id(v))
+    };
+    let (Some(start), Some(end)) = (endpoint("start"), endpoint("end")) else {
+        return Ok(());
+    };
+    for id in [start, end] {
         if node_ids.contains_key(&id) {
             continue;
         }
@@ -710,5 +717,29 @@ this line is not json
         assert_eq!(report.placeholder_nodes, 1);
         assert_eq!(report.dangling_edges, 0);
         assert!(!report.lossless(), "{report:?}");
+    }
+
+    /// A relationship with one endpoint missing its id cannot be created, so
+    /// no placeholder is made for the other end: it would be an orphan node
+    /// left by a discarded record (review on #1941).
+    #[test]
+    fn no_placeholder_is_made_for_a_relationship_that_cannot_be_created() {
+        let text = r#"
+{"type":"node","id":"a","labels":["A"],"properties":{}}
+{"type":"relationship","id":"r1","label":"R","end":{"id":"99"}}
+{"type":"relationship","id":"r2","label":"R","start":{},"end":{"id":"98"}}
+"#;
+        let mut store = GraphStore::new();
+        let report = import_str_with(
+            text,
+            &mut store,
+            "default",
+            ImportOptions { placeholders: true },
+        )
+        .unwrap();
+        assert_eq!(report.placeholder_nodes, 0, "{report:?}");
+        assert_eq!(report.dangling_edges, 2, "{report:?}");
+        assert_eq!(store.all_nodes().len(), 1, "only the node the file defined");
+        assert_eq!(report.edges_created, 0);
     }
 }
