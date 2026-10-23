@@ -3979,11 +3979,29 @@ impl QueryPlanner {
             // user already trusts, so it is refused -- but refused with the
             // reason, because "Unknown procedure" sends the reader looking for
             // an algorithm that is in fact right there (INT-04).
+            //
+            // `write` has an equivalent here, under its own name: it returns
+            // the rows rather than GDS's one summary row, so it is not aliased
+            // onto `.write`; the refusal names it (ALGO-06).
+            let instead = if mode.eq_ignore_ascii_case("write") {
+                format!(
+                    "To store the result on each node, call `algo.{bare}({{{}: \
+                     'name'}})`; it streams the rows as well.",
+                    AlgorithmOperator::WRITE_PROPERTY_KEY
+                )
+            } else {
+                format!("Call `gds.{bare}.stream` or `algo.{bare}` and write the result yourself with SET.")
+            };
             Err(ExecutionError::unknown_procedure(format!(
                 "`{}` is not supported: this engine streams results, and GDS's \
-                 `{}` mode writes them. Call `gds.{}.stream` or `algo.{}` and \
-                 write the result yourself with SET.",
-                call_clause.procedure_name, mode, bare, bare
+                 `{}` mode {}. {instead}",
+                call_clause.procedure_name,
+                mode,
+                match mode.to_ascii_lowercase().as_str() {
+                    "write" => "returns a summary row instead",
+                    "mutate" => "writes them into a graph projection, and there are no projections here yet",
+                    _ => "returns a summary instead of the rows",
+                }
             )))
         } else if call_clause.procedure_name.starts_with("algo.")
             || call_clause.procedure_name.starts_with("gds.")
