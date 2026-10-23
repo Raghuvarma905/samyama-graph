@@ -25,9 +25,17 @@
 //! | [`CpuFallbackReason::BelowThreshold`] | `debug` | every call (expected for small graphs) |
 //! | [`CpuFallbackReason::UnsupportedOption`] | `debug` | every call (the caller chose the option) |
 //! | [`CpuFallbackReason::KernelFailed`] | `warn` | every call (a busy or lost device can recover) |
+//!
+//! "Once" means once *seen*: a permanent reason is only marked as reported when
+//! a subscriber will record its event. A call made before logging is set up,
+//! or while the `samyama::gpu` target is filtered out, does not use it up, so
+//! the first call after logging is enabled still says it.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The `tracing` target every fallback is logged on.
+pub const LOG_TARGET: &str = "samyama::gpu";
 
 /// The algorithms that have a GPU path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +100,17 @@ impl CpuFallbackReason {
             CpuFallbackReason::NotCompiled | CpuFallbackReason::NoDevice
         )
     }
+
+    /// The level this reason is logged at.
+    pub fn level(&self) -> FallbackLevel {
+        match self {
+            CpuFallbackReason::NotCompiled => FallbackLevel::Info,
+            CpuFallbackReason::NoDevice | CpuFallbackReason::KernelFailed(_) => FallbackLevel::Warn,
+            CpuFallbackReason::BelowThreshold { .. } | CpuFallbackReason::UnsupportedOption(_) => {
+                FallbackLevel::Debug
+            }
+        }
+    }
 }
 
 impl fmt::Display for CpuFallbackReason {
@@ -146,13 +165,7 @@ impl FallbackLog {
         if reason.is_permanent() && self.reported[algorithm.index()].swap(true, Ordering::Relaxed) {
             return None;
         }
-        let level = match reason {
-            CpuFallbackReason::NotCompiled => FallbackLevel::Info,
-            CpuFallbackReason::NoDevice | CpuFallbackReason::KernelFailed(_) => FallbackLevel::Warn,
-            CpuFallbackReason::BelowThreshold { .. } | CpuFallbackReason::UnsupportedOption(_) => {
-                FallbackLevel::Debug
-            }
-        };
+        let level = reason.level();
         let once = if reason.is_permanent() {
             " (reported once per process)"
         } else {
@@ -182,19 +195,42 @@ impl Default for FallbackLog {
     }
 }
 
+impl FallbackLog {
+    /// Log why `algorithm` ran on the CPU through `tracing`.
+    ///
+    /// Asks the current subscriber first, and does nothing when it would
+    /// discard the event: a permanent reason's single report is only used up
+    /// by an event that is actually recorded.
+    pub fn note(&self, algorithm: GpuAlgorithm, reason: &CpuFallbackReason) {
+        if !level_enabled(reason.level()) {
+            return;
+        }
+        if let Some((level, message)) = self.message(algorithm, reason) {
+            match level {
+                FallbackLevel::Debug => tracing::debug!(target: LOG_TARGET, "{message}"),
+                FallbackLevel::Info => tracing::info!(target: LOG_TARGET, "{message}"),
+                FallbackLevel::Warn => tracing::warn!(target: LOG_TARGET, "{message}"),
+            }
+        }
+    }
+}
+
+/// Whether the current subscriber records an event at `level` on [`LOG_TARGET`].
+fn level_enabled(level: FallbackLevel) -> bool {
+    match level {
+        FallbackLevel::Debug => tracing::enabled!(target: LOG_TARGET, tracing::Level::DEBUG),
+        FallbackLevel::Info => tracing::enabled!(target: LOG_TARGET, tracing::Level::INFO),
+        FallbackLevel::Warn => tracing::enabled!(target: LOG_TARGET, tracing::Level::WARN),
+    }
+}
+
 /// The process-wide record of what has been reported.
 static FALLBACK_LOG: FallbackLog = FallbackLog::new();
 
 /// Log why `algorithm` ran on the CPU. Every GPU-eligible algorithm calls
 /// this on every path that does not use the GPU.
 pub fn note_cpu_fallback(algorithm: GpuAlgorithm, reason: &CpuFallbackReason) {
-    if let Some((level, message)) = FALLBACK_LOG.message(algorithm, reason) {
-        match level {
-            FallbackLevel::Debug => tracing::debug!(target: "samyama::gpu", "{message}"),
-            FallbackLevel::Info => tracing::info!(target: "samyama::gpu", "{message}"),
-            FallbackLevel::Warn => tracing::warn!(target: "samyama::gpu", "{message}"),
-        }
-    }
+    FALLBACK_LOG.note(algorithm, reason);
 }
 
 /// Report the fallback a build without the `gpu` feature always takes.
@@ -209,10 +245,114 @@ pub(crate) fn note_not_compiled(algorithm: GpuAlgorithm) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     /// A graph size and threshold for the below-threshold reason.
     const NODES: usize = 500;
     const MIN_NODES: usize = 1_000;
+
+    /// A subscriber that records events on [`LOG_TARGET`] only when `accept`
+    /// is set, and counts the events it records.
+    struct Recorder {
+        accept: bool,
+        recorded: Arc<AtomicUsize>,
+    }
+
+    impl Recorder {
+        fn new(accept: bool, recorded: &Arc<AtomicUsize>) -> Self {
+            Self {
+                accept,
+                recorded: Arc::clone(recorded),
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Recorder {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            // Ask `enabled` on every event, so recorders that disagree never
+            // share a cached answer for a callsite.
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            self.accept && metadata.target() == LOG_TARGET
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.recorded.fetch_add(1, Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn each_reason_is_logged_at_its_documented_level() {
+        let cases = [
+            (CpuFallbackReason::NotCompiled, FallbackLevel::Info),
+            (CpuFallbackReason::NoDevice, FallbackLevel::Warn),
+            (
+                CpuFallbackReason::KernelFailed("device lost".to_string()),
+                FallbackLevel::Warn,
+            ),
+            (
+                CpuFallbackReason::BelowThreshold {
+                    nodes: NODES,
+                    min_nodes: MIN_NODES,
+                },
+                FallbackLevel::Debug,
+            ),
+            (
+                CpuFallbackReason::UnsupportedOption("dangling redistribution"),
+                FallbackLevel::Debug,
+            ),
+        ];
+        for (reason, level) in cases {
+            assert_eq!(reason.level(), level, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_permanent_reason_is_kept_until_a_subscriber_records_it() {
+        let log = FallbackLog::new();
+        let recorded = Arc::new(AtomicUsize::new(0));
+        // Before any subscriber is installed, and while one filters the target out.
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice)
+        });
+        tracing::subscriber::with_default(Recorder::new(false, &recorded), || {
+            log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice)
+        });
+        assert!(
+            !log.has_reported(GpuAlgorithm::PageRank),
+            "an event nobody recorded must not use up the only report"
+        );
+        // Logging is enabled: the next call says it, and only that one.
+        tracing::subscriber::with_default(Recorder::new(true, &recorded), || {
+            log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice);
+            log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice);
+        });
+        assert_eq!(recorded.load(Ordering::Relaxed), 1);
+        assert!(log.has_reported(GpuAlgorithm::PageRank));
+    }
+
+    #[test]
+    fn a_per_call_reason_is_recorded_on_every_call() {
+        let log = FallbackLog::new();
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let reason = CpuFallbackReason::KernelFailed("device lost".to_string());
+        tracing::subscriber::with_default(Recorder::new(true, &recorded), || {
+            log.note(GpuAlgorithm::Cdlp, &reason);
+            log.note(GpuAlgorithm::Cdlp, &reason);
+        });
+        assert_eq!(recorded.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn every_algorithm_has_its_own_slot() {
@@ -335,10 +475,14 @@ mod tests {
     #[test]
     fn every_gpu_eligible_algorithm_reports_its_fallback_in_the_default_build() {
         let view = triangle();
-        crate::pagerank::page_rank(&view, crate::pagerank::PageRankConfig::default());
-        crate::cdlp::cdlp(&view, &crate::cdlp::CdlpConfig::default());
-        crate::lcc::local_clustering_coefficient(&view);
-        crate::topology::count_triangles(&view);
+        // A report only counts once a subscriber records it.
+        let recorded = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(Recorder::new(true, &recorded), || {
+            crate::pagerank::page_rank(&view, crate::pagerank::PageRankConfig::default());
+            crate::cdlp::cdlp(&view, &crate::cdlp::CdlpConfig::default());
+            crate::lcc::local_clustering_coefficient(&view);
+            crate::topology::count_triangles(&view);
+        });
         for &algorithm in GpuAlgorithm::ALL {
             assert!(
                 FALLBACK_LOG.has_reported(algorithm),

@@ -110,6 +110,18 @@ the `samyama::gpu` log target (HW-10):
 | An option the GPU kernel does not implement (PageRank's dangling redistribution) | `debug` | every call |
 | The GPU kernel returned an error: device busy, lost or failed | `warn` | every call |
 
+"Once" means once recorded. A call made before a subscriber is installed, or
+while `samyama::gpu` is filtered out, does not use up the report, so the
+first call after logging is enabled still says it.
+
+The threshold in a "graph at or below" line is the one dispatch applied. Before
+the GPU runtime is first initialised the backend is unknown, so a graph at or
+below the smallest threshold of any backend stays on the CPU without
+initialising it, and the line names that smallest threshold (or
+`SAMYAMA_GPU_MIN_NODES`, when set). Once the runtime
+is initialised, the line names the active backend's own threshold: on Metal
+that is 1,000,000 nodes, not 1,000.
+
 A line reads, for example:
 
 ```text
