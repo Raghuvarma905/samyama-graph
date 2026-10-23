@@ -53,6 +53,12 @@ scripts/coverage.sh --lcov       # coverage/lcov.info
 | `crash_consistency.py` | Force-kills the server during writes, restarts it, and reports whether acknowledged data survived consistently. This is a process-level probe, not an in-process unit test. | `python3 scripts/crash_consistency.py --cycles 50 --json out.json` |
 | `run_all_examples.sh` | Starts a local server and runs the example demos interactively or with `--batch`; `--port N` changes the server port. It clears its named demo data directories between examples. | `scripts/run_all_examples.sh --batch` |
 
+### Live comparisons
+
+| Script | What it does | Typical invocation |
+|---|---|---|
+| `falkordb_corpus_run.py` | Runs `benchmarks/compat/falkordb-idioms.cypher` on a FalkorDB and a Samyama server and reports how many idioms run on each, with every failure's error. Produces the "actually runs" figure in `docs/MIGRATING-FROM-FALKORDB.md`. Needs Docker and a fresh dedicated `--ephemeral` Samyama server for each run; existing data or schema is refused before setup. The docstring has the server commands. | `python3 scripts/falkordb_corpus_run.py --falkordb 6391 --samyama 6392 --import-dir /tmp/fk-import` |
+
 ## Dataset helpers
 
 | Script | Data |
@@ -67,6 +73,8 @@ The shell scripts require Bash. Python tools use the Python 3 standard library;
 checks that build or run Samyama need the repository's Rust toolchain. Dataset
 helpers need network access; the Graphalytics S-size download also needs
 `zstd`. Coverage installs `cargo-llvm-cov` if needed.
+
+Corpus runner preflight regressions: `python3 -m unittest discover -s scripts -p test_falkordb_corpus_run.py`.
 
 The `triage SLA role lookup (workflow token)` CI job also checks the role API
 with the same read permissions as the scheduled SLA workflow. Its read-only
