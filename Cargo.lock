@@ -4065,6 +4065,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "samyama-convert"
+version = "1.12.0"
+dependencies = [
+ "samyama",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "samyama-gpu"
 version = "1.12.0"
 dependencies = [
