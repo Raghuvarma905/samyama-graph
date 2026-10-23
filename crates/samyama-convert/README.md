@@ -24,7 +24,7 @@ not a converter to every other format:
 | .sgsnap | `.sgsnap` | yes | yes |
 | Turtle | `.ttl` | not yet | not yet |
 | N-Triples | `.nt` | not yet | not yet |
-| RDF/XML | `.rdf`, `.owl` | not yet | not yet |
+| RDF/XML | `.rdf`, `.owl`, `.xml` | not yet | not yet |
 | JSON-LD | `.jsonld` | not yet | not yet |
 | Neo4j apoc.export.json | `.json` | not yet | not yet |
 | GraphML | `.graphml` | not yet | not yet |
