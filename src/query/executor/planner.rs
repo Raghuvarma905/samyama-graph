@@ -3979,11 +3979,29 @@ impl QueryPlanner {
             // user already trusts, so it is refused -- but refused with the
             // reason, because "Unknown procedure" sends the reader looking for
             // an algorithm that is in fact right there (INT-04).
+            //
+            // `write` has an equivalent here, under its own name: it returns
+            // the rows rather than GDS's one summary row, so it is not aliased
+            // onto `.write`; the refusal names it (ALGO-06).
+            let instead = if mode.eq_ignore_ascii_case("write") {
+                format!(
+                    "To store the result on each node, call `algo.{bare}({{{}: \
+                     'name'}})`; it streams the rows as well.",
+                    AlgorithmOperator::WRITE_PROPERTY_KEY
+                )
+            } else {
+                format!("Call `gds.{bare}.stream` or `algo.{bare}` and write the result yourself with SET.")
+            };
             Err(ExecutionError::unknown_procedure(format!(
                 "`{}` is not supported: this engine streams results, and GDS's \
-                 `{}` mode writes them. Call `gds.{}.stream` or `algo.{}` and \
-                 write the result yourself with SET.",
-                call_clause.procedure_name, mode, bare, bare
+                 `{}` mode {}. {instead}",
+                call_clause.procedure_name,
+                mode,
+                match mode.to_ascii_lowercase().as_str() {
+                    "write" => "returns a summary row instead",
+                    "mutate" => "writes them into a graph projection, and there are no projections here yet",
+                    _ => "returns a summary instead of the rows",
+                }
             )))
         } else if call_clause.procedure_name.starts_with("algo.")
             || call_clause.procedure_name.starts_with("gds.")
@@ -9443,6 +9461,8 @@ impl QueryPlanner {
 
         // Extract edge patterns from MERGE clause
         let mut edges_to_merge = Vec::new();
+        // Each edge's non-literal properties, by position in `edges_to_merge`.
+        let mut edge_property_exprs = Vec::new();
         // `MERGE p = (a)-[:R]->(b)` binds `p` (#876). An anonymous
         // relationship inside a named path is given a synthetic handle, for
         // the same reason `CREATE` gives one to an anonymous node: the path
@@ -9491,6 +9511,7 @@ impl QueryPlanner {
                         edge_var,
                         undirected,
                     ));
+                    edge_property_exprs.push(edge.property_exprs.clone());
                 }
                 current_var = target_var;
             }
@@ -9528,7 +9549,8 @@ impl QueryPlanner {
             use crate::query::executor::operator::MatchMergeEdgeOperator;
             operator = Box::new(
                 MatchMergeEdgeOperator::new(operator, edges_to_merge, Vec::new(), Vec::new())
-                    .with_ordered_sets(on_create, on_match),
+                    .with_ordered_sets(on_create, on_match)
+                    .with_property_exprs(edge_property_exprs),
             );
             if !merge_named_paths.is_empty() {
                 operator = Box::new(crate::query::executor::operator::BindPathOperator::new(

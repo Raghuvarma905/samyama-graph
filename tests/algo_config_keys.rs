@@ -35,11 +35,23 @@ fn run(s: &GraphStore, q: &str) -> Result<usize, String> {
 #[test]
 fn an_unknown_config_key_is_refused_and_the_accepted_ones_are_named() {
     let s = store();
-    let err = run(&s, "CALL algo.pageRank({writeProperty: 'pr'}) YIELD node, score RETURN node")
+    let err = run(&s, "CALL algo.pageRank({scale: 2}) YIELD node, score RETURN node")
         .expect_err("a key the algorithm does not read must be refused");
-    assert!(err.contains("writeProperty"), "the message names the key: {err}");
+    assert!(err.contains("scale"), "the message names the key: {err}");
     assert!(err.contains("iterations") && err.contains("damping"),
             "and lists what it does read: {err}");
+}
+
+#[test]
+fn write_property_is_read_now_and_needs_the_write_executor() {
+    // It was this file's example of a key nothing read (#1316). It is read
+    // since ALGO-06 (#1683), so it is no longer "unknown"; on the read
+    // executor it is refused because it writes.
+    let s = store();
+    let err = run(&s, "CALL algo.pageRank({writeProperty: 'pr'}) YIELD node, score RETURN node")
+        .expect_err("a write-back must not run on the read executor");
+    assert!(!err.contains("unknown config key"), "{err}");
+    assert!(err.contains("requires write access"), "{err}");
 }
 
 #[test]
@@ -79,9 +91,10 @@ fn a_call_with_no_config_is_untouched() {
 }
 
 #[test]
-fn the_message_says_write_back_is_not_implemented() {
-    // `writeProperty` and `mutate` are the two a GDS user tries first, and
-    // "unknown key" alone would read as a typo rather than a missing feature.
+fn the_message_says_mutate_is_not_implemented() {
+    // `mutate` is what a GDS user tries after `writeProperty`, which works now
+    // (#1683). "Unknown key" alone would read as a typo rather than a missing
+    // feature, so the message says what is missing: graph projections.
     let s = store();
     let err = run(&s, "CALL algo.cdlp({mutate: true}) YIELD node, community RETURN node")
         .expect_err("refused");

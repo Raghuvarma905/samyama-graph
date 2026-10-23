@@ -11,8 +11,9 @@
 //! `docs/MIGRATING-FROM-FALKORDB.md`.
 //!
 //! "Accepted" is parse-and-plan. The guide also states how many of these
-//! actually run (32 of 53 on 2026-10-17); that number needs a live engine and is
-//! not what this file measures.
+//! actually run (32 of 53, measured 2026-10-17 and again 2026-10-20); that number
+//! needs two live servers, so `scripts/falkordb_corpus_run.py` measures it and
+//! this file does not.
 
 use samyama::compat::{judge_all, split_queries};
 use samyama::graph::GraphStore;
@@ -29,7 +30,8 @@ const MIN_CORPUS_QUERIES: usize = 50;
 /// accepted, and the engine then reported success and stored nothing. It is now
 /// refused at compile time. The count went down because the honesty went up --
 /// which is the one direction this floor is not meant to guard against, so the
-/// drop is recorded here rather than absorbed.
+/// drop is recorded here rather than absorbed. The compatibility report
+/// measured 37 again on 2026-10-20, at `dev` `397a2ce`.
 const ACCEPTED_FLOOR: usize = 37;
 
 /// Idioms the engine refuses at plan time today, each with why. Matched as a

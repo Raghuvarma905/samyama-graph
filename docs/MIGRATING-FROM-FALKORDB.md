@@ -7,6 +7,9 @@ page takes them in that order.
 
 Everything below was checked against FalkorDB's graph module 4.22.1
 (`falkordb/falkordb:latest`) and this repository's `dev` branch on 2026-10-17.
+The corpus figures in section 1 were re-measured on 2026-10-20, against the same
+FalkorDB version and `dev` at `397a2ce`, after three of the defects this guide
+named were fixed.
 RedisGraph is FalkorDB's predecessor and shares its protocol; it was not run
 separately.
 
@@ -27,14 +30,29 @@ was added. Against it:
 
 | | Count |
 |---|---:|
-| accepted by the report (parses and plans) | 38 of 53 |
+| runs on FalkorDB | 53 of 53 |
+| accepted by the report (parses and plans) | 37 of 53 |
 | **actually runs** | **32 of 53** |
 
 **Read the second line.** "Accepted" means the query parses and a plan can be
-built, and six FalkorDB idioms get that far and then fail when executed:
+built, and five FalkorDB idioms get that far and then fail when executed:
 `algo.BFS`, `algo.SPpaths`, `algo.WCC` and `algo.betweenness` with FalkorDB's
-config keys, `string.join`, and `LOAD CSV … MERGE` ([#1895](https://github.com/samyama-ai/samyama-graph/issues/1895)).
-Treat the report as a ceiling and run your queries before you count them.
+config keys, and `string.join`. Treat the report as a ceiling and run your
+queries before you count them.
+
+The running count is measured, not maintained by hand. Start FalkorDB and
+Samyama with one shared import directory, then run
+[`scripts/falkordb_corpus_run.py`](../scripts/falkordb_corpus_run.py); its
+docstring has the commands. Use a dedicated, newly started `--ephemeral` Samyama
+server for each run: the script refuses existing nodes, indexes or constraints
+before changing either engine or the import CSV. Deleting nodes alone does not
+reset schema. It resets the dedicated FalkorDB `corpus` graph, seeds the same
+graph on both, runs every idiom in file order, and prints each failure and error. On 2026-10-20 the
+figures above did not move from the first measurement, but two idioms swapped
+places: `LOAD CSV … MERGE` now runs
+([#1895](https://github.com/samyama-ai/samyama-graph/issues/1895)), and
+`SET p.embedding = vecf32(…)`, which used to report success and store nothing,
+is now refused ([#1897](https://github.com/samyama-ai/samyama-graph/issues/1897)).
 
 ## 2. What changes at the protocol
 
@@ -67,8 +85,9 @@ These work unchanged: `CREATE INDEX FOR (p:Person) ON (p.age)`, the legacy
 `CALL algo.pageRank('Person', 'KNOWS')`, `db.labels()`,
 `db.relationshipTypes()`, `db.propertyKeys()`, `point()`, `distance()`,
 `date()`, `duration()`, `randomUUID()`, `timestamp()`, `hasLabels()`, `CALL {}`
-subqueries, `FOREACH`, `MERGE … ON CREATE SET … ON MATCH SET`, map projection,
-list and pattern comprehension, and `reduce`.
+subqueries, `FOREACH`, `MERGE … ON CREATE SET … ON MATCH SET`,
+`LOAD CSV … MERGE`, map projection, list and pattern comprehension, and
+`reduce`.
 
 | FalkorDB | Samyama |
 |---|---|
@@ -76,7 +95,7 @@ list and pattern comprehension, and `reduce`.
 | `CALL db.idx.fulltext.queryNodes('Movie', 'Matrix')` | `CALL db.index.fulltext.queryNodes('movie_title', 'Matrix')`, by index name |
 | `CALL db.idx.fulltext.drop('Movie')` | `DROP FULLTEXT INDEX movie_title` |
 | `OPTIONS {dimension: 3, similarityFunction: 'euclidean'}` | `OPTIONS {dimensions: 3, similarity: 'l2'}`. The keys are plural and renamed; the metrics are `cosine` and `l2` |
-| `vecf32([0.1, 0.2])` | a plain list, `[0.1, 0.2]`. Remove every `vecf32`: inside `SET` it currently reports success and writes nothing ([#1897](https://github.com/samyama-ai/samyama-graph/issues/1897)) |
+| `vecf32([0.1, 0.2])` | a plain list, `[0.1, 0.2]`. Remove every `vecf32`: the query is refused with `UnknownFunction` ([#1897](https://github.com/samyama-ai/samyama-graph/issues/1897)) |
 | `db.idx.vector.queryNodes('Person', 'embedding', k, vec)` | `db.index.vector.queryNodes('Person', 'embedding', vec, k)`: **the vector and `k` swap places** |
 | `vec.euclideanDistance`, `vec.cosineDistance` | no equivalent function; rank with the vector index, or compute client-side |
 | `CREATE INDEX FOR ()-[k:KNOWS]-() ON (k.since)` | not supported: no index on a relationship property |
@@ -91,7 +110,6 @@ list and pattern comprehension, and `reduce`.
 | `toJSON(x)` | no equivalent; serialize client-side |
 | `string.join(list, '-')` | `reduce(s = '', x IN list \| s + CASE WHEN s = '' THEN '' ELSE '-' END + x)` |
 | `intern(s)` | drop it: it is a FalkorDB memory hint and changes no result |
-| `LOAD CSV … AS row MERGE …` | fails today ([#1895](https://github.com/samyama-ai/samyama-graph/issues/1895)). `LOAD CSV … CREATE` works, and so does `UNWIND $rows AS row MERGE …` |
 
 Two examples in Samyama's form:
 
@@ -154,11 +172,13 @@ UNWIND $rows AS row CREATE (n:Person) SET n += row.props, n.falkor_id = row.id
 UNWIND $rows AS row MATCH (a:Person {falkor_id: row.src}), (b:Person {falkor_id: row.dst}) CREATE (a)-[r:KNOWS]->(b) SET r += row.props
 ```
 
-**Write `SET n += row.props`, not `SET n = row.props`.** With `=`, any other
-property set on the same node in the same statement is silently dropped
-([#1896](https://github.com/samyama-ai/samyama-graph/issues/1896)). Here that is
-`falkor_id`, after which no relationship finds its endpoints and the import
-reports success with every edge missing.
+**`SET n += row.props` adds to the node; `SET n = row.props` replaces every
+property it already has.** On a node just created the two give the same result.
+Until 2026-10-19, `=` also dropped any other property set on the node in the same
+statement, here `falkor_id`, so no relationship found its endpoints and the
+import reported success with every edge missing
+([#1896](https://github.com/samyama-ai/samyama-graph/issues/1896), fixed). On an
+older release, use `+=`.
 
 Create vector indexes after the load, with the options from section 3. Then
 compare counts per label and per relationship type on both sides before you
@@ -180,6 +200,6 @@ switch over.
 
 `benchmarks/compat/falkordb-idioms.cypher` is measured by
 `tests/falkordb_compatibility_corpus.rs` on every run, so a change that stops one
-of the 38 accepted idioms from parsing fails the build. If your report names a
+of the 37 accepted idioms from parsing fails the build. If your report names a
 cause that is not in that file, add the query. Run it on FalkorDB first, because
 the corpus holds only what FalkorDB itself accepts.
