@@ -1,0 +1,12 @@
+# The versions tests/ were last run against. The DAG and the assets use only
+# stable public API, but a version not listed here has not been tested.
+#
+# Airflow wants its constraints file, which pins its transitive dependencies:
+#   pip install -r requirements.txt \
+#     -c https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt
+#
+# Each pipeline needs only its own orchestrator; `samyama_pipeline.py` is
+# standard library only.
+apache-airflow==3.3.2
+dagster==1.13.26
+pytest
