@@ -6409,7 +6409,7 @@
       "query": "CALL gds.pageRank.write({})"
     },
     "response": {
-      "error": "[Samyama.ClientError.Procedure.NotFound] `gds.pageRank.write` is not supported: this engine streams results, and GDS's `write` mode writes them. Call `gds.pagerank.stream` or `algo.pagerank` and write the result yourself with SET.\n --> 1:6\n  |\n1 | CALL gds.pageRank.write({})\n  |      ^^^^^^^^^^^^^^^^^^"
+      "error": "[Samyama.ClientError.Procedure.NotFound] `gds.pageRank.write` is not supported: this engine streams results, and GDS's `write` mode returns a summary row instead. To store the result on each node, call `algo.pagerank({writeProperty: 'name'})`; it streams the rows as well.\n --> 1:6\n  |\n1 | CALL gds.pageRank.write({})\n  |      ^^^^^^^^^^^^^^^^^^"
     },
     "status": 400
   },
