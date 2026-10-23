@@ -893,6 +893,18 @@ fn cmd_convert(argv: &[String]) -> i32 {
         return 2;
     }
 
+    // The report is written last and unconditionally, so a report path that is
+    // the input or the output would replace that graph with JSON. Refused
+    // before anything is read or written.
+    if let Some(report) = values.get("--report") {
+        for (role, graph) in [("input", input), ("output", output)] {
+            if same_path(std::path::Path::new(report), std::path::Path::new(graph)) {
+                eprintln!("convert: --report {report} is the {role} {graph}; name a different file");
+                return 2;
+            }
+        }
+    }
+
     // Losses are judged here, after writing, so exit 1 means "converted, and
     // something was dropped" -- the report is still written.
     let opts = Options { on_missing_endpoint, require_lossless: false };
@@ -912,23 +924,15 @@ fn cmd_convert(argv: &[String]) -> i32 {
         }
     };
     eprintln!("read {from}: {} nodes, {} edges", read.node_count(), read.edge_count());
-    let written = if to == Format::from_path(std::path::Path::new(output)).unwrap_or(to) {
+    let written = if Format::from_path(std::path::Path::new(output)) == Some(to) {
         convert::write_path(&store, std::path::Path::new(output), &opts)
     } else {
-        // `--to` overrides the extension, so the writer is chosen by format
-        // and the file is still replaced whole: written beside it, then renamed.
-        let tmp = format!("{output}.tmp");
-        std::fs::File::create(&tmp)
-            .map_err(|e| convert::ConvertError::Io { path: tmp.clone().into(), source: e })
-            .and_then(|f| convert::write(to, &store, std::io::BufWriter::new(f), &opts))
-            .and_then(|r| {
-                std::fs::rename(&tmp, output)
-                    .map(|_| r)
-                    .map_err(|e| convert::ConvertError::Io { path: output.into(), source: e })
-            })
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
-            })
+        // `--to` overrides the extension (or names a format for a path that has
+        // none we know), so the writer is chosen by format and the file is
+        // still replaced whole: written to a new, uniquely named file beside
+        // it, then renamed. An existing `<output>.tmp` or a symlink is never
+        // truncated or followed, and the staging file removes itself on error.
+        write_as(&store, to, std::path::Path::new(output), &opts)
     };
     let written = match written {
         Ok(r) => r,
@@ -970,6 +974,62 @@ fn cmd_convert(argv: &[String]) -> i32 {
         return 1;
     }
     0
+}
+
+/// Write `store` as `format` to `output` whatever its extension says, through
+/// a fresh staging file beside it (`.<name>.XXXXXX.tmp`) renamed into place.
+fn write_as(
+    store: &samyama::graph::GraphStore,
+    format: samyama::convert::Format,
+    output: &std::path::Path,
+    opts: &samyama::convert::Options,
+) -> Result<samyama::convert::FormatReport, samyama::convert::ConvertError> {
+    use samyama::convert::{self, ConvertError};
+    let io = |p: &std::path::Path, source: std::io::Error| ConvertError::Io { path: p.into(), source };
+    let parent = output
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    let name = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| io(parent, e))?;
+    let (file, staged) = staging.into_parts();
+    let mut out = std::io::BufWriter::new(file);
+    let report = convert::write(format, store, &mut out, opts)?;
+    let file = out.into_inner().map_err(|e| io(&staged, e.into_error()))?;
+    file.sync_all().map_err(|e| io(&staged, e))?;
+    staged.persist(output).map_err(|e| io(output, e.error))?;
+    Ok(report)
+}
+
+/// Whether `a` and `b` name the same file: the same path once symlinks and
+/// `.`/`..` are resolved (for a file that does not exist yet, through its
+/// parent directory), or, on Unix, the same inode, which catches hard links.
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn resolved(p: &std::path::Path) -> Option<std::path::PathBuf> {
+        if let Ok(full) = std::fs::canonicalize(p) {
+            return Some(full);
+        }
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        Some(std::fs::canonicalize(parent).ok()?.join(p.file_name()?))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if (ma.dev(), ma.ino()) == (mb.dev(), mb.ino()) {
+                return true;
+            }
+        }
+    }
+    match (resolved(a), resolved(b)) {
+        (Some(ra), Some(rb)) => ra == rb,
+        _ => a == b,
+    }
 }
 
 fn cmd_verify(argv: &[String]) -> i32 {

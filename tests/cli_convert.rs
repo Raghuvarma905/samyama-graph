@@ -216,3 +216,82 @@ fn formats_and_help_list_the_matrix() {
         }
     }
 }
+
+/// `--to` names the format when the output's extension does not: an unknown
+/// extension converts with exit 0 and reads back (review on #1939).
+#[test]
+fn to_overrides_an_unknown_output_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "in.sgsnap", false);
+    let output = dir.path().join("out.bin");
+
+    let o = run(&[
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        "--to",
+        "sgsnap",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(counts(&output), (2, 0));
+}
+
+/// The override writer stages in a new file of its own: an existing
+/// `<output>.tmp` -- here the very input -- is neither truncated nor replaced
+/// (review on #1939).
+#[test]
+fn an_existing_dot_tmp_beside_the_output_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "out.bin.tmp", false);
+    let before = std::fs::read(&input).unwrap();
+    let output = dir.path().join("out.bin");
+
+    let o = run(&[
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        "--from",
+        "sgsnap",
+        "--to",
+        "sgsnap",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    assert_eq!(counts(&output), (2, 0));
+}
+
+/// A `--report` that names the input or the output, directly or by another
+/// spelling of the same path, is refused with exit 2 before either graph is
+/// touched (review on #1939).
+#[test]
+fn a_report_path_that_is_a_graph_path_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "in.sgsnap", false);
+    let before = std::fs::read(&input).unwrap();
+    let output = dir.path().join("out.sgsnap");
+    std::fs::write(&output, b"previous output").unwrap();
+    let same_output = dir.path().join(".").join("out.sgsnap");
+
+    for report in [&input, &output, &same_output] {
+        let o = run(&[
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+        ]);
+        assert_eq!(code(&o), 2, "{}", stderr(&o));
+        assert!(stderr(&o).contains("--report"), "{}", stderr(&o));
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous output");
+    }
+
+    // An output that does not exist yet is caught through its directory.
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let fresh = dir.path().join("fresh.sgsnap");
+    let o = run(&[
+        input.to_str().unwrap(),
+        fresh.to_str().unwrap(),
+        "--report",
+        dir.path().join("sub/../fresh.sgsnap").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(!fresh.exists());
+}
