@@ -1,0 +1,41 @@
+name: Triage SLA
+
+# Measures the promise SUPPORT.md makes (DX-11, #1785): an issue opened by
+# someone without triage access gets a first response from a maintainer within
+# 2 business days. See scripts/triage_sla.py for exactly what counts.
+#
+# Daily, not per-PR. Whether the promise was kept depends on the issue tracker,
+# not on the code in a pull request, so it has no business blocking a merge. A
+# run fails when an issue opened since the policy took effect missed it, and the
+# job summary carries the table either way.
+#
+# Exit 2 means "could not measure" (the API was unreachable, or the permission
+# lookup found no maintainers at all) -- a broken measurement, not a missed SLA.
+#
+# Scheduled workflows run from the default branch only, so this starts once it
+# reaches main.
+
+on:
+  schedule:
+    - cron: "30 3 * * 1-5"   # 09:00 Asia/Kolkata, Monday to Friday
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  first-response:
+    name: first response within 2 business days
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rules of the measurement
+        run: python3 scripts/test_triage_sla.py
+      - name: Measure the issue tracker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/triage_sla.py --repo "$GITHUB_REPOSITORY"

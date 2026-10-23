@@ -9443,6 +9443,8 @@ impl QueryPlanner {
 
         // Extract edge patterns from MERGE clause
         let mut edges_to_merge = Vec::new();
+        // Each edge's non-literal properties, by position in `edges_to_merge`.
+        let mut edge_property_exprs = Vec::new();
         // `MERGE p = (a)-[:R]->(b)` binds `p` (#876). An anonymous
         // relationship inside a named path is given a synthetic handle, for
         // the same reason `CREATE` gives one to an anonymous node: the path
@@ -9491,6 +9493,7 @@ impl QueryPlanner {
                         edge_var,
                         undirected,
                     ));
+                    edge_property_exprs.push(edge.property_exprs.clone());
                 }
                 current_var = target_var;
             }
@@ -9528,7 +9531,8 @@ impl QueryPlanner {
             use crate::query::executor::operator::MatchMergeEdgeOperator;
             operator = Box::new(
                 MatchMergeEdgeOperator::new(operator, edges_to_merge, Vec::new(), Vec::new())
-                    .with_ordered_sets(on_create, on_match),
+                    .with_ordered_sets(on_create, on_match)
+                    .with_property_exprs(edge_property_exprs),
             );
             if !merge_named_paths.is_empty() {
                 operator = Box::new(crate::query::executor::operator::BindPathOperator::new(
