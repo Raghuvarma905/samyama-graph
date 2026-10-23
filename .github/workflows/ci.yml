@@ -442,6 +442,15 @@ jobs:
         # nobody can rely on at the moment it matters.
         run: python3 scripts/test_check_release_gate.py
 
+      - name: Corpus runner reset preflights
+        run: python3 -m unittest discover -s scripts -p test_falkordb_corpus_run.py
+
+      - name: The triage-SLA measurement counts neither weekends nor labels
+        # The daily measurement itself lives in triage-sla.yml, because whether
+        # an issue got a reply is not a property of a PR. Its rules are, and a
+        # change that breaks them should fail here, not on some later weekday.
+        run: python3 scripts/test_triage_sla.py
+
       - name: LINT-RATCHET — the clippy warning count may not rise
         id: lint_ratchet
         # Runs even if an earlier gate failed, and the run-all-gates step
@@ -897,6 +906,78 @@ jobs:
             ${{ runner.temp }}/gpml-conformance/suite/results/summary.json
           if-no-files-found: warn
 
+  # INT-10 asks for an orchestration integration that is documented AND tested:
+  # one reference pipeline per tool, run against a server. This runs both --
+  # the Airflow DAG through `dag.test()` and the Dagster assets through
+  # `materialize` -- against the release binary `test` built, each test on its
+  # own server with a fresh data directory (examples/orchestration/tests/).
+  #
+  # A reference pipeline that is not run rots exactly like documentation does,
+  # only later: it keeps importing cleanly long after the HTTP API it calls has
+  # moved, and the first person to find out is the one who copied it.
+  #
+  # Not in `ci-ok`'s `needs`, for the reason `gpml` is not: making a new suite
+  # block every merge -- here, one that installs Airflow from PyPI -- is a policy
+  # decision, separate from adding the suite. tests/ci_gate_enumeration.rs
+  # records the exemption so it cannot be forgotten.
+  orchestration:
+    name: orchestration (Airflow and Dagster reference pipelines)
+    needs: [changes, test]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The binary `test` already built. A missing artifact is not a failure:
+      # the next step builds the engine instead, as the gpml job does.
+      - name: Discard any cached release executable
+        run: rm -f target/release/samyama
+
+      - name: Take the release binary from the test job
+        id: orchestration_release_binary
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: samyama-release
+          path: target/release
+
+      - name: Use it if it arrived, otherwise build it
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.orchestration_release_binary.outcome }}" = "success" ] && [ -f target/release/samyama ]; then
+            # An artifact download does not preserve the executable bit.
+            chmod +x target/release/samyama
+            echo "using the binary built by the test job"
+          else
+            echo "::notice::no release artifact; building the engine"
+            rm -f target/release/samyama
+            cargo build --release --bin samyama --locked
+          fi
+
+      - name: Install Airflow and Dagster at the tested versions
+        working-directory: examples/orchestration
+        # Airflow's constraints file is per Airflow version and per Python
+        # version; both are read rather than restated, so bumping the pin in
+        # requirements.txt cannot leave this step installing against the old
+        # constraints.
+        run: |
+          set -euo pipefail
+          airflow=$(sed -n 's/^apache-airflow==//p' requirements.txt)
+          py=$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+          pip install -r requirements.txt \
+            -c "https://raw.githubusercontent.com/apache/airflow/constraints-${airflow}/constraints-${py}.txt"
+
+      - name: Run both pipelines against the engine
+        working-directory: examples/orchestration
+        env:
+          SAMYAMA_BIN: ${{ github.workspace }}/target/release/samyama
+        run: python -m pytest -v tests/
+
   # API-09: the SDKs users already have keep working against this build.
   #
   # docs/VERSIONING.md promises that the previous minor's SDKs work against the
@@ -980,6 +1061,28 @@ jobs:
   # listed in `needs` below, because a suite added without being added here would
   # stop gating silently: the aggregator would go green without ever waiting for
   # it.
+  triage-sla-contract:
+    name: triage SLA role lookup (workflow token)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Match the scheduled SLA workflow. Metadata read is implicit in GitHub's
+    # repository token; the permission endpoint must not need a maintainer PAT.
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline SLA rules
+        run: python3 scripts/test_triage_sla.py
+      - name: Check actual workflow-token role classification
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROLE_MAINTAINER: ${{ vars.TRIAGE_SLA_MAINTAINER || 'Raghuvarma905' }}
+          ROLE_OUTSIDE_USER: ${{ vars.TRIAGE_SLA_OUTSIDE_USER || 'octocat' }}
+        run: >-
+          python3 scripts/check_triage_role_lookup.py --repo "$GITHUB_REPOSITORY"
+          --maintainer "$ROLE_MAINTAINER" --outside-user "$ROLE_OUTSIDE_USER"
+
   ci-ok:
     name: ci-ok
     # always() is load-bearing. Without it a failed dependency SKIPS this job, and
@@ -988,6 +1091,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - triage-sla-contract
       - supply-chain
       - test
       - docs-gate
