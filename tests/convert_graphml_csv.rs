@@ -352,3 +352,62 @@ fn a_property_name_with_a_colon_is_left_out_and_reported() {
     assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
     assert!(!refused.exists());
 }
+
+/// A column mixing integers and floats is `double` only when every integer is
+/// exact as one. Past 2^53 an integer would round on import, so the column is
+/// written as text, digits exact, and the widening is reported (review on
+/// #1942).
+#[test]
+fn an_integer_a_double_cannot_hold_keeps_its_column_as_exact_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = GraphStore::new();
+    let big = 9_007_199_254_740_993i64; // 2^53 + 1
+    let a = s.create_node("Reading");
+    s.set_node_property("default", a, "v", big).unwrap();
+    let b = s.create_node("Reading");
+    s.set_node_property("default", b, "v", 1.5f64).unwrap();
+    // Small integers beside a float still make a `double` column.
+    let c = s.create_node("Small");
+    s.set_node_property("default", c, "v", 3i64).unwrap();
+    let d = s.create_node("Small");
+    s.set_node_property("default", d, "v", 1.5f64).unwrap();
+    let input = dir.path().join("big.sgsnap");
+    samyama::snapshot::write_file(&s, &input, &Default::default()).unwrap();
+
+    let out = dir.path().join("csv");
+    let report = convert(&input, &out, &Options::default()).unwrap();
+    let (header, rows) = read_csv(&out.join("nodes_Reading.csv"));
+    assert!(header.iter().any(|h| h == "v:string"), "{header:?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.iter().any(|c| c == "9007199254740993")),
+        "the digits are written exactly: {rows:?}"
+    );
+    let (small_header, _) = read_csv(&out.join("nodes_Small.csv"));
+    assert!(
+        small_header.iter().any(|h| h == "v:double"),
+        "{small_header:?}"
+    );
+    let widened = report
+        .output
+        .dropped()
+        .iter()
+        .find(|d| d.what == "columns_widened_to_string")
+        .expect("the widening is reported");
+    assert!(
+        widened.detail.contains("nodes_Reading.csv:v"),
+        "{}",
+        widened.detail
+    );
+
+    let strict = Options {
+        require_lossless: true,
+        ..Options::default()
+    };
+    let refused = dir.path().join("csv_strict");
+    assert!(matches!(
+        convert(&input, &refused, &strict),
+        Err(ConvertError::Lossy(_))
+    ));
+    assert!(!refused.exists());
+}

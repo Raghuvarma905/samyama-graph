@@ -297,6 +297,9 @@ impl ColType {
     }
 }
 
+/// The largest integer magnitude an `f64` holds exactly: 2^53.
+const MAX_EXACT_DOUBLE_INT: u64 = 1 << 53;
+
 /// One property value as a CSV field's text.
 fn graph_cell(v: &crate::graph::PropertyValue, report: &mut GraphCsvReport) -> String {
     use crate::graph::PropertyValue as P;
@@ -350,7 +353,7 @@ pub fn write_graph_dir(
     store: &crate::graph::GraphStore,
     dir: &std::path::Path,
 ) -> std::io::Result<GraphCsvReport> {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Write;
 
     let mut report = GraphCsvReport::default();
@@ -401,10 +404,18 @@ pub fn write_graph_dir(
         // column reported as widened held more than one type and ended as a
         // string; a long-and-double column is a double and loses nothing.
         let mut seen: BTreeMap<String, Vec<ColType>> = BTreeMap::new();
+        // Columns holding an integer a double cannot represent exactly, so
+        // such a column must not widen to `double` (review on #1942).
+        let mut inexact_as_double: BTreeSet<String> = BTreeSet::new();
         for props in &t.props {
             for (k, v) in props {
                 if matches!(v, crate::graph::PropertyValue::Null) {
                     continue;
+                }
+                if let crate::graph::PropertyValue::Integer(i) = v {
+                    if i.unsigned_abs() > MAX_EXACT_DOUBLE_INT {
+                        inexact_as_double.insert(k.clone());
+                    }
                 }
                 let held = seen.entry(k.clone()).or_default();
                 let ty = ColType::of(v);
@@ -424,7 +435,13 @@ pub fn write_graph_dir(
             .iter()
             .filter(|(k, _)| !k.contains(':'))
             .map(|(k, held)| {
-                let ty = held[1..].iter().fold(held[0], |a, b| a.widen(*b));
+                let mut ty = held[1..].iter().fold(held[0], |a, b| a.widen(*b));
+                // A long and a double make a double only when every integer in
+                // the column survives as one; past 2^53 Neo4j would round it
+                // on import, so the column is text, with the digits exact.
+                if ty == ColType::Double && inexact_as_double.contains(k) {
+                    ty = ColType::String;
+                }
                 if held.len() > 1 && ty == ColType::String {
                     report.columns_widened_to_string.push(format!("{name}:{k}"));
                 }
