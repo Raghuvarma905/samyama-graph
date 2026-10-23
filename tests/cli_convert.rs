@@ -334,3 +334,55 @@ fn a_report_alias_beneath_a_missing_output_directory_is_refused() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(counts(&absolute), (2, 0));
 }
+
+/// A report path that is a dangling symlink to the output is the output: it
+/// is refused before anything is written (review on #1939).
+#[cfg(unix)]
+#[test]
+fn a_report_symlink_to_the_output_not_yet_written_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "in.sgsnap", false);
+    let output = dir.path().join("out.sgsnap");
+    let report = dir.path().join("report.json");
+    std::os::unix::fs::symlink("out.sgsnap", &report).unwrap();
+
+    let o = run(&[
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(!output.exists());
+}
+
+/// The report is renamed into place, so a symlink at the report path is
+/// replaced, never written through onto the file it names.
+#[cfg(unix)]
+#[test]
+fn the_report_replaces_a_symlink_instead_of_writing_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "in.sgsnap", false);
+    let output = dir.path().join("out.sgsnap");
+    let other = dir.path().join("notes.txt");
+    std::fs::write(&other, b"mine").unwrap();
+    let report = dir.path().join("report.json");
+    std::os::unix::fs::symlink(&other, &report).unwrap();
+
+    let o = run(&[
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(std::fs::read(&other).unwrap(), b"mine");
+    assert!(!std::fs::symlink_metadata(&report)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(std::fs::read_to_string(&report)
+        .unwrap()
+        .contains("lossless"));
+    assert_eq!(counts(&output), (2, 0));
+}

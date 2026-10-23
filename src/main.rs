@@ -963,7 +963,13 @@ fn cmd_convert(argv: &[String]) -> i32 {
             "output": { "path": output, "format": to.to_string(), "report": side(&report.output) },
             "lossless": report.lossless(),
         });
-        if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap_or_default()) {
+        // Staged and renamed, so a symlink at the report path is replaced
+        // rather than followed onto a graph file the check above missed.
+        let bytes = serde_json::to_vec_pretty(&json).unwrap_or_default();
+        let written = write_staged(std::path::Path::new(path), |out| {
+            std::io::Write::write_all(out, &bytes).map_err(|e| samyama::convert::ConvertError::Io { path: path.into(), source: e })
+        });
+        if let Err(e) = written {
             eprintln!("convert: could not write the report {path}: {e}");
             return 73;
         }
@@ -977,21 +983,33 @@ fn cmd_convert(argv: &[String]) -> i32 {
 }
 
 /// Write `store` as `format` to `output` whatever its extension says, through
-/// a fresh staging file beside it (`.<name>.XXXXXX.tmp`) renamed into place.
+/// a fresh staging file beside it renamed into place.
 fn write_as(
     store: &samyama::graph::GraphStore,
     format: samyama::convert::Format,
     output: &std::path::Path,
     opts: &samyama::convert::Options,
 ) -> Result<samyama::convert::FormatReport, samyama::convert::ConvertError> {
-    use samyama::convert::{self, ConvertError};
+    write_staged(output, |out| samyama::convert::write(format, store, out, opts))
+}
+
+/// Write `path` through a new, uniquely named staging file beside it
+/// (`.<name>.XXXXXX.tmp`), synced and then renamed over `path`. An existing
+/// `<path>.tmp` is never truncated, and a symlink at `path` is replaced by the
+/// rename, not written through, so it cannot redirect the write onto another
+/// file. The staging file removes itself on error.
+fn write_staged<T>(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T, samyama::convert::ConvertError>,
+) -> Result<T, samyama::convert::ConvertError> {
+    use samyama::convert::ConvertError;
     let io = |p: &std::path::Path, source: std::io::Error| ConvertError::Io { path: p.into(), source };
-    let parent = output
+    let parent = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    let name = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let staging = tempfile::Builder::new()
         .prefix(&format!(".{name}."))
         .suffix(".tmp")
@@ -999,11 +1017,11 @@ fn write_as(
         .map_err(|e| io(parent, e))?;
     let (file, staged) = staging.into_parts();
     let mut out = std::io::BufWriter::new(file);
-    let report = convert::write(format, store, &mut out, opts)?;
+    let written = write(&mut out)?;
     let file = out.into_inner().map_err(|e| io(&staged, e.into_error()))?;
     file.sync_all().map_err(|e| io(&staged, e))?;
-    staged.persist(output).map_err(|e| io(output, e.error))?;
-    Ok(report)
+    staged.persist(path).map_err(|e| io(path, e.error))?;
+    Ok(written)
 }
 
 /// Whether `a` and `b` name the same file: the same path once symlinks and
@@ -1014,7 +1032,18 @@ fn write_as(
 fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     fn resolved(p: &std::path::Path) -> Option<std::path::PathBuf> {
         use std::path::Component;
-        let absolute = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().ok()?.join(p) };
+        let mut absolute = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().ok()?.join(p) };
+        // A dangling symlink does not canonicalize, but what it names is where
+        // a write through it lands: follow it, by hand, to its target. Bounded
+        // like the OS's own limit, so a loop of links cannot hang this.
+        for _ in 0..40 {
+            let is_link = std::fs::symlink_metadata(&absolute).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            if !is_link || std::fs::canonicalize(&absolute).is_ok() {
+                break;
+            }
+            let target = std::fs::read_link(&absolute).ok()?;
+            absolute = absolute.parent()?.join(target);
+        }
         // Walk up to the deepest ancestor that exists, so its symlinks resolve.
         let mut base = absolute.as_path();
         let mut full = loop {
