@@ -442,6 +442,9 @@ jobs:
         # nobody can rely on at the moment it matters.
         run: python3 scripts/test_check_release_gate.py
 
+      - name: Corpus runner reset preflights
+        run: python3 -m unittest discover -s scripts -p test_falkordb_corpus_run.py
+
       - name: The triage-SLA measurement counts neither weekends nor labels
         # The daily measurement itself lives in triage-sla.yml, because whether
         # an issue got a reply is not a property of a PR. Its rules are, and a

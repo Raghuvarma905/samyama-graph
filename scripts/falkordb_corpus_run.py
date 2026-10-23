@@ -172,6 +172,27 @@ def ensure_fresh_samyama(conn: Conn) -> None:
                                "--ephemeral server before each corpus run")
 
 
+def reset_falkordb(conn: Conn) -> None:
+    """Reset only the dedicated graph; never measure after a refused reset."""
+    def graphs():
+        reply = conn.call("GRAPH.LIST")
+        error = error_of(reply)
+        if error:
+            raise RuntimeError(f"could not list FalkorDB graphs: {error}")
+        if not isinstance(reply, list) or not all(isinstance(g, str) for g in reply):
+            raise RuntimeError("unexpected FalkorDB graph list response")
+        return reply
+
+    # An absent graph needs no deletion. Every error deleting an existing graph
+    # is fatal, including ACL refusals; a successful query is not proof of reset.
+    if FALKOR_GRAPH in graphs():
+        error = error_of(conn.call("GRAPH.DELETE", FALKOR_GRAPH))
+        if error:
+            raise RuntimeError(f"could not reset FalkorDB graph: {error}")
+        if FALKOR_GRAPH in graphs():
+            raise RuntimeError("FalkorDB corpus graph remains after reset")
+
+
 def run(conn: Conn, graph: str, queries: list[str]) -> list[str | None]:
     return [error_of(conn.call("GRAPH.QUERY", graph, q)) for q in queries]
 
@@ -191,8 +212,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fk, sg = Conn(args.falkordb), Conn(args.samyama)
         ensure_fresh_samyama(sg)
+        reset_falkordb(fk)
         (args.import_dir / "people.csv").write_text(PEOPLE_CSV)
-        fk.call("GRAPH.DELETE", FALKOR_GRAPH)   # an error if absent, which is fine
         for conn, graph in ((fk, FALKOR_GRAPH), (sg, SAMYAMA_GRAPH)):
             e = error_of(conn.call("GRAPH.QUERY", graph, SEED))
             if e:
