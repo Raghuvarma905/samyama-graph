@@ -84,13 +84,35 @@ impl Format {
             .find(|f| f.extensions().contains(&ext.as_str()))
     }
 
+    /// The format a name given on the command line means (`--from` / `--to`),
+    /// case-insensitive: the format's own name or any of its extensions.
+    pub fn from_name(name: &str) -> Option<Format> {
+        let n = name.trim_start_matches('.').to_ascii_lowercase();
+        let named = match n.as_str() {
+            "sgsnap" => Some(Format::Sgsnap),
+            "turtle" => Some(Format::Turtle),
+            "ntriples" | "n-triples" => Some(Format::NTriples),
+            "rdfxml" | "rdf-xml" | "rdf/xml" => Some(Format::RdfXml),
+            "jsonld" | "json-ld" => Some(Format::JsonLd),
+            "neo4j" | "neo4j-json" | "neo4jjson" => Some(Format::Neo4jJson),
+            "graphml" => Some(Format::GraphMl),
+            "csv" => Some(Format::Csv),
+            _ => None,
+        };
+        named.or_else(|| {
+            Format::ALL
+                .into_iter()
+                .find(|f| f.extensions().contains(&n.as_str()))
+        })
+    }
+
     /// The file extensions that name this format, without the dot.
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
             Format::Sgsnap => &["sgsnap"],
             Format::Turtle => &["ttl"],
             Format::NTriples => &["nt"],
-            Format::RdfXml => &["rdf", "owl"],
+            Format::RdfXml => &["rdf", "owl", "xml"],
             Format::JsonLd => &["jsonld"],
             Format::Neo4jJson => &["json"],
             Format::GraphMl => &["graphml"],
