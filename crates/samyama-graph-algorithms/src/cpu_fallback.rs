@@ -216,11 +216,22 @@ impl FallbackLog {
 }
 
 /// Whether the current subscriber records an event at `level` on [`LOG_TARGET`].
+///
+/// Asks about an *event* carrying a `message` field, as the one
+/// [`FallbackLog::note`] emits, not the span-or-event hint `tracing::enabled!`
+/// asks about: a subscriber that filters on `Metadata::is_event`, or on the
+/// event's fields, must get the same answer here as for the event itself.
 fn level_enabled(level: FallbackLevel) -> bool {
     match level {
-        FallbackLevel::Debug => tracing::enabled!(target: LOG_TARGET, tracing::Level::DEBUG),
-        FallbackLevel::Info => tracing::enabled!(target: LOG_TARGET, tracing::Level::INFO),
-        FallbackLevel::Warn => tracing::enabled!(target: LOG_TARGET, tracing::Level::WARN),
+        FallbackLevel::Debug => {
+            tracing::event_enabled!(target: LOG_TARGET, tracing::Level::DEBUG, message)
+        }
+        FallbackLevel::Info => {
+            tracing::event_enabled!(target: LOG_TARGET, tracing::Level::INFO, message)
+        }
+        FallbackLevel::Warn => {
+            tracing::event_enabled!(target: LOG_TARGET, tracing::Level::WARN, message)
+        }
     }
 }
 
@@ -252,17 +263,29 @@ mod tests {
     const NODES: usize = 500;
     const MIN_NODES: usize = 1_000;
 
-    /// A subscriber that records events on [`LOG_TARGET`] only when `accept`
-    /// is set, and counts the events it records.
+    /// What a [`Recorder`] lets through.
+    type Filter = fn(&tracing::Metadata<'_>) -> bool;
+
+    /// Everything on [`LOG_TARGET`].
+    const ON_TARGET: Filter = |metadata| metadata.target() == LOG_TARGET;
+    /// Nothing: the target is filtered out.
+    const NOTHING: Filter = |_| false;
+    /// Events only, never a span or a hint: `filter_fn(|m| m.is_event())`.
+    const EVENTS_ONLY: Filter = |metadata| metadata.is_event();
+    /// Only events with a `message` field, as every fallback event has.
+    const WITH_MESSAGE: Filter = |metadata| metadata.fields().field("message").is_some();
+
+    /// A subscriber that records the events its `filter` lets through, and
+    /// counts them.
     struct Recorder {
-        accept: bool,
+        filter: Filter,
         recorded: Arc<AtomicUsize>,
     }
 
     impl Recorder {
-        fn new(accept: bool, recorded: &Arc<AtomicUsize>) -> Self {
+        fn new(filter: Filter, recorded: &Arc<AtomicUsize>) -> Self {
             Self {
-                accept,
+                filter,
                 recorded: Arc::clone(recorded),
             }
         }
@@ -278,7 +301,7 @@ mod tests {
             tracing::subscriber::Interest::sometimes()
         }
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            self.accept && metadata.target() == LOG_TARGET
+            (self.filter)(metadata)
         }
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
@@ -326,7 +349,7 @@ mod tests {
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice)
         });
-        tracing::subscriber::with_default(Recorder::new(false, &recorded), || {
+        tracing::subscriber::with_default(Recorder::new(NOTHING, &recorded), || {
             log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice)
         });
         assert!(
@@ -334,7 +357,7 @@ mod tests {
             "an event nobody recorded must not use up the only report"
         );
         // Logging is enabled: the next call says it, and only that one.
-        tracing::subscriber::with_default(Recorder::new(true, &recorded), || {
+        tracing::subscriber::with_default(Recorder::new(ON_TARGET, &recorded), || {
             log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice);
             log.note(GpuAlgorithm::PageRank, &CpuFallbackReason::NoDevice);
         });
@@ -343,11 +366,40 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_that_accepts_the_event_gets_every_report() {
+        // #1936 review: a subscriber that filters on event metadata must not
+        // be refused by the check made before the event.
+        for (name, filter) in [
+            ("events only", EVENTS_ONLY),
+            ("with a message", WITH_MESSAGE),
+        ] {
+            let log = FallbackLog::new();
+            let recorded = Arc::new(AtomicUsize::new(0));
+            tracing::subscriber::with_default(Recorder::new(filter, &recorded), || {
+                log.note(GpuAlgorithm::Lcc, &CpuFallbackReason::NoDevice);
+                log.note(
+                    GpuAlgorithm::Lcc,
+                    &CpuFallbackReason::KernelFailed("device lost".to_string()),
+                );
+                log.note(
+                    GpuAlgorithm::Lcc,
+                    &CpuFallbackReason::BelowThreshold {
+                        nodes: NODES,
+                        min_nodes: MIN_NODES,
+                    },
+                );
+            });
+            assert_eq!(recorded.load(Ordering::Relaxed), 3, "{name}");
+            assert!(log.has_reported(GpuAlgorithm::Lcc), "{name}");
+        }
+    }
+
+    #[test]
     fn a_per_call_reason_is_recorded_on_every_call() {
         let log = FallbackLog::new();
         let recorded = Arc::new(AtomicUsize::new(0));
         let reason = CpuFallbackReason::KernelFailed("device lost".to_string());
-        tracing::subscriber::with_default(Recorder::new(true, &recorded), || {
+        tracing::subscriber::with_default(Recorder::new(ON_TARGET, &recorded), || {
             log.note(GpuAlgorithm::Cdlp, &reason);
             log.note(GpuAlgorithm::Cdlp, &reason);
         });
@@ -477,7 +529,7 @@ mod tests {
         let view = triangle();
         // A report only counts once a subscriber records it.
         let recorded = Arc::new(AtomicUsize::new(0));
-        tracing::subscriber::with_default(Recorder::new(true, &recorded), || {
+        tracing::subscriber::with_default(Recorder::new(ON_TARGET, &recorded), || {
             crate::pagerank::page_rank(&view, crate::pagerank::PageRankConfig::default());
             crate::cdlp::cdlp(&view, &crate::cdlp::CdlpConfig::default());
             crate::lcc::local_clustering_coefficient(&view);
