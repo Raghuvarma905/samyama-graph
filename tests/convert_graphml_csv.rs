@@ -313,3 +313,42 @@ fn an_existing_dot_tmp_beside_the_output_is_left_alone() {
     assert!(graphml.exists());
     assert_eq!(std::fs::read(&graphml_tmp).unwrap(), b"mine");
 }
+
+/// A property name with `:` cannot be written in `neo4j-admin`'s header
+/// (`a:b` would read as property `a` of type `b`), so the column is left out
+/// and reported, and `require_lossless` refuses (review on #1942).
+#[test]
+fn a_property_name_with_a_colon_is_left_out_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = GraphStore::new();
+    let n = s.create_node("Thing");
+    s.set_node_property("default", n, "plain", "kept").unwrap();
+    s.set_node_property("default", n, "ns:name", "omitted")
+        .unwrap();
+    let input = dir.path().join("colon.sgsnap");
+    samyama::snapshot::write_file(&s, &input, &Default::default()).unwrap();
+
+    let out = dir.path().join("csv");
+    let report = convert(&input, &out, &Options::default()).unwrap();
+    let (header, rows) = read_csv(&out.join("nodes_Thing.csv"));
+    assert!(header.iter().any(|h| h == "plain:string"), "{header:?}");
+    assert!(!header.iter().any(|h| h.contains("ns")), "{header:?}");
+    assert!(!rows[0].iter().any(|c| c == "omitted"), "{rows:?}");
+    let omitted = report
+        .output
+        .dropped()
+        .iter()
+        .find(|d| d.what == "properties_with_a_colon_omitted")
+        .expect("reported");
+    assert_eq!(omitted.count, 1);
+    assert!(omitted.detail.contains("ns:name"), "{}", omitted.detail);
+
+    let strict = Options {
+        require_lossless: true,
+        ..Options::default()
+    };
+    let refused = dir.path().join("csv_strict");
+    let err = convert(&input, &refused, &strict).unwrap_err();
+    assert!(matches!(err, ConvertError::Lossy(_)), "{err}");
+    assert!(!refused.exists());
+}

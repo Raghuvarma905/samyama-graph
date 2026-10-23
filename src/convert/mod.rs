@@ -448,6 +448,15 @@ fn csv_losses(r: &crate::export::csv::GraphCsvReport) -> Vec<Dropped> {
             r.labels_containing_a_semicolon.join(", ")
         ),
     );
+    push(
+        "properties_with_a_colon_omitted",
+        r.properties_with_a_colon_omitted.len(),
+        format!(
+            "neo4j-admin reads `:` in a header as the start of the column type and has no \
+             escape for it, so these properties are not written: {}.",
+            r.properties_with_a_colon_omitted.join(", ")
+        ),
+    );
     out
 }
 

@@ -239,6 +239,11 @@ pub struct GraphCsvReport {
     pub temporal_values_written_as_text: usize,
     /// Labels containing `;`, the separator `neo4j-admin` reads between labels.
     pub labels_containing_a_semicolon: Vec<String>,
+    /// Properties left out because their name contains `:`, which
+    /// `neo4j-admin` reads as the start of the column's type (`a:b` would be
+    /// `a:b:string`), and its header has no escape for it. Listed as
+    /// `file:property`.
+    pub properties_with_a_colon_omitted: Vec<String>,
 }
 
 impl GraphCsvReport {
@@ -248,6 +253,7 @@ impl GraphCsvReport {
             && self.values_written_as_json == 0
             && self.temporal_values_written_as_text == 0
             && self.labels_containing_a_semicolon.is_empty()
+            && self.properties_with_a_colon_omitted.is_empty()
     }
 }
 
@@ -407,8 +413,16 @@ pub fn write_graph_dir(
                 }
             }
         }
+        // No header syntax carries a `:` in a name, so such a column is left
+        // out and reported rather than written unparseable.
+        for k in seen.keys().filter(|k| k.contains(':')) {
+            report
+                .properties_with_a_colon_omitted
+                .push(format!("{name}:{k}"));
+        }
         let types: BTreeMap<String, ColType> = seen
             .iter()
+            .filter(|(k, _)| !k.contains(':'))
             .map(|(k, held)| {
                 let ty = held[1..].iter().fold(held[0], |a, b| a.widen(*b));
                 if held.len() > 1 && ty == ColType::String {
@@ -436,5 +450,6 @@ pub fn write_graph_dir(
         report.files.push(name.clone());
     }
     report.columns_widened_to_string.sort();
+    report.properties_with_a_colon_omitted.sort();
     Ok(report)
 }
