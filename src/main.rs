@@ -963,8 +963,21 @@ fn cmd_convert(argv: &[String]) -> i32 {
             "output": { "path": output, "format": to.to_string(), "report": side(&report.output) },
             "lossless": report.lossless(),
         });
+        // Checked again now that the output exists and the report's directory
+        // has been made: both resolve to real files, so no spelling of either
+        // path can hide that they are the same one. The graph stays as written.
+        let report_path = std::path::Path::new(path);
+        if let Some(dir) = report_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        for (role, graph) in [("input", input), ("output", output)] {
+            if same_path(report_path, std::path::Path::new(graph)) {
+                eprintln!("convert: --report {path} is the {role} {graph}; the report was not written");
+                return 2;
+            }
+        }
         // Staged and renamed, so a symlink at the report path is replaced
-        // rather than followed onto a graph file the check above missed.
+        // rather than followed onto a graph file.
         let bytes = serde_json::to_vec_pretty(&json).unwrap_or_default();
         let written = write_staged(std::path::Path::new(path), |out| {
             std::io::Write::write_all(out, &bytes).map_err(|e| samyama::convert::ConvertError::Io { path: path.into(), source: e })
@@ -1052,8 +1065,10 @@ fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
             }
             base = base.parent()?;
         };
-        // What does not exist yet cannot be a symlink, so the rest of the path,
-        // `.` and `..` included, resolves by name.
+        // The rest is walked a component at a time. A `..` can climb back out
+        // of a missing directory into ones that exist, so wherever the path so
+        // far exists it is canonicalized again, and a symlink met there is
+        // followed (`new/../alias/x` with `alias -> real` is `real/x`).
         let tail = absolute.strip_prefix(base).ok()?;
         for part in tail.components() {
             match part {
@@ -1063,6 +1078,9 @@ fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
                 }
                 Component::Normal(name) => full.push(name),
                 Component::RootDir | Component::Prefix(_) => return None,
+            }
+            if let Ok(c) = std::fs::canonicalize(&full) {
+                full = c;
             }
         }
         Some(full)

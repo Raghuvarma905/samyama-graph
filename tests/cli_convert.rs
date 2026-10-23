@@ -386,3 +386,33 @@ fn the_report_replaces_a_symlink_instead_of_writing_through_it() {
         .contains("lossless"));
     assert_eq!(counts(&output), (2, 0));
 }
+
+/// A missing directory followed by `..` and then a symlinked directory still
+/// names the output: `new/../alias/out.sgsnap` with `alias -> real` is
+/// `real/out.sgsnap`, so a report there is refused and the graph is kept
+/// (review on #1939).
+#[cfg(unix)]
+#[test]
+fn a_report_alias_through_dotdot_and_a_symlinked_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "in.sgsnap", false);
+    std::fs::create_dir(dir.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("real", dir.path().join("alias")).unwrap();
+
+    let o = Command::new(env!("CARGO_BIN_EXE_samyama"))
+        .current_dir(dir.path())
+        .arg("convert")
+        .args([
+            input.to_str().unwrap(),
+            "new/../alias/out.sgsnap",
+            "--report",
+            "real/out.sgsnap",
+        ])
+        .output()
+        .expect("the samyama binary runs");
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let written = dir.path().join("real/out.sgsnap");
+    if written.exists() {
+        assert_eq!(counts(&written), (2, 0), "the graph, not the report");
+    }
+}
