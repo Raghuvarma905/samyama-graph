@@ -295,3 +295,42 @@ fn a_report_path_that_is_a_graph_path_is_refused() {
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(!fresh.exists());
 }
+
+/// An output whose directory does not exist yet still cannot be named by
+/// `--report` through another spelling, relative or absolute: the paths are
+/// resolved through their nearest existing ancestor (review on #1939).
+#[test]
+fn a_report_alias_beneath_a_missing_output_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = snapshot(dir.path(), "in.sgsnap", false);
+    let in_dir = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_samyama"))
+            .current_dir(dir.path())
+            .arg("convert")
+            .args(args)
+            .output()
+            .expect("the samyama binary runs")
+    };
+    let absolute = dir.path().join("new/out.sgsnap");
+
+    for (output, report) in [
+        ("new/out.sgsnap", absolute.to_str().unwrap()),
+        (absolute.to_str().unwrap(), "new/out.sgsnap"),
+        ("new/out.sgsnap", "new/../new/./out.sgsnap"),
+        ("new/deeper/../out.sgsnap", "./new/out.sgsnap"),
+    ] {
+        let o = in_dir(&[input.to_str().unwrap(), output, "--report", report]);
+        assert_eq!(code(&o), 2, "{output} / {report}: {}", stderr(&o));
+        assert!(!dir.path().join("new").exists(), "{output} / {report}");
+    }
+
+    // A report beside the output, not on it, is still fine.
+    let o = in_dir(&[
+        input.to_str().unwrap(),
+        "new/out.sgsnap",
+        "--report",
+        "new/report.json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(counts(&absolute), (2, 0));
+}

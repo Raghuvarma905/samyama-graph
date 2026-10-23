@@ -1007,15 +1007,36 @@ fn write_as(
 }
 
 /// Whether `a` and `b` name the same file: the same path once symlinks and
-/// `.`/`..` are resolved (for a file that does not exist yet, through its
-/// parent directory), or, on Unix, the same inode, which catches hard links.
+/// `.`/`..` are resolved, or, on Unix, the same inode, which catches hard
+/// links. A path that does not exist yet -- an output whose directory the
+/// writer will create -- is resolved through its nearest existing ancestor,
+/// with the rest normalized by name.
 fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     fn resolved(p: &std::path::Path) -> Option<std::path::PathBuf> {
-        if let Ok(full) = std::fs::canonicalize(p) {
-            return Some(full);
+        use std::path::Component;
+        let absolute = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().ok()?.join(p) };
+        // Walk up to the deepest ancestor that exists, so its symlinks resolve.
+        let mut base = absolute.as_path();
+        let mut full = loop {
+            if let Ok(c) = std::fs::canonicalize(base) {
+                break c;
+            }
+            base = base.parent()?;
+        };
+        // What does not exist yet cannot be a symlink, so the rest of the path,
+        // `.` and `..` included, resolves by name.
+        let tail = absolute.strip_prefix(base).ok()?;
+        for part in tail.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    full.pop();
+                }
+                Component::Normal(name) => full.push(name),
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
         }
-        let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-        Some(std::fs::canonicalize(parent).ok()?.join(p.file_name()?))
+        Some(full)
     }
     #[cfg(unix)]
     {
