@@ -224,6 +224,14 @@ fn placeholder_keeps_the_relationship_against_an_unresolved_node() {
 /// Floats, lists (mixed and nested) and nested maps survive the conversion
 /// exactly, on nodes and on relationships, and a file that carries only these
 /// converts losslessly (review on #1941).
+///
+/// Why this sits beside the importer test that expects `[{"a":1}]` to be
+/// refused: the store's rule, `graph::store::property_is_storable`, refuses a
+/// property whose value is a *list* holding a map, at any depth of nested
+/// lists, and accepts a property whose value is a *map* whatever it holds.
+/// Every complex value here is either a list without maps (`mixed`, `tags`)
+/// or a map at the top (`nested`, `meta`), so both tests hold; the last
+/// assertion below pins the refusal from this side too.
 #[test]
 fn floats_lists_nested_maps_and_relationship_properties_are_preserved() {
     use std::collections::HashMap;
@@ -301,4 +309,28 @@ fn floats_lists_nested_maps_and_relationship_properties_are_preserved() {
             ("score", P::Float(1.5))
         ]))
     );
+
+    // The rule the importer test pins, from this side: a list holding a map
+    // is refused by the store, so the conversion fails rather than stores it.
+    let refused = dir.path().join("refused.json");
+    std::fs::write(
+        &refused,
+        r#"{"type":"node","id":"x","labels":["Item"],"properties":{"bad":[{"a":1}]}}"#,
+    )
+    .unwrap();
+    assert!(convert(
+        &refused,
+        &dir.path().join("refused.sgsnap"),
+        &Options::default()
+    )
+    .is_err());
+    assert!(samyama::graph::store::property_is_storable(&P::Map(
+        HashMap::from([(
+            "inner".to_string(),
+            P::Array(vec![P::Integer(1), P::Map(HashMap::new())]),
+        )])
+    )));
+    assert!(!samyama::graph::store::property_is_storable(&P::Array(
+        vec![P::Map(HashMap::new())]
+    )));
 }
