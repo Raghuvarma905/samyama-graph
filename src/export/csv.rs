@@ -357,7 +357,12 @@ pub fn write_graph_dir(
     use std::io::Write;
 
     let mut report = GraphCsvReport::default();
-    let mut tables: BTreeMap<String, Table> = BTreeMap::new();
+    // Keyed by what each table *is* -- a node's sorted label set, or an
+    // edge's type -- not by its file name: file names are made file-safe and
+    // can coincide (`A_B`, `A B` and `A`+`B` all read `nodes_A_B.csv`), and
+    // two groups sharing a table would share its column types (review on
+    // #1942). `false` sorts node tables before edge tables.
+    let mut tables: BTreeMap<(bool, Vec<String>), Table> = BTreeMap::new();
 
     for node in store.all_nodes() {
         let mut labels: Vec<String> = node.labels.iter().map(|l| l.as_str().to_string()).collect();
@@ -367,12 +372,7 @@ pub fn write_graph_dir(
                 report.labels_containing_a_semicolon.push(l.clone());
             }
         }
-        let file = if labels.is_empty() {
-            "nodes__unlabelled.csv".to_string()
-        } else {
-            format!("nodes_{}.csv", labels.iter().map(|l| file_part(l)).collect::<Vec<_>>().join("_"))
-        };
-        let t = tables.entry(file).or_insert_with(|| Table {
+        let t = tables.entry((false, labels.clone())).or_insert_with(|| Table {
             fixed_header: vec![":ID", ":LABEL"],
             fixed: Vec::new(),
             props: Vec::new(),
@@ -384,7 +384,7 @@ pub fn write_graph_dir(
     for edge in store.all_edges() {
         let ty = edge.edge_type.as_str().to_string();
         let t = tables
-            .entry(format!("edges_{}.csv", file_part(&ty)))
+            .entry((true, vec![ty.clone()]))
             .or_insert_with(|| Table {
                 fixed_header: vec![":START_ID", ":END_ID", ":TYPE"],
                 fixed: Vec::new(),
@@ -395,11 +395,28 @@ pub fn write_graph_dir(
         report.edges_written += 1;
     }
 
-    // Node files first, then edge files: the order neo4j-admin is given them.
-    let mut names: Vec<&String> = tables.keys().collect();
-    names.sort_by_key(|n| (n.starts_with("edges_"), n.to_string()));
-    for name in names {
-        let t = &tables[name];
+    // One file per table, node files first, then edge files: the order
+    // neo4j-admin is given them. A name already taken gets `_2`, `_3`, ...
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    let mut files: Vec<(String, &Table)> = Vec::new();
+    for ((is_edge, parts), t) in &tables {
+        let stem = match (is_edge, parts.is_empty()) {
+            (false, true) => "nodes__unlabelled".to_string(),
+            (false, false) => format!(
+                "nodes_{}",
+                parts.iter().map(|l| file_part(l)).collect::<Vec<_>>().join("_")
+            ),
+            (true, _) => format!("edges_{}", file_part(&parts[0])),
+        };
+        let mut name = format!("{stem}.csv");
+        let mut n = 2;
+        while !used.insert(name.clone()) {
+            name = format!("{stem}_{n}.csv");
+            n += 1;
+        }
+        files.push((name, t));
+    }
+    for (name, t) in &files {
         // Every type each column held, then the one it is written as. A
         // column reported as widened held more than one type and ended as a
         // string; a long-and-double column is a double and loses nothing.

@@ -452,3 +452,65 @@ fn an_empty_string_is_quoted_and_an_absent_property_is_left_empty() {
         "an absent property is an empty field: {text}"
     );
 }
+
+/// Label groups and relationship types whose file names would coincide get
+/// files of their own, so each keeps its own column types (review on #1942):
+/// `A_B`, `A B` and `A`+`B` all make `nodes_A_B`, and `R_S` and `R S` both
+/// make `edges_R_S`.
+#[test]
+fn groups_whose_file_names_coincide_get_separate_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = GraphStore::new();
+    let under = s.create_node("A_B");
+    s.set_node_property("default", under, "x", 1i64).unwrap();
+    let spaced = s.create_node("A B");
+    s.set_node_property("default", spaced, "x", true).unwrap();
+    let both = s.create_node("A");
+    s.add_label_to_node("default", both, "B").unwrap();
+    s.set_node_property("default", both, "x", 2.5f64).unwrap();
+    let e1 = s.create_edge(under, spaced, "R_S").unwrap();
+    s.set_edge_property(e1, "w", 1i64).unwrap();
+    let e2 = s.create_edge(spaced, both, "R S").unwrap();
+    s.set_edge_property(e2, "w", "heavy").unwrap();
+    let input = dir.path().join("collide.sgsnap");
+    samyama::snapshot::write_file(&s, &input, &Default::default()).unwrap();
+
+    let out = dir.path().join("csv");
+    let report = convert(&input, &out, &Options::default()).unwrap();
+    assert!(
+        !report
+            .output
+            .dropped()
+            .iter()
+            .any(|d| d.what == "columns_widened_to_string"),
+        "no table mixes two groups' types: {:?}",
+        report.output.dropped()
+    );
+
+    // Each file holds one group; find it by its :LABEL / :TYPE cell.
+    let mut by_group: BTreeMap<String, String> = BTreeMap::new();
+    for entry in std::fs::read_dir(&out).unwrap() {
+        let path = entry.unwrap().path();
+        let (header, rows) = read_csv(&path);
+        assert_eq!(rows.len(), 1, "{path:?}: one row per group");
+        let group_col = header
+            .iter()
+            .position(|h| h == ":LABEL" || h == ":TYPE")
+            .unwrap();
+        let typed: Vec<&String> = header.iter().filter(|h| !h.starts_with(':')).collect();
+        by_group.insert(
+            rows[0][group_col].clone(),
+            typed
+                .iter()
+                .map(|h| h.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    assert_eq!(by_group.get("A_B").map(String::as_str), Some("x:long"));
+    assert_eq!(by_group.get("A B").map(String::as_str), Some("x:boolean"));
+    assert_eq!(by_group.get("A;B").map(String::as_str), Some("x:double"));
+    assert_eq!(by_group.get("R_S").map(String::as_str), Some("w:long"));
+    assert_eq!(by_group.get("R S").map(String::as_str), Some("w:string"));
+    assert_eq!(by_group.len(), 5);
+}
