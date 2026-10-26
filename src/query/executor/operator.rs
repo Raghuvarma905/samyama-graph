@@ -14605,6 +14605,12 @@ impl PhysicalOperator for CartesianProductOperator {
 }
 
 /// Join operator: Joins two inputs on a shared variable
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum HashJoinKey {
+    Identity(Vec<Value>),
+    Expression(Vec<JoinKey>),
+}
+
 pub struct JoinOperator {
     left: OperatorBox,
     right: OperatorBox,
@@ -14616,7 +14622,8 @@ pub struct JoinOperator {
     /// therefore whether the answer was right — varied between runs of the same query on
     /// the same data (#360).
     join_vars: Vec<String>,
-    left_records: HashMap<Vec<Value>, Vec<Record>>,
+    expression_keys: Vec<(Expression, Expression)>,
+    left_records: HashMap<HashJoinKey, Vec<Record>>,
     right_records: Vec<Record>,
     current_right_index: usize,
     current_left_list_index: usize,
@@ -14646,6 +14653,7 @@ impl JoinOperator {
             left,
             right,
             join_vars,
+            expression_keys: Vec::new(),
             left_records: HashMap::new(),
             right_records: Vec::new(),
             current_right_index: 0,
@@ -14656,6 +14664,27 @@ impl JoinOperator {
         }
     }
 
+    /// Property-expression keys use Cypher equality rather than Value hashing.
+    pub fn on_expressions(left: OperatorBox, right: OperatorBox, keys: Vec<(Expression, Expression)>) -> Self {
+        let mut join = Self::new(left, right, Vec::new());
+        join.expression_keys = keys;
+        join
+    }
+
+    fn hash_key(&self, record: &Record, right: bool, store: &GraphStore) -> ExecutionResult<Option<HashJoinKey>> {
+        if self.expression_keys.is_empty() {
+            return Ok(Self::key_of(record, &self.join_vars).map(HashJoinKey::Identity));
+        }
+        let mut parts = Vec::with_capacity(self.expression_keys.len());
+        for (left_expr, right_expr) in &self.expression_keys {
+            let value = eval_expression(if right { right_expr } else { left_expr }, record, store)?;
+            let Value::Property(property) = value else { return Ok(None) };
+            let Some(key) = join_key_of(&property) else { return Ok(None) };
+            parts.push(key);
+        }
+        Ok(Some(HashJoinKey::Expression(parts)))
+    }
+
     fn materialize(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         if self.materialized {
             return Ok(());
@@ -14664,7 +14693,7 @@ impl JoinOperator {
         // Materialize left into a hash map (with periodic timeout check)
         let mut count = 0u64;
         while let Some(record) = self.left.next(store)? {
-            if let Some(key) = Self::key_of(&record, &self.join_vars) {
+            if let Some(key) = self.hash_key(&record, false, store)? {
                 self.left_records.entry(key).or_default().push(record);
             }
             count += 1;
@@ -14703,7 +14732,7 @@ impl PhysicalOperator for JoinOperator {
 
         while self.current_right_index < self.right_records.len() {
             let right_record = &self.right_records[self.current_right_index];
-            if let Some(join_key) = Self::key_of(right_record, &self.join_vars) {
+            if let Some(join_key) = self.hash_key(right_record, true, store)? {
                 if let Some(left_list) = self.left_records.get(&join_key) {
                     if self.current_left_list_index < left_list.len() {
                         let left_record = &left_list[self.current_left_list_index];
@@ -14733,7 +14762,7 @@ impl PhysicalOperator for JoinOperator {
 
         while results.len() < batch_size && self.current_right_index < self.right_records.len() {
             let right_record = &self.right_records[self.current_right_index];
-            if let Some(join_key) = Self::key_of(right_record, &self.join_vars) {
+            if let Some(join_key) = self.hash_key(right_record, true, store)? {
                 if let Some(left_list) = self.left_records.get(&join_key) {
                     let take = (batch_size - results.len()).min(left_list.len() - self.current_left_list_index);
                     
@@ -14819,8 +14848,8 @@ impl PhysicalOperator for JoinOperator {
 
     fn describe(&self) -> OperatorDescription {
         OperatorDescription {
-            name: "HashJoin".to_string(),
-            details: format!("on={}", self.join_vars.join(",")),
+            name: if self.expression_keys.is_empty() { "HashJoin" } else { "ExpressionHashJoin" }.to_string(),
+            details: if self.expression_keys.is_empty() { format!("on={}", self.join_vars.join(",")) } else { format!("on={:?}", self.expression_keys) },
             children: vec![self.left.describe(), self.right.describe()],
         }
     }

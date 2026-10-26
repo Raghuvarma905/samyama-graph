@@ -2361,7 +2361,7 @@ impl QueryPlanner {
                         ) {
                             Ok(lookup) => lookup,
                             Err(existing) => {
-                                Box::new(CartesianProductOperator::new(existing, match_op)) as OperatorBox
+                                Self::join_disjoint(existing, match_op, &known_vars, &clause_vars, &cross_match_predicates, query.limit.is_none())
                             }
                         }
                     }
@@ -2910,8 +2910,7 @@ impl QueryPlanner {
                                     store,
                                 ) {
                                     Ok(lookup) => lookup,
-                                    Err(existing) => Box::new(CartesianProductOperator::new(existing, match_op))
-                                        as OperatorBox,
+                                    Err(existing) => Self::join_disjoint(existing, match_op, &known_vars, &clause_vars, &cross_match_preds, query.limit.is_none()),
                                 }
                             }
                         }
@@ -6420,6 +6419,41 @@ impl QueryPlanner {
     /// n.id = x.id`): the `lookup_chain` over the cross-clause predicates, the
     /// ones it used taken out of `cross_preds`. `existing` comes back when the
     /// shape does not apply.
+    /// Disjoint inner patterns may join on top-level property equalities.
+    /// Retain the predicates as filters, and leave OPTIONAL/OR/NOT unchanged.
+    fn join_disjoint(
+        left: OperatorBox,
+        right: OperatorBox,
+        left_vars: &HashSet<String>,
+        right_vars: &HashSet<String>,
+        predicates: &[Expression],
+        allow_hash: bool,
+    ) -> OperatorBox {
+        let mut keys = Vec::new();
+        if allow_hash {
+            for predicate in predicates {
+                for conjunct in flatten_and_predicates(predicate) {
+                    if let Expression::Binary { left, op: BinaryOp::Eq, right } = conjunct {
+                        if let (Expression::Property { variable: a, .. }, Expression::Property { variable: b, .. }) = (&*left, &*right) {
+                            if left_vars.contains(a) && right_vars.contains(b) {
+                                keys.push((*left, *right));
+                            } else if left_vars.contains(b) && right_vars.contains(a) {
+                                keys.push((*right, *left));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // With LIMIT a lazy filtered product can stop early, whereas the hash
+        // join materializes both inputs. Preserve that cheaper startup plan.
+        if keys.is_empty() {
+            Box::new(CartesianProductOperator::new(left, right))
+        } else {
+            Box::new(JoinOperator::on_expressions(left, right, keys))
+        }
+    }
+
     fn try_correlated_index_lookup(
         existing: OperatorBox,
         match_clause: &MatchClause,
