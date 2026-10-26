@@ -285,13 +285,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("dataset: deterministic synthetic anchors; NOT LDBC SF1");
         for (anchor, count) in [(1i64,5usize),(2,142),(3,920)] {
             let p=graph.create_node("Person");
-            graph.get_node_mut(p).unwrap().set_property("id",anchor);
+            graph.set_node_property("default",p,"id",anchor)?;
             for i in 0..count {
                 let f=graph.create_node("Person");
-                let n=graph.get_node_mut(f).unwrap();
-                n.set_property("id",anchor*10000+i as i64);
-                n.set_property("firstName",format!("name{:04}",(i*73)%count));
-                n.set_property("lastName",format!("family{:04}",(i*37)%count));
+                // Match the real LDBC loader's column-backed property path.
+                graph.set_node_property("default",f,"id",anchor*10000+i as i64)?;
+                graph.set_node_property("default",f,"firstName",format!("name{:04}",(i*73)%count))?;
+                graph.set_node_property("default",f,"lastName",format!("family{:04}",(i*37)%count))?;
                 graph.create_edge(p,f,"KNOWS")?;
             }
         }
