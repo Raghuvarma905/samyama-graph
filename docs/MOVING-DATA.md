@@ -1,6 +1,6 @@
 # Moving data in and out
 
-Verified against v1.12.0 · `samyama convert` (#1905)
+Current converter support on this branch · `samyama convert` (#1905)
 
 Every route in and out of Samyama goes through one file format, `.sgsnap`, in
 two steps:
@@ -16,7 +16,7 @@ curl -X POST http://localhost:8080/api/snapshot/import -F file=@graph.sgsnap
 
 # Out: a running server -> a snapshot -> someone else's format
 curl -X POST http://localhost:8080/api/snapshot/export -o graph.sgsnap
-samyama convert graph.sgsnap graph.ttl
+samyama convert graph.sgsnap copy.sgsnap
 ```
 
 Keeping the two apart is deliberate. A conversion can be run, checked and
@@ -38,13 +38,13 @@ README's copy of it to the code.
 | Format | Extensions | Read | Write |
 |---|---|---|---|
 | `.sgsnap` | `.sgsnap` | yes | yes |
-| Turtle | `.ttl` | yes | yes |
-| N-Triples | `.nt` | yes | yes |
-| RDF/XML | `.rdf`, `.owl`, `.xml` | yes | yes |
-| JSON-LD | `.jsonld` | no | yes |
+| Turtle | `.ttl` | no | no |
+| N-Triples | `.nt` | no | no |
+| RDF/XML | `.rdf`, `.owl`, `.xml` | no | no |
+| JSON-LD | `.jsonld` | no | no |
 | Neo4j `apoc.export.json` | `.json` | yes | no |
-| GraphML | `.graphml` | no | yes |
-| CSV directory (`neo4j-admin import` layout) | a path with no extension | no | yes |
+| GraphML | `.graphml` | no | no |
+| CSV directory (`neo4j-admin import` layout) | a path with no extension | no | no |
 
 Every conversion has `.sgsnap` at one end or the other. Convert A → B as
 A → `.sgsnap` → B, so each step's losses are reported separately.
@@ -61,7 +61,6 @@ graph, and named graphs would be dropped.
 ```bash
 samyama convert <input> <output> [--from FMT] [--to FMT]
                                  [--missing-endpoints fail|placeholder|drop]
-                                 [--mapping mapping.yaml | --preset generic|skos|owl|samyama]
                                  [--report report.json] [--require-lossless]
 samyama convert --formats
 ```
@@ -73,8 +72,6 @@ samyama convert --formats
   id. `drop` leaves the relationship out and reports it. `placeholder` keeps
   it against an `Unresolved` node holding the missing id as `neo4j_id`, which
   is also reported.
-- `--mapping` and `--preset` say how RDF input becomes a property graph. See
-  below.
 - `--report` writes what each step read, wrote and dropped as JSON. It is
   refused (exit 2) when it names the input or the output, under any spelling
   of the path.
@@ -95,85 +92,17 @@ samyama convert --formats
 
 ---
 
-## Loss reports
+## Pending converter extensions
 
-A conversion either carries something or says it did not. Each step's
-report lists what it dropped. Each entry has a `what` you can branch on, a
-`count`, and a sentence on what it means for the result:
+RDF mapping and presets (#1952), RDF input/output (#1954), and GraphML/CSV
+output (#1942) are separate pull requests. Their commands and loss-report
+fields are not available at this branch's head. Use `samyama convert --formats`
+to inspect the capabilities of the binary you actually run; do not assume
+that a v1.12.0 version string includes these pending extensions.
 
-```json
-{"what": "attributes_widened_to_string", "count": 1,
- "detail": "GraphML declares one type per attribute; these held more than one and are written as text: node.flag."}
-```
-
-An empty list means that step lost nothing the format can hold. The entries
-you will meet most:
-
-| Step | `what` | Means |
-|---|---|---|
-| any → `.sgsnap` | `edge_creation_timestamps` | Relationships carry no creation time in a snapshot; nodes do. |
-| Neo4j → | `dangling_relationships`, `unresolved_endpoints` | A relationship whose endpoint the export left out, dropped or kept against a placeholder. |
-| Neo4j → | `null_properties`, `unknown_record_types`, `unparseable_lines` | A JSON null (Neo4j cannot store one), a record type not read, a line that is not JSON. |
-| RDF → | `rdf_predicates_dropped` | Triples the mapping drops (`drop:`), or whose object it cannot use. The predicates are named. |
-| RDF → | `rdf_languages_dropped`, `rdf_decimals_as_float`, `rdf_literals_as_string`, `rdf_datatypes_normalized` | Language, number and datatype detail that does not survive as typed graph values. |
-| RDF → | `rdf_edge_predicates_ambiguous`, `rdf_term_kinds_mixed`, `rdf_blank_nodes_shared`, `rdf_blank_node_cycles` | What the graph holds but cannot write back as the same RDF: one relationship type from several predicates, a key holding both IRIs and text, a blank node inlined under several parents or inside itself. |
-| → GraphML | `attributes_widened_to_string`, `values_written_as_json`, `temporal_values_written_as_text`, `labels_containing_a_space` | GraphML declares one type per attribute and has no list, map or temporal type. |
-| → CSV | `columns_widened_to_string`, `labels_containing_a_semicolon`, `properties_with_a_colon_omitted` | The same for `neo4j-admin`'s header, plus what its header syntax cannot name. |
-| → RDF | `rdf_edge_properties_not_written`, `rdf_values_as_json` | Relationship properties have no RDF form under a mapping, and values with no XSD type are written as Samyama JSON literals. |
-
-`--require-lossless` turns any entry into exit 1, the form to use in a
-script. In a library call (`samyama_convert::Options::require_lossless`) a
-lossy step is refused *before* its output is published. An existing file is
-left as it was.
-
----
-
-## RDF: the mapping file and its presets
-
-RDF has no single correct property-graph form, so the choices are written
-down in a YAML mapping file laid over a preset:
-
-| Preset | For | What it does |
-|---|---|---|
-| `generic` (default) | any RDF | `rdf:type` → label by local name, literal → property, IRI → relationship type upper-cased (`SUB_CLASS_OF`), blank node → node; a local name two namespaces share falls back to `prefix_name` and is reported |
-| `skos` | SKOS vocabularies | `Concept`, `prefLabel` / `altLabel` / `definition` / `notation`, `broader` → `BROADER`, `narrower` → `BROADER` the other way round, `related`, `exactMatch`, `closeMatch`; `inScheme` dropped and reported |
-| `owl` | OWL ontologies | `Class`, `Property`, `SUBCLASS_OF`, `DOMAIN`, `RANGE`, `EQUIVALENT`; restrictions inline as maps |
-| `samyama` | Samyama's own RDF export | exactly the engine's mapper, so Samyama → RDF → Samyama is an identity |
-
-A file overrides any part of its preset:
-
-```yaml
-preset: skos
-prefixes: { cso: "http://cso.kmi.open.ac.uk/schema/cso#" }
-labels: { "cso:Topic": Concept }
-edges:
-  "cso:superTopicOf": { type: BROADER, reverse: true }
-merge: { predicate: "cso:preferentialEquivalent", into: object, aliases_property: aliases }
-languages: { prefer: en, others: suffix }   # others: suffix | map | drop
-multi_valued: list                          # list | first | error
-blank_nodes: node                           # node | inline | drop
-drop: [ "skos:inScheme" ]
-```
-
-`aliases_property` must name a key no predicate fills: a node with both
-merged aliases and its own values for that key is refused rather than one
-silently replacing the other.
-
-`src/convert/presets/` holds the presets, and
-`src/convert/presets/examples/cso.yaml` maps the Computer Science Ontology.
-
-**The mapping travels with the graph.** Reading RDF records the source in the
-snapshot header (`sources[]`): the file name, its SHA-256, the converter, and
-the resolved mapping with the names it actually applied. Writing that
-snapshot back to RDF uses them to undo the mapping:
-- labels and keys go back to the classes and predicates they came from, and
-  reversed edges are re-reversed;
-- merged aliases come back as their own subjects;
-- blank nodes come back as blank nodes.
-
-Under `generic`, Turtle → `.sgsnap` → Turtle gives back the same graph, and
-the tests compare the two blank-node-aware. A snapshot of a graph that never
-was RDF is written in Samyama's own RDF form.
+For the supported Neo4j route, review the JSON report for null properties,
+unknown records, malformed lines, and missing endpoints before importing the
+snapshot. `--require-lossless` exits 1 when a conversion reports a loss.
 
 ---
 
