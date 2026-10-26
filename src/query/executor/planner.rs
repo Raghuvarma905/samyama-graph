@@ -2361,7 +2361,7 @@ impl QueryPlanner {
                         ) {
                             Ok(lookup) => lookup,
                             Err(existing) => {
-                                Self::join_disjoint(existing, match_op, &known_vars, &clause_vars, &cross_match_predicates, query.limit.is_none())
+                                Self::join_disjoint(existing, match_op, &known_vars, &clause_vars, &cross_match_predicates, query.limit.is_none(), store)
                             }
                         }
                     }
@@ -2910,7 +2910,7 @@ impl QueryPlanner {
                                     store,
                                 ) {
                                     Ok(lookup) => lookup,
-                                    Err(existing) => Self::join_disjoint(existing, match_op, &known_vars, &clause_vars, &cross_match_preds, query.limit.is_none()),
+                                    Err(existing) => Self::join_disjoint(existing, match_op, &known_vars, &clause_vars, &cross_match_preds, query.limit.is_none(), store),
                                 }
                             }
                         }
@@ -6422,12 +6422,13 @@ impl QueryPlanner {
     /// Disjoint inner patterns may join on top-level property equalities.
     /// Retain the predicates as filters, and leave OPTIONAL/OR/NOT unchanged.
     fn join_disjoint(
-        left: OperatorBox,
-        right: OperatorBox,
+        mut left: OperatorBox,
+        mut right: OperatorBox,
         left_vars: &HashSet<String>,
         right_vars: &HashSet<String>,
         predicates: &[Expression],
         allow_hash: bool,
+        store: &GraphStore,
     ) -> OperatorBox {
         let mut keys = Vec::new();
         if allow_hash {
@@ -6447,7 +6448,16 @@ impl QueryPlanner {
         }
         // With LIMIT a lazy filtered product can stop early, whereas the hash
         // join materializes both inputs. Preserve that cheaper startup plan.
-        if keys.is_empty() {
+        fn estimate(op: &mut OperatorBox, store: &GraphStore) -> Option<f64> {
+            let children: Vec<Option<f64>> = op.children_mut().into_iter()
+                .map(|child| estimate(child, store)).collect();
+            op.estimate_rows(store, &children)
+        }
+        let product_is_cheaper = match (estimate(&mut left, store), estimate(&mut right, store)) {
+            (Some(l), Some(r)) => l * r <= l + r,
+            _ => false,
+        };
+        if keys.is_empty() || product_is_cheaper {
             Box::new(CartesianProductOperator::new(left, right))
         } else {
             Box::new(JoinOperator::on_expressions(left, right, keys))
