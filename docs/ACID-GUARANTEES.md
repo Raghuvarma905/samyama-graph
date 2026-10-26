@@ -114,6 +114,28 @@ modules of `src/protocol/server.rs` (RESP) and `src/http/transactions.rs` (HTTP)
     | vm-1 (i7-13620H, local NVMe) | 419,199 /s | **420×** (404–450) | 208× |
     | Vultr `voc-c-8c` (8 dedicated vCPU, virtio disk) | 174,757 /s | **120×** | 66× |
 
+    **Measured under glibc malloc, not the allocator the server ships.** These
+    figures were taken on 2026-09-21 (#1407); `examples/fsync_cost.rs` did not
+    declare `#[global_allocator]` until 2026-10-04 (#1820), so both arms ran on
+    glibc while the server runs mimalloc (ADR-038). What this costs the two
+    kinds of number here is not the same, and the distinction is the reason
+    this note is not a retraction:
+
+    - **The ratios — 420×, 208×, 120×, 66× — are the part to keep.** Both arms
+      of every pair were measured in the same configuration on the same host,
+      so the allocator is common to numerator and denominator and largely
+      divides out. An fsync is a syscall that waits on a device; it does not
+      allocate in proportion to the write rate.
+    - **The absolute unsynced baselines — 419,199 /s and 174,757 /s — are the
+      part to re-measure.** They are throughput of the allocation-heavy path,
+      measured on the allocator nobody runs, and #1818's own re-measurement of
+      a different probe moved a per-row figure by 28× when the allocator
+      changed. No claim is made here about which direction these move.
+
+    Re-measuring is bounded by the hosts: the table names them, and a figure
+    from a third host would confound the allocator change with the hardware
+    change and could not be compared with what it replaced. Tracked in #1818.
+
     The vm-1 both-barriers figure is the median of **five alternated pairs**,
     and the range beside it is what those five spanned. Alternation is not a
     refinement: RocksDB's `WriteOptions` are fixed when the database is opened,

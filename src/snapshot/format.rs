@@ -50,10 +50,38 @@ pub struct SnapshotHeader {
     /// reason the catalog is one: the body format does not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<QueriesRef>,
+    /// Where this snapshot's data came from and how it was mapped (#1911):
+    /// one entry per input a converter read, so a converted file explains
+    /// itself and can be converted back. A list, because two converted files
+    /// imported into one tenant and exported again keep both.
+    ///
+    /// Additive like `queries` and `read_only`: absent from a file written
+    /// without it, and a header with none serializes exactly as before. The
+    /// format version stays 2.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SnapshotSource>,
 }
 
 /// Where a snapshot's sidecar -- its query catalog (#1154) or its materialized
 /// results (#1158) -- lives, and what its bytes hash to.
+/// One input a snapshot's data was converted from (#1911).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotSource {
+    /// The input format, as the converter names it: `"turtle"`, `"neo4j-json"`.
+    pub format: String,
+    /// The input's bare file name, not a path: a path names a directory on
+    /// the machine that converted it, which means nothing to a reader (the
+    /// same reason as [`QueriesRef::file`]).
+    pub file: String,
+    /// SHA-256 of the input as it was read, lower-case hex.
+    pub sha256: String,
+    /// What converted it, with its version: `"samyama-convert 1.12.0"`.
+    pub converter: String,
+    /// The resolved mapping, prefixes expanded (#1910), when one applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueriesRef {
     /// File name of the catalog, resolved against the snapshot's own directory.

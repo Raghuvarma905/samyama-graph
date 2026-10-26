@@ -142,6 +142,7 @@ pub mod nlq;
 pub mod agent;
 pub mod migrate;
 pub mod snapshot;
+pub mod convert;
 pub use auth::{Credential, Secret, Role, read_credentials};
 pub mod optimization;
 

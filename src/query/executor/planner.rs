@@ -79,6 +79,9 @@ pub struct PlanDiagnostics {
     pub candidates_evaluated: usize,
     pub chosen_plan_cost: f64,
     pub candidate_costs: Vec<(String, f64)>,
+    /// The candidate that runs, counting from 0: the cheapest unless
+    /// `CYPHER plan=N` forced another (#1616).
+    pub chosen: usize,
 }
 
 thread_local! {
@@ -834,6 +837,18 @@ pub struct QueryPlanner {
     /// (#1675). Set per `plan` call, like `trail_enumeration`, because the scan
     /// choices sit in builders that never see the `Query`.
     hints: std::sync::Mutex<(Vec<PlanHint>, HashSet<String>)>,
+    /// The query's `CYPHER planner=… plan=N` options (#1616), set per `plan`
+    /// call for the same reason as `hints`.
+    forcing: std::sync::Mutex<Forcing>,
+}
+
+/// `CYPHER` options in force for the query being planned (#1616).
+#[derive(Debug, Default)]
+struct Forcing {
+    /// `Some` when the query named a planner; otherwise the config decides.
+    graph_native: Option<bool>,
+    /// The candidate each MATCH runs, counting from 1.
+    plan: Option<usize>,
 }
 
 /// Project a `RETURN` list, building an aggregation when any item aggregates.
@@ -892,6 +907,7 @@ impl QueryPlanner {
             config: PlannerConfig::default(),
             trail_enumeration: std::sync::atomic::AtomicBool::new(false),
             hints: std::sync::Mutex::new((Vec::new(), HashSet::new())),
+            forcing: std::sync::Mutex::new(Forcing::default()),
         }
     }
 
@@ -902,6 +918,7 @@ impl QueryPlanner {
             config,
             trail_enumeration: std::sync::atomic::AtomicBool::new(false),
             hints: std::sync::Mutex::new((Vec::new(), HashSet::new())),
+            forcing: std::sync::Mutex::new(Forcing::default()),
         }
     }
 
@@ -1255,6 +1272,25 @@ impl QueryPlanner {
     }
 
     pub fn plan(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
+        use crate::query::ast::PlannerChoice;
+        // Diagnostics are left for EXPLAIN to take; a query that ran without
+        // EXPLAIN would otherwise leave its candidates for the next one to print.
+        PLAN_DIAGNOSTICS.with(|d| d.borrow_mut().take());
+        let options = &query.plan_options;
+        *self.forcing.lock().unwrap() = Forcing {
+            graph_native: match options.planner {
+                Some(PlannerChoice::Cost) => Some(true),
+                Some(PlannerChoice::Legacy) => Some(false),
+                None => options.plan.map(|_| true),
+            },
+            plan: options.plan,
+        };
+        let plan = self.plan_with_hints(query, store);
+        *self.forcing.lock().unwrap() = Forcing::default();
+        plan
+    }
+
+    fn plan_with_hints(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
         if query.hints.is_empty() {
             self.hints.lock().unwrap().0.clear();
             return self.plan_unhinted(query, store);
@@ -1650,6 +1686,14 @@ impl QueryPlanner {
             });
         }
 
+        if let Some(ddl) = &query.point_index_ddl {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::point_ops::PointIndexDdlOperator::new(ddl.clone())),
+                output_columns: vec![],
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
         if let Some(clause) = &query.drop_fulltext_index_clause {
             return Ok(ExecutionPlan {
                 root: Box::new(DropFullTextIndexOperator::new(clause.index_name.clone())),
@@ -1744,44 +1788,32 @@ impl QueryPlanner {
         // is still row-driven, and planning it here runs the MERGE once with
         // nothing bound. It falls through to the general path, where the
         // Unwind feeds the merge.
+        //
+        // `LOAD CSV` and `LOAD PARQUET` are row sources too, and the CREATE-only
+        // branch below already excludes them. This one did not, so
+        // `LOAD CSV ... AS row MERGE (:N {name: row.name})` -- the standard
+        // idempotent bulk load -- planned the MERGE alone, never opened the
+        // file, and failed with "Variable not found: row" (#1895).
         if query.match_clauses.is_empty()
             && query.call_clause.is_none()
             && !Self::has_any_unwind(query)
+            && query.load_csv_clause.is_none()
+            && query.load_parquet_clause.is_none()
         {
             if let Some(merge_clause) = &query.merge_clause {
-                let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
-                    .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-                    .collect();
-                let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
-                    .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-                    .collect();
-                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause.on_create_labels.iter()
-                    .map(|l| (l.variable.clone(), l.labels.clone()))
-                    .collect();
-                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause.on_match_labels.iter()
-                    .map(|l| (l.variable.clone(), l.labels.clone()))
-                    .collect();
-
-                // `ON CREATE SET n = {…}` / `n += {…}` (#874).
-                let on_create_entity: Vec<(String, bool, Expression)> = merge_clause
-                    .on_create_entity_set
-                    .iter()
-                    .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                    .collect();
-                let on_match_entity: Vec<(String, bool, Expression)> = merge_clause
-                    .on_match_entity_set
-                    .iter()
-                    .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                    .collect();
+                // `ON CREATE` / `ON MATCH` items in the order written (#1919).
                 let mut operator: OperatorBox = Box::new(
                     MergeOperator::new(
                         merge_clause.pattern.clone(),
-                        on_create,
-                        on_match,
-                        on_create_labels,
-                        on_match_labels,
+                        Vec::new(),
+                        Vec::new(),
+                        merge_labels(&merge_clause.on_create),
+                        merge_labels(&merge_clause.on_match),
                     )
-                    .with_entity_sets(on_create_entity, on_match_entity),
+                    .with_ordered_sets(
+                        merge_writes(&merge_clause.on_create),
+                        merge_writes(&merge_clause.on_match),
+                    ),
                 );
 
                 // `MERGE p = (...)` binds `p` (#876).
@@ -1796,16 +1828,12 @@ impl QueryPlanner {
                 // A bare `SET` after MERGE applies on both branches, unlike ON CREATE /
                 // ON MATCH. It parsed but was dropped here, so `MERGE (m) SET m.x = 1`
                 // silently left the property unset.
+                //
+                // Through `attach_set` like every other SET: this path used to
+                // keep only the `n.prop = v` items, so `MERGE (m) SET m = {…}`
+                // and `SET m:Label` were dropped without a word.
                 if !query.set_clauses.is_empty() {
-                    let items: Vec<(String, String, Expression)> = query
-                        .set_clauses
-                        .iter()
-                        .flat_map(|sc| sc.items.iter())
-                        .map(|item| {
-                            (item.variable.clone(), item.property.clone(), item.value.clone())
-                        })
-                        .collect();
-                    operator = Box::new(SetPropertyOperator::new(operator, items));
+                    operator = Self::attach_set(operator, &query.set_clauses);
                 }
 
                 let mut output_columns = Vec::new();
@@ -3758,6 +3786,54 @@ impl QueryPlanner {
             )));
         }
 
+        if call_clause.procedure_name.eq_ignore_ascii_case("db.index.point.nearest") {
+            // (label, property, point, k) YIELD node, distance (#1618).
+            let args = &call_clause.arguments;
+            if args.len() != 4 {
+                return Err(ExecutionError::PlanningError(
+                    "db.index.point.nearest takes (label, property, point, k)".to_string(),
+                ));
+            }
+            let lit = |e: &Expression, what: &str| -> ExecutionResult<String> {
+                match e {
+                    Expression::Literal(PropertyValue::String(s)) => Ok(s.clone()),
+                    _ => Err(ExecutionError::PlanningError(format!(
+                        "db.index.point.nearest: the {what} must be a string literal"
+                    ))),
+                }
+            };
+            let label = lit(&args[0], "label")?;
+            let property = lit(&args[1], "property")?;
+            let centre = match super::operator::eval_expression(&args[2], &super::Record::new(), store)? {
+                super::Value::Property(v) => v,
+                _ => {
+                    return Err(ExecutionError::PlanningError(
+                        "db.index.point.nearest: the third argument must be a point".to_string(),
+                    ))
+                }
+            };
+            let k = match &args[3] {
+                Expression::Literal(PropertyValue::Integer(i)) if *i >= 0 => *i as usize,
+                _ => {
+                    return Err(ExecutionError::PlanningError(
+                        "db.index.point.nearest: k must be a non-negative integer literal".to_string(),
+                    ))
+                }
+            };
+            let mut node_var = "node".to_string();
+            let mut distance_var = None;
+            for item in &call_clause.yield_items {
+                if item.name == "node" {
+                    node_var = item.alias.clone().unwrap_or_else(|| item.name.clone());
+                } else if item.name == "distance" {
+                    distance_var = Some(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+                }
+            }
+            return Ok(Box::new(super::point_ops::PointNearestOperator::new(
+                label, property, centre, k, node_var, distance_var,
+            )));
+        }
+
         if call_clause.procedure_name == "db.index.vector.queryNodes" {
             // Two spellings of the same call, because the name is Neo4j's (#1041):
             //
@@ -3903,11 +3979,29 @@ impl QueryPlanner {
             // user already trusts, so it is refused -- but refused with the
             // reason, because "Unknown procedure" sends the reader looking for
             // an algorithm that is in fact right there (INT-04).
+            //
+            // `write` has an equivalent here, under its own name: it returns
+            // the rows rather than GDS's one summary row, so it is not aliased
+            // onto `.write`; the refusal names it (ALGO-06).
+            let instead = if mode.eq_ignore_ascii_case("write") {
+                format!(
+                    "To store the result on each node, call `algo.{bare}({{{}: \
+                     'name'}})`; it streams the rows as well.",
+                    AlgorithmOperator::WRITE_PROPERTY_KEY
+                )
+            } else {
+                format!("Call `gds.{bare}.stream` or `algo.{bare}` and write the result yourself with SET.")
+            };
             Err(ExecutionError::unknown_procedure(format!(
                 "`{}` is not supported: this engine streams results, and GDS's \
-                 `{}` mode writes them. Call `gds.{}.stream` or `algo.{}` and \
-                 write the result yourself with SET.",
-                call_clause.procedure_name, mode, bare, bare
+                 `{}` mode {}. {instead}",
+                call_clause.procedure_name,
+                mode,
+                match mode.to_ascii_lowercase().as_str() {
+                    "write" => "returns a summary row instead",
+                    "mutate" => "writes them into a graph projection, and there are no projections here yet",
+                    _ => "returns a summary instead of the rows",
+                }
             )))
         } else if call_clause.procedure_name.starts_with("algo.")
             || call_clause.procedure_name.starts_with("gds.")
@@ -4277,8 +4371,29 @@ impl QueryPlanner {
     }
 
     fn dispatch_plan_match_inner(&self, match_clause: &MatchClause, where_clause: Option<&WhereClause>, store: &GraphStore) -> ExecutionResult<OperatorBox> {
-        if self.config.graph_native {
-            match self.plan_match_native(match_clause, where_clause, store) {
+        let (graph_native, forced) = {
+            let f = self.forcing.lock().unwrap();
+            (f.graph_native.unwrap_or(self.config.graph_native), f.plan)
+        };
+        if let Some(n) = forced {
+            // A pattern the enumerator cannot plan has the one plan the
+            // default planner gives it, so `plan=1` is that plan and any
+            // other number does not exist. Refused rather than run as plan 1:
+            // a harness comparing "plan 2" with plan 1 would be comparing a
+            // plan with itself and could never fail.
+            if let Some(why) = Self::not_enumerable(match_clause) {
+                if n == 1 {
+                    return self.plan_match(match_clause, where_clause, store);
+                }
+                return Err(ExecutionError::PlanningError(format!(
+                    "cannot honour CYPHER plan={n}: this MATCH has one plan, because the \
+                     cost-based enumerator does not plan {why}"
+                )));
+            }
+            return self.plan_match_native(match_clause, where_clause, store, n - 1);
+        }
+        if graph_native {
+            match self.plan_match_native(match_clause, where_clause, store, 0) {
                 Ok(plan) => Ok(plan),
                 Err(_) => {
                     // Fallback to legacy planner for patterns the graph-native
@@ -4291,26 +4406,160 @@ impl QueryPlanner {
         }
     }
 
-    /// Graph-native planner (ADR-015): enumerate candidate plans, choose cheapest
-    fn plan_match_native(&self, match_clause: &MatchClause, where_clause: Option<&WhereClause>, store: &GraphStore) -> ExecutionResult<OperatorBox> {
+    /// Why the cost-based enumerator cannot plan this MATCH exactly, or `None`
+    /// when it can (#1616).
+    ///
+    /// Its pattern graph keeps nodes, single-type relationships in a stated
+    /// direction and literal inline properties. Anything else it would drop
+    /// rather than plan -- a length bound, a path variable, `shortestPath` --
+    /// and a plan that drops part of the pattern answers a different query.
+    /// Such a MATCH goes to the default planner, as `SAMYAMA_GRAPH_NATIVE` has
+    /// always done on an error; checking up front makes that fallback cover
+    /// the shapes that used to be planned wrongly instead of refused.
+    fn not_enumerable(match_clause: &MatchClause) -> Option<&'static str> {
+        use crate::query::ast::{Direction, PathRestrictor, PathSelector, PathType};
+        if match_clause.pattern.paths.is_empty() {
+            return Some("an empty pattern");
+        }
+        for path in &match_clause.pattern.paths {
+            if path.path_variable.is_some() {
+                return Some("a named path");
+            }
+            if path.path_type != PathType::Normal || path.selector != PathSelector::All {
+                return Some("a shortest-path or selector pattern");
+            }
+            if path.restrictor != PathRestrictor::Trail {
+                return Some("a path restrictor other than TRAIL");
+            }
+            let nodes = std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node));
+            for node in nodes {
+                if node.property_exprs.as_ref().is_some_and(|m| !m.is_empty()) {
+                    return Some("an inline property that is not a literal");
+                }
+            }
+            for seg in &path.segments {
+                let e = &seg.edge;
+                if e.length.is_some() {
+                    return Some("a variable-length relationship");
+                }
+                if e.direction == Direction::Both {
+                    return Some("an undirected relationship");
+                }
+                if e.types.len() > 1 {
+                    return Some("a relationship with more than one type");
+                }
+                if e.properties.as_ref().is_some_and(|m| !m.is_empty())
+                    || e.property_exprs.as_ref().is_some_and(|m| !m.is_empty())
+                {
+                    return Some("a relationship with inline properties");
+                }
+            }
+        }
+        None
+    }
+
+    /// The clause the enumerator plans, and the predicates its pattern graph
+    /// does not carry by itself (#1616):
+    ///
+    /// - every anonymous node and relationship named, since the pattern
+    ///   graph keys on names and dropped the unnamed ones;
+    /// - every label of every occurrence of a node, since a scan reads only
+    ///   the first label and an expand reads none;
+    /// - every literal inline property of every occurrence, since the
+    ///   pattern graph keeps only the first occurrence's;
+    /// - that two relationships which could be the same one are not, since
+    ///   nothing else in an enumerated plan keeps a pattern from walking one
+    ///   relationship twice.
+    fn prepare_for_enumeration(match_clause: &MatchClause) -> (MatchClause, Vec<Expression>) {
+        let mut clause = match_clause.clone();
+        let mut extra = Vec::new();
+        let mut minted = 0usize;
+        let mut mint = |prefix: &str| {
+            minted += 1;
+            format!("__{prefix}_{}", minted - 1)
+        };
+        let mut rels: Vec<(String, Vec<EdgeType>)> = Vec::new();
+        for path in clause.pattern.paths.iter_mut() {
+            let nodes = std::iter::once(&mut path.start).chain(path.segments.iter_mut().map(|s| &mut s.node));
+            for node in nodes {
+                let var = node.variable.get_or_insert_with(|| mint("enum_node")).clone();
+                if !node.labels.is_empty() {
+                    extra.push(Expression::Function {
+                        name: "hasLabels".to_string(),
+                        args: vec![
+                            Expression::Variable(var.clone()),
+                            Expression::Literal(PropertyValue::Array(
+                                node.labels.iter().map(|l| PropertyValue::String(l.as_str().to_string())).collect(),
+                            )),
+                        ],
+                        distinct: false,
+                    });
+                }
+                for (k, v) in node.properties.iter().flatten() {
+                    extra.push(Expression::Binary {
+                        left: Box::new(Expression::Property { variable: var.clone(), property: k.clone() }),
+                        op: BinaryOp::Eq,
+                        right: Box::new(Expression::Literal(v.clone())),
+                    });
+                }
+            }
+            for seg in path.segments.iter_mut() {
+                let var = seg.edge.variable.get_or_insert_with(|| mint("enum_rel")).clone();
+                rels.push((var, seg.edge.types.clone()));
+            }
+        }
+        let may_share = |a: &[EdgeType], b: &[EdgeType]| a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t));
+        for i in 0..rels.len() {
+            for j in i + 1..rels.len() {
+                if rels[i].0 != rels[j].0 && may_share(&rels[i].1, &rels[j].1) {
+                    extra.push(Expression::Binary {
+                        left: Box::new(Expression::Variable(rels[i].0.clone())),
+                        op: BinaryOp::Ne,
+                        right: Box::new(Expression::Variable(rels[j].0.clone())),
+                    });
+                }
+            }
+        }
+        (clause, extra)
+    }
+
+    /// Graph-native planner (ADR-015): enumerate candidate plans and run the
+    /// `pick`-th cheapest, counting from 0 -- the cheapest unless `CYPHER
+    /// plan=N` forced another (#1616).
+    fn plan_match_native(&self, match_clause: &MatchClause, where_clause: Option<&WhereClause>, store: &GraphStore, pick: usize) -> ExecutionResult<OperatorBox> {
         use super::logical_plan::PatternGraph;
         use super::plan_enumerator::{enumerate_plans, EnumerationConfig};
         use super::physical_planner::logical_to_physical;
 
-        let pattern = &match_clause.pattern;
-        if pattern.paths.is_empty() {
-            return Err(ExecutionError::PlanningError("Match pattern has no paths".to_string()));
+        if let Some(why) = Self::not_enumerable(match_clause) {
+            return Err(ExecutionError::PlanningError(format!("the cost-based enumerator does not plan {why}")));
         }
+        let (clause, extra) = Self::prepare_for_enumeration(match_clause);
+        let predicate = where_clause
+            .map(|w| w.predicate.clone())
+            .into_iter()
+            .chain(extra)
+            .reduce(|a, b| Expression::Binary { left: Box::new(a), op: BinaryOp::And, right: Box::new(b) });
+        let where_clause = predicate.map(|predicate| WhereClause { predicate });
 
-        let pg = PatternGraph::from_match_clause(match_clause);
+        let pg = PatternGraph::from_match_clause(&clause);
         let catalog = store.catalog();
         let config = EnumerationConfig {
             max_candidate_plans: self.config.max_candidate_plans,
         };
 
-        let candidates = enumerate_plans(&pg, where_clause, catalog, &store.property_index, &config);
+        let candidates = enumerate_plans(&pg, where_clause.as_ref(), catalog, &store.property_index, &config);
         if candidates.is_empty() {
             return Err(ExecutionError::PlanningError("No valid plans enumerated".to_string()));
+        }
+        if pick >= candidates.len() {
+            return Err(ExecutionError::PlanningError(format!(
+                "cannot honour CYPHER plan={}: this MATCH has {} candidate plan{}; EXPLAIN \
+                 under CYPHER planner=cost lists them",
+                pick + 1,
+                candidates.len(),
+                if candidates.len() == 1 { "" } else { "s" }
+            )));
         }
 
         // Collect candidate diagnostics before consuming
@@ -4319,18 +4568,18 @@ impl QueryPlanner {
             let desc = plan.display_plan(0);
             (desc, *cost)
         }).collect();
-        let best_cost = candidates[0].1;
+        let chosen_cost = candidates[pick].1;
 
-        // Pick the cheapest plan (first one — already sorted)
-        let (best_plan, _) = candidates.into_iter().next().unwrap();
-        let physical = logical_to_physical(&best_plan);
+        let (chosen_plan, _) = candidates.into_iter().nth(pick).expect("pick is in range");
+        let physical = logical_to_physical(&chosen_plan);
 
         // Store diagnostics in thread-local for EXPLAIN to pick up
         PLAN_DIAGNOSTICS.with(|diag| {
             *diag.borrow_mut() = Some(PlanDiagnostics {
                 candidates_evaluated: num_candidates,
-                chosen_plan_cost: best_cost,
+                chosen_plan_cost: chosen_cost,
                 candidate_costs: candidate_summaries,
+                chosen: pick,
             });
         });
 
@@ -4504,6 +4753,10 @@ impl QueryPlanner {
                     Some(end) => scan.with_other_end(end),
                     None => scan,
                 })
+            } else if let Some(op) = point_index_scan(&start_var, &path.start.labels, &remaining_predicates, store) {
+                // A spatial predicate on an R-tree-indexed property (#1618).
+                // The predicate stays in the filter: the region is a superset.
+                op
             } else {
                 Box::new(NodeScanOperator::new(
                     start_var.clone(),
@@ -5480,6 +5733,8 @@ impl QueryPlanner {
                 Some(end) => scan.with_other_end(end),
                 None => scan,
             })
+        } else if let Some(op) = point_index_scan(&anchor_var, &anchor.labels, &candidates, store) {
+            op
         } else {
             Box::new(NodeScanOperator::new(anchor_var.clone(), anchor.labels.clone()))
         };
@@ -6206,6 +6461,11 @@ impl QueryPlanner {
     }
 
     /// Collect variables referenced by an expression
+    /// The variables an expression reads, for callers outside the planner.
+    pub(crate) fn collect_vars(expr: &Expression, vars: &mut HashSet<String>) {
+        Self::collect_expression_variables(expr, vars)
+    }
+
     fn collect_expression_variables(expr: &Expression, vars: &mut HashSet<String>) {
         match expr {
             Expression::Variable(v) => { vars.insert(v.clone()); }
@@ -7319,6 +7579,34 @@ fn propagate_shared_variable_labels(clauses: &[MatchClause]) -> Vec<MatchClause>
     result
 }
 
+/// A `PointIndexScan` for `var` when one of `preds` confines a property of
+/// `var` that a point index covers under one of its labels (#1618). The
+/// predicate is left where it is, so the scan can only narrow the work.
+fn point_index_scan(
+    var: &str,
+    labels: &[Label],
+    preds: &[Expression],
+    store: &GraphStore,
+) -> Option<OperatorBox> {
+    if store.point_index.is_empty() {
+        return None;
+    }
+    for pred in preds.iter().flat_map(flatten_and_predicates) {
+        let Some((property, region)) = super::point_ops::spatial_region(var, &pred, store) else { continue };
+        for label in labels {
+            if store.point_index.name_for(label.as_str(), &property).is_some() {
+                return Some(Box::new(super::point_ops::PointIndexScanOperator::new(
+                    var.to_string(),
+                    label.clone(),
+                    property,
+                    region,
+                )));
+            }
+        }
+    }
+    None
+}
+
 /// What remains of a closing segment after a fused cyclic close bound it
 /// (#1614): a filter on the closing relationship's inline properties, if any.
 struct FusedCloseSegment {
@@ -7672,7 +7960,10 @@ fn anchor_cardinality(
                 let selectivity = if matches!(op, BinaryOp::Eq) {
                     stats.estimate_equality_selectivity_for_value(&label, &property, &val)
                 } else {
-                    0.3
+                    // From the histogram (#478): a range on a skewed property
+                    // keeps anywhere from nothing to everything, and the fixed
+                    // 0.3 costed both alike.
+                    stats.estimate_comparison_selectivity(&label, &property, &op, &val).unwrap_or(0.3)
                 };
                 (base * selectivity).max(1.0)
             }
@@ -8490,44 +8781,16 @@ impl QueryPlanner {
                     bound.extend(clause_vars);
                 }
                 Clause::Merge(mc) => {
-                    let on_create: Vec<(String, String, Expression)> = mc
-                        .on_create_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let on_match: Vec<(String, String, Expression)> = mc
-                        .on_match_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let on_create_labels: Vec<(String, Vec<Label>)> = mc
-                        .on_create_labels
-                        .iter()
-                        .map(|l| (l.variable.clone(), l.labels.clone()))
-                        .collect();
-                    let on_match_labels: Vec<(String, Vec<Label>)> = mc
-                        .on_match_labels
-                        .iter()
-                        .map(|l| (l.variable.clone(), l.labels.clone()))
-                        .collect();
+                    // `ON CREATE` / `ON MATCH` items in the order written (#1919).
                     operator = Box::new(
                         MergeOperator::new(
                             mc.pattern.clone(),
-                            on_create,
-                            on_match,
-                            on_create_labels,
-                            on_match_labels,
+                            Vec::new(),
+                            Vec::new(),
+                            merge_labels(&mc.on_create),
+                            merge_labels(&mc.on_match),
                         )
-                        .with_entity_sets(
-                            mc.on_create_entity_set
-                                .iter()
-                                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                                .collect(),
-                            mc.on_match_entity_set
-                                .iter()
-                                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                                .collect(),
-                        )
+                        .with_ordered_sets(merge_writes(&mc.on_create), merge_writes(&mc.on_match))
                         .with_input(operator),
                     );
                     // `MERGE p = (...)` binds `p` (#876).
@@ -8606,29 +8869,7 @@ impl QueryPlanner {
                     bound.insert(u.variable.clone());
                 }
                 Clause::Set(sc) => {
-                    let items: Vec<(String, String, Expression)> = sc
-                        .items
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
-                        .collect();
-                    let entity_items: Vec<(String, bool, Expression)> = sc
-                        .entity_items
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect();
-                    if !items.is_empty() || !entity_items.is_empty() {
-                        operator = Box::new(SetPropertyOperator::with_entity_items(
-                            operator, items, entity_items,
-                        ));
-                    }
-                    let adds: Vec<(String, Label)> = sc
-                        .label_items
-                        .iter()
-                        .flat_map(|i| i.labels.iter().map(|l| (i.variable.clone(), l.clone())))
-                        .collect();
-                    if !adds.is_empty() {
-                        operator = Box::new(LabelMutationOperator::new(operator, adds, Vec::new()));
-                    }
+                    operator = Self::attach_set(operator, std::slice::from_ref(sc));
                 }
                 Clause::Remove(rc) => {
                     let mut props = Vec::new();
@@ -9142,31 +9383,38 @@ impl QueryPlanner {
         operator
     }
 
-    /// `SET` over `operator`: property and whole-entity items, then labels.
+    /// `SET` over `operator`, one clause after another.
+    ///
+    /// Each clause gets its own operators, so a later clause's writes land
+    /// after an earlier clause's. Flattening every clause into one list lost
+    /// that, and `SET n = {…} SET n.k = 7` dropped `k` (#1896). Within a
+    /// clause the property and whole-entity writes keep the order they were
+    /// written in; labels follow, which no property write can disturb.
     fn attach_set(mut operator: OperatorBox, set_clauses: &[SetClause]) -> OperatorBox {
-        let mut items = Vec::new();
-        let mut label_adds = Vec::new();
-        let mut entity_items = Vec::new();
+        use crate::query::executor::operator::SetWrite;
         for set_clause in set_clauses {
-            for item in &set_clause.items {
-                items.push((item.variable.clone(), item.property.clone(), item.value.clone()));
-            }
-            for item in &set_clause.label_items {
-                for label in &item.labels {
-                    label_adds.push((item.variable.clone(), label.clone()));
+            let mut writes = Vec::new();
+            let mut label_adds = Vec::new();
+            for op in &set_clause.ops {
+                match op {
+                    SetOp::Property(i) => writes.push(SetWrite::Property(
+                        i.variable.clone(),
+                        i.property.clone(),
+                        i.value.clone(),
+                    )),
+                    SetOp::Entity(i) => {
+                        writes.push(SetWrite::Entity(i.variable.clone(), i.merge, i.value.clone()))
+                    }
+                    SetOp::Labels(i) => label_adds
+                        .extend(i.labels.iter().map(|l| (i.variable.clone(), l.clone()))),
                 }
             }
-            for item in &set_clause.entity_items {
-                entity_items.push((item.variable.clone(), item.merge, item.value.clone()));
+            if !writes.is_empty() {
+                operator = Box::new(SetPropertyOperator::from_writes(operator, writes));
             }
-        }
-        if !items.is_empty() || !entity_items.is_empty() {
-            operator = Box::new(SetPropertyOperator::with_entity_items(
-                operator, items, entity_items,
-            ));
-        }
-        if !label_adds.is_empty() {
-            operator = Box::new(LabelMutationOperator::new(operator, label_adds, Vec::new()));
+            if !label_adds.is_empty() {
+                operator = Box::new(LabelMutationOperator::new(operator, label_adds, Vec::new()));
+            }
         }
         operator
     }
@@ -9207,15 +9455,14 @@ impl QueryPlanner {
         merge_clause: &MergeClause,
         bound_by_match: &[String],
     ) -> OperatorBox {
-        let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
-            .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-            .collect();
-        let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
-            .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
-            .collect();
+        // `ON CREATE` / `ON MATCH` items in the order written (#1919).
+        let on_create = merge_writes(&merge_clause.on_create);
+        let on_match = merge_writes(&merge_clause.on_match);
 
         // Extract edge patterns from MERGE clause
         let mut edges_to_merge = Vec::new();
+        // Each edge's non-literal properties, by position in `edges_to_merge`.
+        let mut edge_property_exprs = Vec::new();
         // `MERGE p = (a)-[:R]->(b)` binds `p` (#876). An anonymous
         // relationship inside a named path is given a synthetic handle, for
         // the same reason `CREATE` gives one to an anonymous node: the path
@@ -9264,6 +9511,7 @@ impl QueryPlanner {
                         edge_var,
                         undirected,
                     ));
+                    edge_property_exprs.push(edge.property_exprs.clone());
                 }
                 current_var = target_var;
             }
@@ -9299,20 +9547,10 @@ impl QueryPlanner {
         if !edges_to_merge.is_empty() && all_endpoints_bound {
             // Edge MERGE: use MatchMergeEdgeOperator
             use crate::query::executor::operator::MatchMergeEdgeOperator;
-            // `ON CREATE SET n = {…}` / `n += {…}` (#874).
-            let on_create_entity: Vec<(String, bool, Expression)> = merge_clause
-                .on_create_entity_set
-                .iter()
-                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                .collect();
-            let on_match_entity: Vec<(String, bool, Expression)> = merge_clause
-                .on_match_entity_set
-                .iter()
-                .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                .collect();
             operator = Box::new(
-                MatchMergeEdgeOperator::new(operator, edges_to_merge, on_create, on_match)
-                    .with_entity_sets(on_create_entity, on_match_entity),
+                MatchMergeEdgeOperator::new(operator, edges_to_merge, Vec::new(), Vec::new())
+                    .with_ordered_sets(on_create, on_match)
+                    .with_property_exprs(edge_property_exprs),
             );
             if !merge_named_paths.is_empty() {
                 operator = Box::new(crate::query::executor::operator::BindPathOperator::new(
@@ -9330,36 +9568,15 @@ impl QueryPlanner {
             // the point, could not see the row. That is why
             // `UNWIND [...] AS x MERGE (n:N {v: x})` had nowhere to read
             // `x` from (#642).
-            let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause
-                .on_create_labels
-                .iter()
-                .map(|l| (l.variable.clone(), l.labels.clone()))
-                .collect();
-            let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause
-                .on_match_labels
-                .iter()
-                .map(|l| (l.variable.clone(), l.labels.clone()))
-                .collect();
             operator = Box::new(
                 MergeOperator::new(
                     merge_clause.pattern.clone(),
-                    on_create,
-                    on_match,
-                    on_create_labels,
-                    on_match_labels,
+                    Vec::new(),
+                    Vec::new(),
+                    merge_labels(&merge_clause.on_create),
+                    merge_labels(&merge_clause.on_match),
                 )
-                .with_entity_sets(
-                    merge_clause
-                        .on_create_entity_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect(),
-                    merge_clause
-                        .on_match_entity_set
-                        .iter()
-                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
-                        .collect(),
-                )
+                .with_ordered_sets(on_create, on_match)
                 .with_input(operator),
             );
             if !merge_named_paths.is_empty() {
@@ -10066,6 +10283,33 @@ impl QueryPlanner {
         }
         true
     }
+}
+
+
+/// The property and whole-entity items of an `ON CREATE` / `ON MATCH` block,
+/// as writes in the order written (#1919). Labels are taken separately by
+/// [`merge_labels`]; a property write cannot disturb a label.
+fn merge_writes(ops: &[SetOp]) -> Vec<crate::query::executor::operator::SetWrite> {
+    use crate::query::executor::operator::SetWrite;
+    ops.iter()
+        .filter_map(|op| match op {
+            SetOp::Property(i) => {
+                Some(SetWrite::Property(i.variable.clone(), i.property.clone(), i.value.clone()))
+            }
+            SetOp::Entity(i) => Some(SetWrite::Entity(i.variable.clone(), i.merge, i.value.clone())),
+            SetOp::Labels(_) => None,
+        })
+        .collect()
+}
+
+/// The label items of an `ON CREATE` / `ON MATCH` block.
+fn merge_labels(ops: &[SetOp]) -> Vec<(String, Vec<Label>)> {
+    ops.iter()
+        .filter_map(|op| match op {
+            SetOp::Labels(l) => Some((l.variable.clone(), l.labels.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -10825,6 +11069,7 @@ mod tests {
             create_vector_index_clause: None,
             create_fulltext_index_clause: None,
             drop_fulltext_index_clause: None,
+            point_index_ddl: None,
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,
@@ -10837,6 +11082,7 @@ mod tests {
             profile: false,
             analyze: false,
             hints: Vec::new(),
+            plan_options: Default::default(),
             params: std::collections::HashMap::new(),
             foreach_clause: None,
             unwind_clause: None,

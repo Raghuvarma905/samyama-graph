@@ -143,7 +143,78 @@ index over any float list nobody had indexed.
   label or property — is skipped and counted in `ImportStats::index_conflicts`:
   the rows already there were indexed under the target's definition.
 
+**The header can say where the data came from** (`sources`, added 2026-10-21 for
+#1911). One entry per input a converter read (`samyama convert`, #1905), so a
+converted file explains itself and can be converted back:
+
+```json
+"sources": [{"format": "turtle", "file": "cso.ttl", "sha256": "…",
+             "converter": "samyama-convert 1.12.0", "mapping": {…}}]
+```
+
+- **Additive, no version bump.** Absent when empty, as `queries` and
+  `read_only` are, so a header with no sources is written exactly as before
+  and a header written before #1911 reads with none. `mapping` is the resolved
+  mapping (#1910), omitted when none applied. `file` is a bare name, never a
+  path, for the same reason as `queries.file`.
+- **A list, carried by the graph.** Import adds a snapshot's sources to the
+  store (`GraphStore::snapshot_sources`), only once the import has succeeded,
+  and every export writes them back. Two converted files imported into one
+  tenant and exported again keep both entries.
+- **Never claimed silently.** The store remembers its data epoch when sources
+  were recorded. An export at a later epoch -- the graph changed after it was
+  converted -- keeps the sources and adds `sources_may_be_stale` to `dropped`,
+  so the header says where the data started, not that it still matches.
+- **Once stale, stale.** The flag is kept until the graph is cleared: an
+  import of a snapshot whose header already carries `sources_may_be_stale`
+  stays flagged, and adding sources after an edit does not make the earlier
+  ones current. Two imports with no edit between them stay current, because an
+  import judges the sources already held before its own writes.
+- **Shown by `samyama verify`**, one line per source.
+
 Properties are encoded as JSON values. Edge records ("stub edges") carry only `id, src, tgt, type, props` — endpoint/type metadata, no creation timestamps in v2.
+
+### Typed values
+
+A string, integer, float, boolean, null, list or map property is the JSON value
+of the same kind; lists and map values are encoded recursively. Every other
+`PropertyValue` is a JSON object whose `__type` names it (#1907). The codec is
+`samyama::snapshot::codec::{property_to_json, json_to_property}`, public so a
+converter outside the server calls it rather than copying this table.
+
+| `__type` | Fields | `PropertyValue` | Meaning |
+|---|---|---|---|
+| `DateTime` | `value` (i64) | `DateTime` | milliseconds since the Unix epoch, UTC. The original temporal form, kept unchanged so snapshots written before #689 still read |
+| `Date` | `days` (i32) | `Date` | days since 1970-01-01 |
+| `LocalTime` | `nanos` (i64) | `LocalTime` | nanoseconds since midnight |
+| `Time` | `nanos` (i64), `offset` (i32) | `Time` | nanoseconds since midnight; offset from UTC in seconds |
+| `LocalDateTime` | `secs` (i64), `nanos` (u32) | `LocalDateTime` | seconds since the epoch with no zone, plus a sub-second part |
+| `ZonedDateTime` | `secs` (i64), `nanos` (u32), `offset` (i32), `zone` (string or null) | `ZonedDateTime` | an instant, its offset in seconds, and the IANA zone name when there was one |
+| `Duration` | `months`, `days`, `seconds` (i64), `nanos` (i32) | `Duration` | the four components kept apart, as Cypher keeps them |
+| `Vector` | `value` (array of numbers) | `Vector` | an `f32` embedding |
+
+Reading rules, which a second implementation must follow to agree with this one:
+
+- **A missing or mistyped required field is not defaulted.** For every tag except
+  `Duration`, the object is then read as a plain map, so a damaged record does
+  not become the epoch. `Duration`'s four fields each default to `0`;
+  `offset` defaults to `0` and `nanos` (for `LocalDateTime` / `ZonedDateTime`) to
+  `0` when absent.
+- **An unknown `__type` is a plain map.** That keeps a newer writer's tag
+  readable as data by an older reader, with the tag visible.
+- **Strings are trimmed on import.**
+- **One ambiguity is inherent.** A user's map property that holds a `__type` key
+  naming one of these tags, with that tag's fields, reads back as the typed
+  value. No tag is reserved against user data; a map shaped exactly like a typed
+  value is the one input that does not round-trip.
+
+### Writing a file from a standalone store
+
+`samyama::snapshot::write_file(&store, path, &WriteOptions)` writes any
+`GraphStore`, with no server (#1907). It creates parent directories, writes
+`<path>.tmp`, syncs it, and renames it over `path`, so a crash or an export
+error never leaves a truncated `.sgsnap` that a later import would read as
+short. It returns the export's `ExportStats`, `dropped` included.
 
 ## Consequences
 

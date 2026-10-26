@@ -185,6 +185,7 @@ fn parse_clause_pipeline(input: &str) -> ParseResult<Query> {
                     query.explain = true;
                     query.profile = inner.as_str().eq_ignore_ascii_case("PROFILE");
                 }
+                Rule::cypher_options => parse_cypher_options(inner, &mut query.plan_options)?,
                 Rule::pipeline_stmt => {
                     for c in inner.into_inner() {
                         match c.as_rule() {
@@ -575,6 +576,7 @@ pub fn parse_query(input: &str) -> ParseResult<Query> {
                 let mut first = true;
                 for inner in pair.into_inner() {
                     match inner.as_rule() {
+                        Rule::cypher_options => parse_cypher_options(inner, &mut query.plan_options)?,
                         Rule::explain_clause => {
                             let text = inner.as_str().to_uppercase();
                             if text.starts_with("PROFILE") {
@@ -720,14 +722,35 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> Pars
                 parse_create_index_statement(inner, query)?;
             }
             Rule::create_point_index_stmt => {
-                return Err(ParseError::SemanticError(
-                    "CREATE POINT INDEX is not supported yet: a point index is a spatial \
-                     structure (an R-tree) that answers point.withinBBox and nearest-neighbour \
-                     queries, and it does not exist in this engine yet -- samyama-graph#1618. \
-                     Spatial predicates run as a scan until then; CREATE INDEX on a scalar \
-                     property (for example a geohash) is the available alternative."
-                        .to_string(),
-                ));
+                // An unnamed index is named from what it covers, as the
+                // full-text kinds are (#1668), so DROP POINT INDEX can name it.
+                let mut name = None;
+                let mut label = None;
+                let mut property = None;
+                for part in inner.into_inner() {
+                    match part.as_rule() {
+                        Rule::index_name => name = Some(part.as_str().to_string()),
+                        Rule::label => label = Some(Label::new(unescape_name(part.as_str()))),
+                        Rule::property_key => property = Some(unescape_name(part.as_str())),
+                        _ => {}
+                    }
+                }
+                let (Some(label), Some(property)) = (label, property) else {
+                    return Err(ParseError::SemanticError(
+                        "CREATE POINT INDEX needs a label and a property: \
+                         CREATE POINT INDEX [name] FOR (n:Label) ON (n.property)".to_string(),
+                    ));
+                };
+                let name = name.unwrap_or_else(|| format!("point_{}_{}", label.as_str(), property));
+                query.point_index_ddl = Some(PointIndexDdl::Create { name, label, property });
+            }
+            Rule::drop_point_index_stmt => {
+                let name = inner
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::index_name)
+                    .map(|p| p.as_str().to_string())
+                    .ok_or_else(|| ParseError::SemanticError("DROP POINT INDEX needs a name".to_string()))?;
+                query.point_index_ddl = Some(PointIndexDdl::Drop { name });
             }
             Rule::call_stmt => {
                 parse_call_statement(inner, query)?;
@@ -809,6 +832,81 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> Pars
 }
 
 /// `USING INDEX n:L(p)`, `USING SCAN n:L` or `USING JOIN ON n, m` (#1675).
+/// `CYPHER key=value …` (LANG-06, #1616). Every key and value is checked
+/// here: one this engine does not have is refused by name, because an option
+/// accepted and ignored reads exactly like one that took effect.
+fn parse_cypher_options(pair: pest::iterators::Pair<Rule>, options: &mut crate::query::ast::PlanOptions) -> ParseResult<()> {
+    use crate::query::ast::PlannerChoice;
+    use crate::query::error_code as c;
+    let mut seen = std::collections::HashSet::new();
+    for opt in pair.into_inner().filter(|p| p.as_rule() == Rule::cypher_option) {
+        let mut kv = opt.into_inner();
+        let key = kv.next().map(|p| p.as_str().to_string()).unwrap_or_default();
+        let value = kv.next().map(|p| p.as_str().to_string()).unwrap_or_default();
+        let lower = key.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            return Err(ParseError::Coded { code: c::BAD_ARGUMENT, message: format!("CYPHER option `{key}` is given twice") });
+        }
+        match lower.as_str() {
+            "planner" => {
+                options.planner = Some(match value.to_ascii_lowercase().as_str() {
+                    "cost" => PlannerChoice::Cost,
+                    "legacy" => PlannerChoice::Legacy,
+                    _ => {
+                        return Err(ParseError::Coded {
+                            code: c::UNSUPPORTED,
+                            message: format!(
+                                "CYPHER planner={value}: this engine has two planners, \
+                                 `planner=cost` (the cost-based enumerator) and `planner=legacy`"
+                            ),
+                        })
+                    }
+                });
+            }
+            "plan" => match value.parse::<usize>() {
+                Ok(n) if n >= 1 => options.plan = Some(n),
+                _ => {
+                    return Err(ParseError::Coded {
+                        code: c::BAD_ARGUMENT,
+                        message: format!(
+                            "CYPHER plan={value}: a plan is numbered from 1, as EXPLAIN \
+                             numbers the candidates under `CYPHER planner=cost`"
+                        ),
+                    })
+                }
+            },
+            "runtime" => {
+                // One runtime exists, the Volcano iterator (ADR-007). Naming
+                // it is honoured; naming another is refused, not ignored.
+                if !matches!(value.to_ascii_lowercase().as_str(), "volcano" | "interpreted") {
+                    return Err(ParseError::Coded {
+                        code: c::UNSUPPORTED,
+                        message: format!(
+                            "CYPHER runtime={value}: this engine has one runtime, the Volcano \
+                             iterator (`runtime=volcano`, or `interpreted`)"
+                        ),
+                    });
+                }
+            }
+            _ => {
+                return Err(ParseError::Coded {
+                    code: c::UNSUPPORTED,
+                    message: format!("unknown CYPHER option `{key}`; the options are planner, plan and runtime"),
+                })
+            }
+        }
+    }
+    if options.plan.is_some() && options.planner == Some(PlannerChoice::Legacy) {
+        return Err(ParseError::Coded {
+            code: c::CLAUSE_CONFLICT,
+            message: "CYPHER plan=N picks a candidate of the cost-based enumerator, which \
+                      planner=legacy turns off"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn parse_using_hint(pair: pest::iterators::Pair<Rule>) -> ParseResult<PlanHint> {
     let hint = pair
         .into_inner()
@@ -1650,17 +1748,16 @@ fn parse_set_label_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetLab
 }
 
 fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause> {
-    let mut items = Vec::new();
-    let mut label_items: Vec<SetLabelItem> = Vec::new();
-    let mut entity_items: Vec<crate::query::ast::SetEntityItem> = Vec::new();
+    use crate::query::ast::SetOp;
+    let mut ops = Vec::new();
 
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::set_label_item {
-            label_items.push(parse_set_label_item(inner)?);
+            ops.push(SetOp::Labels(parse_set_label_item(inner)?));
             continue;
         }
         if inner.as_rule() == Rule::set_entity_item {
-            entity_items.push(parse_set_entity_item(inner)?);
+            ops.push(SetOp::Entity(parse_set_entity_item(inner)?));
             continue;
         }
         if inner.as_rule() == Rule::set_item {
@@ -1686,15 +1783,15 @@ fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause>
                 }
             }
 
-            items.push(SetItem {
+            ops.push(SetOp::Property(SetItem {
                 variable,
                 property,
                 value: value.ok_or_else(|| ParseError::SemanticError("SET item missing value".to_string()))?,
-            });
+            }));
         }
     }
 
-    Ok(SetClause { items, label_items, entity_items })
+    Ok(SetClause { ops })
 }
 
 fn parse_remove_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<RemoveClause> {
@@ -1828,36 +1925,14 @@ fn parse_load_parquet_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<L
 fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> ParseResult<()> {
     // merge_stmt has pattern, on_create_set?, on_match_set?, return_clause?
     let mut pattern = None;
-    let mut on_create_set = Vec::new();
-    let mut on_match_set = Vec::new();
-    let mut on_create_labels = Vec::new();
-    let mut on_match_labels = Vec::new();
-    let mut on_create_entity_set = Vec::new();
-    let mut on_match_entity_set = Vec::new();
+    let mut on_create = Vec::new();
+    let mut on_match = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
-            Rule::on_create_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => on_create_entity_set.push(parse_set_entity_item(si)?),
-                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
-            Rule::on_match_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => on_match_entity_set.push(parse_set_entity_item(si)?),
-                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
+            Rule::on_create_set => parse_on_set_block(inner, &mut on_create)?,
+            Rule::on_match_set => parse_on_set_block(inner, &mut on_match)?,
             Rule::set_clause => {
                 // A bare SET after MERGE, applying on both branches. Kept in
                 // `query.set_clauses` rather than folded into ON CREATE/ON MATCH so the
@@ -1877,52 +1952,40 @@ fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
 
     query.merge_clause = Some(MergeClause {
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
-        on_create_set,
-        on_match_set,
-        on_create_labels,
-        on_match_labels,
-        on_create_entity_set,
-        on_match_entity_set,
+        on_create,
+        on_match,
     });
+    Ok(())
+}
+
+/// The items of one `ON CREATE SET` / `ON MATCH SET`, appended in the order
+/// written, so a later block follows an earlier one (#1919).
+fn parse_on_set_block(
+    pair: pest::iterators::Pair<Rule>,
+    ops: &mut Vec<crate::query::ast::SetOp>,
+) -> ParseResult<()> {
+    use crate::query::ast::SetOp;
+    for si in pair.into_inner() {
+        match si.as_rule() {
+            Rule::set_item => ops.push(SetOp::Property(parse_set_item(si)?)),
+            Rule::set_entity_item => ops.push(SetOp::Entity(parse_set_entity_item(si)?)),
+            Rule::set_label_item => ops.push(SetOp::Labels(parse_set_label_item(si)?)),
+            _ => {}
+        }
+    }
     Ok(())
 }
 
 fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeClause> {
     let mut pattern = None;
-    let mut on_create_set = Vec::new();
-    let mut on_match_set = Vec::new();
-    let mut on_create_labels = Vec::new();
-    let mut on_match_labels = Vec::new();
-    let mut on_create_entity_set = Vec::new();
-    let mut on_match_entity_set = Vec::new();
+    let mut on_create = Vec::new();
+    let mut on_match = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
-            Rule::on_create_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => {
-                            on_create_entity_set.push(parse_set_entity_item(si)?)
-                        }
-                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
-            Rule::on_match_set => {
-                for si in inner.into_inner() {
-                    match si.as_rule() {
-                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
-                        Rule::set_entity_item => {
-                            on_match_entity_set.push(parse_set_entity_item(si)?)
-                        }
-                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
-                        _ => {}
-                    }
-                }
-            }
+            Rule::on_create_set => parse_on_set_block(inner, &mut on_create)?,
+            Rule::on_match_set => parse_on_set_block(inner, &mut on_match)?,
             Rule::return_clause => {
                 // Handled at statement level for merge_stmt
             }
@@ -1932,12 +1995,8 @@ fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeCla
 
     Ok(MergeClause {
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
-        on_create_set,
-        on_match_set,
-        on_create_labels,
-        on_match_labels,
-        on_create_entity_set,
-        on_match_entity_set,
+        on_create,
+        on_match,
     })
 }
 
@@ -3590,8 +3649,8 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse SET: {:?}", result.err());
         let ast = result.unwrap();
         assert_eq!(ast.set_clauses.len(), 1);
-        assert_eq!(ast.set_clauses[0].items[0].variable, "n");
-        assert_eq!(ast.set_clauses[0].items[0].property, "name");
+        assert_eq!(ast.set_clauses[0].items().next().unwrap().variable, "n");
+        assert_eq!(ast.set_clauses[0].items().next().unwrap().property, "name");
     }
 
     #[test]
@@ -3669,8 +3728,8 @@ mod tests {
         let ast = result.unwrap();
         assert!(ast.merge_clause.is_some());
         let merge = ast.merge_clause.unwrap();
-        assert_eq!(merge.on_create_set.len(), 1);
-        assert_eq!(merge.on_match_set.len(), 1);
+        assert_eq!(merge.on_create_set().count(), 1);
+        assert_eq!(merge.on_match_set().count(), 1);
     }
 
     #[test]
@@ -4692,7 +4751,7 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse SET clause: {:?}", result.err());
         let ast = result.unwrap();
         assert!(!ast.set_clauses.is_empty());
-        let item = &ast.set_clauses[0].items[0];
+        let item = ast.set_clauses[0].items().next().unwrap();
         assert_eq!(item.variable, "n");
         assert_eq!(item.property, "age");
     }
@@ -4723,7 +4782,7 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse multiple SET items: {:?}", result.err());
         let ast = result.unwrap();
         assert!(!ast.set_clauses.is_empty());
-        assert!(ast.set_clauses[0].items.len() >= 2);
+        assert!(ast.set_clauses[0].items().count() >= 2);
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub struct Query {
     pub create_vector_index_clause: Option<CreateVectorIndexClause>,
     pub create_fulltext_index_clause: Option<CreateFullTextIndexClause>,
     pub drop_fulltext_index_clause: Option<DropFullTextIndexClause>,
+    /// `CREATE POINT INDEX` / `DROP POINT INDEX` (#1618).
+    pub point_index_ddl: Option<PointIndexDdl>,
     /// CREATE INDEX clause (optional)
     pub create_index_clause: Option<CreateIndexClause>,
     /// DROP INDEX clause (optional)
@@ -136,6 +138,8 @@ pub struct Query {
     /// Planner hints from every MATCH in the query (#1675). Keyed by variable,
     /// which names one node across the whole query.
     pub hints: Vec<PlanHint>,
+    /// `CYPHER planner=… plan=N` options before the query (LANG-06, #1616).
+    pub plan_options: PlanOptions,
     /// SHOW CONSTRAINTS flag
     pub show_constraints: bool,
     /// PROFILE flag
@@ -234,6 +238,13 @@ pub struct CreateFullTextIndexClause {
     /// One or more properties. Neo4j's `ON EACH [n.a, n.b]` indexes several,
     /// and the single-property form is the same thing with one entry.
     pub property_keys: Vec<String>,
+}
+
+/// `CREATE POINT INDEX` / `DROP POINT INDEX` (#1618).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointIndexDdl {
+    Create { name: String, label: Label, property: String },
+    Drop { name: String },
 }
 
 /// DROP FULLTEXT INDEX clause
@@ -336,6 +347,35 @@ pub enum PlanHint {
     /// `USING JOIN ON n` -- accepted; this planner joins comma-separated
     /// patterns on their shared variables already, so it is checked and kept.
     Join { variables: Vec<String> },
+}
+
+/// Options written as `CYPHER key=value …` before a query (LANG-06, #1616):
+/// which planner plans it, and which of its candidate plans runs.
+///
+/// Like the `USING` hints, these are mandatory. An option this engine does
+/// not have, or a plan number a pattern does not have, is an error: a plan
+/// forced in name and not in fact is the one thing plan-equivalence testing
+/// cannot survive, because the comparison would pass by comparing a plan
+/// with itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanOptions {
+    /// `planner=cost` plans every MATCH with the cost-based enumerator
+    /// (ADR-015), `planner=legacy` with the default planner. `None` keeps
+    /// the server's setting.
+    pub planner: Option<PlannerChoice>,
+    /// `plan=N`: run the N-th cheapest candidate the enumerator produces for
+    /// each MATCH, counting from 1 -- the numbers EXPLAIN prints beside
+    /// `Alternative plans`. Implies `planner=cost`.
+    pub plan: Option<usize>,
+}
+
+/// The planners a query can name with `CYPHER planner=…`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerChoice {
+    /// The cost-based enumerator (`planner=cost`).
+    Cost,
+    /// The default planner (`planner=legacy`).
+    Legacy,
 }
 
 /// MATCH clause: `MATCH (n:Person)-[:KNOWS]->(m)`
@@ -1014,16 +1054,43 @@ pub struct DeleteClause {
 /// SET clause
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetClause {
-    /// Items to set
-    pub items: Vec<SetItem>,
-    /// Labels to add: `SET n:Admin`, `SET n:A:B`.
+    /// The items, in the order they were written.
     ///
-    /// Kept beside `items` rather than folded into it because `SetItem` is a
-    /// struct read by field in several places, and an enum would touch all of
-    /// them for no gain. `RemoveItem` is an enum because it always was.
-    pub label_items: Vec<SetLabelItem>,
-    /// Whole-entity assignment: `SET n = {…}` and `SET n += {…}`.
-    pub entity_items: Vec<SetEntityItem>,
+    /// One sequence rather than a vector per kind, because the order between
+    /// kinds is part of the meaning: `SET n = {a: 1}, n.k = 7` keeps `k` and
+    /// `SET n.k = 7, n = {a: 1}` does not. Three vectors kept each kind's own
+    /// order and lost the order between them, so the executor had to pick one
+    /// -- and whichever it picked, the other way round was silently wrong
+    /// (#1896).
+    pub ops: Vec<SetOp>,
+}
+
+impl SetClause {
+    /// `n.prop = value` items, in order.
+    pub fn items(&self) -> impl Iterator<Item = &SetItem> {
+        set_items(&self.ops)
+    }
+
+    /// `n:Label` items, in order.
+    pub fn label_items(&self) -> impl Iterator<Item = &SetLabelItem> {
+        set_label_items(&self.ops)
+    }
+
+    /// `n = …` and `n += …` items, in order.
+    pub fn entity_items(&self) -> impl Iterator<Item = &SetEntityItem> {
+        set_entity_items(&self.ops)
+    }
+}
+
+/// One item of a `SET` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOp {
+    /// `n.prop = value`
+    Property(SetItem),
+    /// `n:Admin`, `n:A:B`
+    Labels(SetLabelItem),
+    /// `n = {…}` (replace) or `n += {…}` (merge)
+    Entity(SetEntityItem),
 }
 
 /// `SET n = <expr>` (replace every property) or `SET n += <expr>` (merge).
@@ -1115,27 +1182,65 @@ pub struct UnwindClause {
 pub struct MergeClause {
     /// Pattern to merge
     pub pattern: Pattern,
-    /// ON CREATE SET items
-    pub on_create_set: Vec<SetItem>,
-    /// ON MATCH SET items
-    pub on_match_set: Vec<SetItem>,
-    /// Labels added by `ON CREATE SET n:Label`.
+    /// `ON CREATE SET` items, in the order they were written.
     ///
-    /// Separate from `on_create_set` for the same reason `SetClause` keeps
-    /// `label_items` apart from `items`: the property form is read by field in
-    /// several places and an enum would touch all of them.
-    pub on_create_labels: Vec<SetLabelItem>,
-    /// Labels added by `ON MATCH SET n:Label`.
-    pub on_match_labels: Vec<SetLabelItem>,
-    /// Whole-entity assignment in `ON CREATE SET n = {…}` / `n += {…}`.
-    ///
-    /// The grammar has always parsed these -- `set_entry` includes
-    /// `set_entity_item` -- but `parse_merge_clause` matched only `set_item`
-    /// and `set_label_item`, so they fell through its `match` and the clause
-    /// the user wrote was **silently discarded** (#874).
-    pub on_create_entity_set: Vec<SetEntityItem>,
-    /// The same for `ON MATCH SET`.
-    pub on_match_entity_set: Vec<SetEntityItem>,
+    /// One ordered sequence per block, as `SetClause` has since #1896. Six
+    /// vectors by kind -- property, whole-entity and label, for each block --
+    /// lost the order between kinds, so `ON CREATE SET n = row.props,
+    /// n.id = row.id` ran the property first and the replace erased it (#1919).
+    /// This was the last field-per-kind split in the SET family; `ForeachBody`
+    /// records the same mistake costing DELETE and REMOVE (#465).
+    pub on_create: Vec<SetOp>,
+    /// `ON MATCH SET` items, in the order they were written.
+    pub on_match: Vec<SetOp>,
+}
+
+impl MergeClause {
+    /// `ON CREATE SET n.prop = value` items, in order.
+    pub fn on_create_set(&self) -> impl Iterator<Item = &SetItem> {
+        set_items(&self.on_create)
+    }
+    /// `ON MATCH SET n.prop = value` items, in order.
+    pub fn on_match_set(&self) -> impl Iterator<Item = &SetItem> {
+        set_items(&self.on_match)
+    }
+    /// `ON CREATE SET n = …` / `n += …` items, in order.
+    pub fn on_create_entity_set(&self) -> impl Iterator<Item = &SetEntityItem> {
+        set_entity_items(&self.on_create)
+    }
+    /// `ON MATCH SET n = …` / `n += …` items, in order.
+    pub fn on_match_entity_set(&self) -> impl Iterator<Item = &SetEntityItem> {
+        set_entity_items(&self.on_match)
+    }
+    /// `ON CREATE SET n:Label` items, in order.
+    pub fn on_create_labels(&self) -> impl Iterator<Item = &SetLabelItem> {
+        set_label_items(&self.on_create)
+    }
+    /// `ON MATCH SET n:Label` items, in order.
+    pub fn on_match_labels(&self) -> impl Iterator<Item = &SetLabelItem> {
+        set_label_items(&self.on_match)
+    }
+}
+
+fn set_items(ops: &[SetOp]) -> impl Iterator<Item = &SetItem> {
+    ops.iter().filter_map(|op| match op {
+        SetOp::Property(i) => Some(i),
+        _ => None,
+    })
+}
+
+fn set_entity_items(ops: &[SetOp]) -> impl Iterator<Item = &SetEntityItem> {
+    ops.iter().filter_map(|op| match op {
+        SetOp::Entity(i) => Some(i),
+        _ => None,
+    })
+}
+
+fn set_label_items(ops: &[SetOp]) -> impl Iterator<Item = &SetLabelItem> {
+    ops.iter().filter_map(|op| match op {
+        SetOp::Labels(i) => Some(i),
+        _ => None,
+    })
 }
 
 /// WITH clause
@@ -1255,6 +1360,7 @@ impl Query {
             || self.create_vector_index_clause.is_some()
             || self.create_fulltext_index_clause.is_some()
             || self.drop_fulltext_index_clause.is_some()
+            || self.point_index_ddl.is_some()
             || self.create_constraint_clause.is_some()
             || self.create_hierarchy_index_clause.is_some()
             || self.drop_hierarchy_index.is_some()
@@ -1285,7 +1391,9 @@ impl Query {
         self.call_subquery.as_deref().is_some_and(|q| q.is_write())
     }
 
-    /// Does any `CALL` in this statement name a procedure that needs write access?
+    /// Does any `CALL` in this statement need write access: a procedure that
+    /// always writes, or an algorithm asked to store its result
+    /// (`writeProperty`, ALGO-06)?
     ///
     /// Both AST shapes are checked: `call_clause` holds the CALL when the query was
     /// parsed into the older shape, `clauses` when it was parsed into the newer one.
@@ -1295,12 +1403,12 @@ impl Query {
         if self
             .call_clause
             .as_ref()
-            .is_some_and(|c| AlgorithmOperator::procedure_is_mutating(&c.procedure_name))
+            .is_some_and(|c| AlgorithmOperator::call_writes(&c.procedure_name, &c.arguments))
         {
             return true;
         }
         self.clauses.iter().any(|c| match c {
-            Clause::Call(call) => AlgorithmOperator::procedure_is_mutating(&call.procedure_name),
+            Clause::Call(call) => AlgorithmOperator::call_writes(&call.procedure_name, &call.arguments),
             _ => false,
         })
     }
@@ -1326,6 +1434,7 @@ impl Query {
             create_vector_index_clause: None,
             create_fulltext_index_clause: None,
             drop_fulltext_index_clause: None,
+            point_index_ddl: None,
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,
@@ -1336,6 +1445,7 @@ impl Query {
             show_indexes: false,
             analyze: false,
             hints: Vec::new(),
+            plan_options: PlanOptions::default(),
             show_constraints: false,
             profile: false,
             params: HashMap::new(),

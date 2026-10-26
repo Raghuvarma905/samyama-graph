@@ -1540,6 +1540,7 @@ fn index_catalog_lists_every_kind_in_a_stable_order() {
             IndexDefinition::UniqueConstraint { .. } => 1,
             IndexDefinition::FullText { .. } => 2,
             IndexDefinition::Vector { .. } => 3,
+            IndexDefinition::Point { .. } => 4,
         })
         .collect();
     let mut sorted = kinds.clone();
@@ -2105,6 +2106,7 @@ fn selectivity_without_most_common_values_is_the_uniform_estimate() {
             distinct_count: 4,
             selectivity: 0.25,
             most_common: vec![],
+            histogram: None,
         },
     );
     let stats = GraphStatistics {

@@ -9,6 +9,7 @@
 //!
 //! On import, old node IDs are remapped to new IDs via a HashMap.
 
+pub mod codec;
 pub mod encryption;
 pub mod format;
 pub mod persist;
@@ -28,6 +29,7 @@ use flate2::Compression;
 use crate::graph::property::PropertyValue;
 use crate::graph::store::GraphStore;
 use crate::graph::types::NodeId;
+use codec::{json_to_property, property_to_json};
 use format::{
     ExportStats, ImportStats, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex,
     SnapshotIndexCatalog, SnapshotNode, SNAPSHOT_VERSION,
@@ -89,6 +91,93 @@ pub fn export_tenant(
     writer: impl Write,
 ) -> Result<ExportStats, Box<dyn std::error::Error>> {
     export_tenant_with_compression(store, writer, DEFAULT_SNAPSHOT_COMPRESSION)
+}
+
+/// How [`write_file`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// gzip level, 0-9. See [`DEFAULT_SNAPSHOT_COMPRESSION`].
+    pub compression_level: u32,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self { compression_level: DEFAULT_SNAPSHOT_COMPRESSION }
+    }
+}
+
+/// Write `store` to `path` as a `.sgsnap`, from any `GraphStore`, with no
+/// server involved (#1907).
+///
+/// The one call a converter makes (`samyama convert`, #1905), so every one of
+/// them gets the same file handling:
+///
+/// - **Parent directories are created.**
+/// - **The file appears whole or not at all.** The export goes to
+///   `<path>.tmp`, is flushed and synced, and is renamed over `path` only
+///   after it completed. A crash, a full disk or an export error leaves the
+///   previous `path` (or none) and never a truncated `.sgsnap` that a later
+///   import would read as short. On failure the temporary file is removed.
+/// - **The loss report comes back.** The returned [`ExportStats`] is the
+///   export's own, `dropped` included.
+pub fn write_file(
+    store: &GraphStore,
+    path: impl AsRef<std::path::Path>,
+    opts: &WriteOptions,
+) -> Result<ExportStats, Box<dyn std::error::Error>> {
+    write_file_if(store, path, opts, |_| true).map(|(stats, _)| stats)
+}
+
+/// [`write_file`], with `keep` deciding from the finished export's
+/// [`ExportStats`] whether it replaces `path`.
+///
+/// `keep` runs after the temporary file is complete and before the rename. If
+/// it returns `false` the temporary file is removed and `path` is left as it
+/// was, existing or absent; the stats come back with `false`. This is how a
+/// caller refuses a lossy export (`samyama convert --require-lossless`)
+/// without having already overwritten the destination, which may be the
+/// conversion's own input.
+pub fn write_file_if(
+    store: &GraphStore,
+    path: impl AsRef<std::path::Path>,
+    opts: &WriteOptions,
+    keep: impl FnOnce(&ExportStats) -> bool,
+) -> Result<(ExportStats, bool), Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+
+    let written = (|| -> Result<ExportStats, Box<dyn std::error::Error>> {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let stats = export_tenant_with_compression(store, &mut out, opts.compression_level)?;
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        Ok(stats)
+    })();
+    let stats = match written {
+        Ok(stats) => stats,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if !keep(&stats) {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok((stats, false));
+    }
+    std::fs::rename(&tmp, path)?;
+    // The rename is durable only once the directory entry is. Unix lets a
+    // directory be opened and synced; elsewhere this is best left to the OS.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir.unwrap_or_else(|| std::path::Path::new("."))) {
+        let _ = d.sync_all();
+    }
+    Ok((stats, true))
 }
 
 /// Export at an explicit gzip level (0-9).
@@ -233,6 +322,22 @@ pub fn export_tenant_with_compression(
         GzEncoder::new(writer, Compression::new(compression_level.min(9))),
     );
 
+    // The store's sources go forward with its data (#1911). When the graph
+    // changed after they were recorded, they describe where it started, not
+    // what it is now: said in the loss report rather than claimed silently.
+    let sources = store.snapshot_sources().to_vec();
+    let mut dropped = dropped;
+    if !sources.is_empty() && !store.snapshot_sources_are_current() {
+        dropped.push(crate::snapshot::format::Dropped {
+            what: "sources_may_be_stale".to_string(),
+            count: sources.len() as u64,
+            detail: "The graph changed after it was converted from the sources in this \
+                     header, so they say where the data started, not that it still \
+                     matches them."
+                .to_string(),
+        });
+    }
+
     // Write header (v2)
     let header = SnapshotHeader {
         format: "sgsnap".to_string(),
@@ -248,6 +353,7 @@ pub fn export_tenant_with_compression(
         queries: None,
         read_only: false,
         results: None,
+        sources,
     };
     let header_json = serde_json::to_string(&header)?;
     gz.write_all(header_json.as_bytes())?;
@@ -804,6 +910,10 @@ fn import_tenant_inner(
         .next()
         .ok_or("empty snapshot file: missing header")??;
     let header: SnapshotHeader = serde_json::from_str(&header_line)?;
+    // Judged before this import writes anything: whether sources the store
+    // already holds still describe its data (#1911). Afterwards the import's
+    // own writes would make them all look changed.
+    let earlier_sources_current = store.snapshot_sources_are_current();
 
     if header.format != "sgsnap" {
         return Err(format!(
@@ -1341,6 +1451,24 @@ fn import_tenant_inner(
         }
     };
 
+    // Where this data came from travels with it, so the next export says so
+    // (#1911). Recorded last, once nothing else in the import can change the
+    // graph: the store compares against this point to tell whether the data
+    // still is what the sources describe.
+    // A snapshot whose export already flagged its sources as possibly stale
+    // stays flagged: importing it does not make it match them again.
+    if !header.sources.is_empty() {
+        let incoming_stale = header
+            .dropped
+            .iter()
+            .any(|d| d.what == "sources_may_be_stale");
+        store.record_snapshot_sources(
+            header.sources.clone(),
+            earlier_sources_current,
+            incoming_stale,
+        );
+    }
+
     Ok(ImportStats {
         node_count: imported_node_count,
         edge_count: imported_edge_count,
@@ -1382,177 +1510,6 @@ fn conflicting_definition<'a>(
             _ => false,
         }
     })
-}
-
-/// Convert PropertyValue to serde_json::Value for snapshot serialization
-fn property_to_json(pv: &PropertyValue) -> serde_json::Value {
-    match pv {
-        PropertyValue::String(s) => serde_json::Value::String(s.clone()),
-        PropertyValue::Integer(i) => serde_json::json!(i),
-        PropertyValue::Float(f) => serde_json::json!(f),
-        PropertyValue::Boolean(b) => serde_json::json!(b),
-        PropertyValue::Null => serde_json::Value::Null,
-        PropertyValue::DateTime(dt) => {
-            // Wrap in an object to distinguish from plain integer
-            serde_json::json!({"__type": "DateTime", "value": dt})
-        }
-        // The five real temporal types (#689). Same `__type` scheme as
-        // DateTime/Vector/Duration, and each carries its own components rather
-        // than an epoch, because an epoch cannot represent a `Date` without a
-        // zone or a `LocalTime` without a date. `DateTime` above stays exactly
-        // as it was so snapshots written before this still read back.
-        PropertyValue::Date(days) => serde_json::json!({"__type": "Date", "days": days}),
-        PropertyValue::LocalTime(nanos) => {
-            serde_json::json!({"__type": "LocalTime", "nanos": nanos})
-        }
-        PropertyValue::Time { nanos, offset_seconds } => {
-            serde_json::json!({"__type": "Time", "nanos": nanos, "offset": offset_seconds})
-        }
-        PropertyValue::LocalDateTime { secs, nanos } => {
-            serde_json::json!({"__type": "LocalDateTime", "secs": secs, "nanos": nanos})
-        }
-        PropertyValue::ZonedDateTime { secs, nanos, offset_seconds, zone } => {
-            serde_json::json!({
-                "__type": "ZonedDateTime",
-                "secs": secs, "nanos": nanos,
-                "offset": offset_seconds, "zone": zone
-            })
-        }
-        PropertyValue::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(property_to_json).collect())
-        }
-        PropertyValue::Map(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), property_to_json(v)))
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        PropertyValue::Vector(v) => {
-            serde_json::json!({"__type": "Vector", "value": v})
-        }
-        PropertyValue::Duration {
-            months,
-            days,
-            seconds,
-            nanos,
-        } => {
-            serde_json::json!({
-                "__type": "Duration",
-                "months": months,
-                "days": days,
-                "seconds": seconds,
-                "nanos": nanos
-            })
-        }
-    }
-}
-
-/// Convert serde_json::Value back to PropertyValue for snapshot import
-fn json_to_property(val: &serde_json::Value) -> PropertyValue {
-    match val {
-        serde_json::Value::String(s) => PropertyValue::String(s.trim().to_string()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                PropertyValue::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                PropertyValue::Float(f)
-            } else {
-                PropertyValue::Null
-            }
-        }
-        serde_json::Value::Bool(b) => PropertyValue::Boolean(*b),
-        serde_json::Value::Null => PropertyValue::Null,
-        serde_json::Value::Array(arr) => {
-            PropertyValue::Array(arr.iter().map(json_to_property).collect())
-        }
-        serde_json::Value::Object(obj) => {
-            // Check for tagged types (__type field)
-            if let Some(type_tag) = obj.get("__type").and_then(|v| v.as_str()) {
-                match type_tag {
-                    "DateTime" => {
-                        if let Some(dt) = obj.get("value").and_then(|v| v.as_i64()) {
-                            return PropertyValue::DateTime(dt);
-                        }
-                    }
-                    "Date" => {
-                        if let Some(d) = obj.get("days").and_then(|v| v.as_i64()) {
-                            return PropertyValue::Date(d as i32);
-                        }
-                    }
-                    "LocalTime" => {
-                        if let Some(n) = obj.get("nanos").and_then(|v| v.as_i64()) {
-                            return PropertyValue::LocalTime(n);
-                        }
-                    }
-                    "Time" => {
-                        if let Some(n) = obj.get("nanos").and_then(|v| v.as_i64()) {
-                            return PropertyValue::Time {
-                                nanos: n,
-                                offset_seconds: obj.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                            };
-                        }
-                    }
-                    "LocalDateTime" => {
-                        if let Some(sec) = obj.get("secs").and_then(|v| v.as_i64()) {
-                            return PropertyValue::LocalDateTime {
-                                secs: sec,
-                                nanos: obj.get("nanos").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                            };
-                        }
-                    }
-                    "ZonedDateTime" => {
-                        if let Some(sec) = obj.get("secs").and_then(|v| v.as_i64()) {
-                            return PropertyValue::ZonedDateTime {
-                                secs: sec,
-                                nanos: obj.get("nanos").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                                offset_seconds: obj.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                                zone: obj.get("zone").and_then(|v| v.as_str()).map(|z| z.to_string()),
-                            };
-                        }
-                    }
-                    "Vector" => {
-                        if let Some(arr) = obj.get("value").and_then(|v| v.as_array()) {
-                            let floats: Vec<f32> = arr
-                                .iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect();
-                            return PropertyValue::Vector(floats);
-                        }
-                    }
-                    "Duration" => {
-                        let months = obj
-                            .get("months")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        let days =
-                            obj.get("days").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let seconds = obj
-                            .get("seconds")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        let nanos = obj
-                            .get("nanos")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0) as i32;
-                        return PropertyValue::Duration {
-                            months,
-                            days,
-                            seconds,
-                            nanos,
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            // Plain map (no __type tag)
-            let map: HashMap<String, PropertyValue> = obj
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_property(v)))
-                .collect();
-            PropertyValue::Map(map)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2045,6 +2002,7 @@ mod tests {
             queries: None,
             read_only: false,
             results: None,
+            sources: Vec::new(),
         };
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         let header_json = serde_json::to_string(&header).unwrap();
@@ -2075,6 +2033,7 @@ mod tests {
             queries: None,
             read_only: false,
             results: None,
+            sources: Vec::new(),
         };
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         let header_json = serde_json::to_string(&header).unwrap();

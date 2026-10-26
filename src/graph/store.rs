@@ -260,12 +260,166 @@ pub struct PropertyStats {
     /// Empty when a property was never sampled, which is why the value-aware
     /// estimator falls back rather than assuming absence means rarity.
     pub most_common: Vec<(PropertyValue, f64)>,
+    /// Equi-depth histogram of the sampled values, for range predicates
+    /// (#478). `None` when the values are not all of one orderable kind.
+    pub histogram: Option<Histogram>,
 }
 
 /// How many values to retain per (label, property). Small on purpose: the
 /// point is to capture the head of a skewed distribution, and the tail is what
 /// histograms are for.
 pub const MAX_MCV: usize = 16;
+
+/// Buckets per equi-depth histogram (#478).
+pub const HISTOGRAM_BUCKETS: usize = 64;
+
+/// A string bound is kept to this many characters. Bounds are only compared,
+/// and a long text property would otherwise hold 65 copies of its longest
+/// values in the statistics.
+const HISTOGRAM_TEXT_BOUND: usize = 64;
+
+/// The axis a numeric histogram's values sit on. Cypher compares an integer
+/// with a float but not a date with a number, so each temporal kind is its own
+/// axis and a literal on another axis gets no estimate from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistogramAxis {
+    /// `Integer` and `Float`.
+    Number,
+    /// An instant: `ZonedDateTime`, and the legacy millisecond `DateTime`,
+    /// which reads as a UTC `ZonedDateTime`. In seconds.
+    Instant,
+    /// `LocalDateTime`, in wall-clock seconds.
+    LocalDateTime,
+    /// `Date`, in days.
+    Date,
+    /// `LocalTime`, in nanoseconds of the day.
+    LocalTime,
+}
+
+impl HistogramAxis {
+    /// `value` as a position on its axis, or `None` for a value no numeric
+    /// histogram orders.
+    pub fn of(value: &PropertyValue) -> Option<(HistogramAxis, f64)> {
+        match value {
+            PropertyValue::Integer(i) => Some((HistogramAxis::Number, *i as f64)),
+            PropertyValue::Float(f) if !f.is_nan() => Some((HistogramAxis::Number, *f)),
+            PropertyValue::DateTime(ms) => Some((HistogramAxis::Instant, *ms as f64 / 1000.0)),
+            PropertyValue::ZonedDateTime { secs, nanos, .. } => {
+                Some((HistogramAxis::Instant, *secs as f64 + *nanos as f64 / 1e9))
+            }
+            PropertyValue::LocalDateTime { secs, nanos } => {
+                Some((HistogramAxis::LocalDateTime, *secs as f64 + *nanos as f64 / 1e9))
+            }
+            PropertyValue::Date(d) => Some((HistogramAxis::Date, *d as f64)),
+            PropertyValue::LocalTime(n) => Some((HistogramAxis::LocalTime, *n as f64)),
+            _ => None,
+        }
+    }
+}
+
+/// How `a` orders against `b` on a histogram's axes: numbers with numbers,
+/// each temporal kind with itself, text with text. `None` across kinds, where
+/// Cypher's comparison is null.
+fn histogram_order(a: &PropertyValue, b: &PropertyValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (PropertyValue::String(x), PropertyValue::String(y)) => Some(x.cmp(y)),
+        _ => {
+            let ((ax, x), (bx, y)) = (HistogramAxis::of(a)?, HistogramAxis::of(b)?);
+            if ax != bx {
+                return None;
+            }
+            x.partial_cmp(&y)
+        }
+    }
+}
+
+/// An equi-depth histogram over the sampled non-null values of a property
+/// (#478): `bounds[0]` is the least value, `bounds[k]` the greatest, and each
+/// of the `k` buckets between two bounds holds about `1/k` of the values.
+///
+/// It answers what the 1/3 guess for every range predicate could not: on a
+/// skewed property `x < 10` may keep almost nothing or almost everything. The
+/// mass *at* a value comes from the most-common-value list, which is what the
+/// histogram cannot see -- a value repeated across many buckets is a run of
+/// equal bounds, and the estimate of `<` and `<=` must differ by exactly it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Histogram {
+    Numeric { axis: HistogramAxis, bounds: Vec<f64> },
+    Text { bounds: Vec<String> },
+}
+
+impl Histogram {
+    /// Build from sampled values, or `None` unless at least two are of one
+    /// orderable kind and no value is of another.
+    pub fn build(values: &[PropertyValue]) -> Option<Histogram> {
+        if values.len() < 2 {
+            return None;
+        }
+        if let PropertyValue::String(_) = &values[0] {
+            let mut texts: Vec<&str> = Vec::with_capacity(values.len());
+            for v in values {
+                let PropertyValue::String(t) = v else { return None };
+                texts.push(t);
+            }
+            texts.sort_unstable();
+            let bounds = Self::quantiles(&texts)
+                .into_iter()
+                .map(|t| t.chars().take(HISTOGRAM_TEXT_BOUND).collect())
+                .collect();
+            return Some(Histogram::Text { bounds });
+        }
+        let (axis, _) = HistogramAxis::of(&values[0])?;
+        let mut keys: Vec<f64> = Vec::with_capacity(values.len());
+        for v in values {
+            match HistogramAxis::of(v) {
+                Some((a, k)) if a == axis => keys.push(k),
+                _ => return None,
+            }
+        }
+        keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(Histogram::Numeric { axis, bounds: Self::quantiles(&keys) })
+    }
+
+    /// `HISTOGRAM_BUCKETS + 1` quantiles of a sorted slice, or one per value
+    /// when there are fewer.
+    fn quantiles<T: Clone>(sorted: &[T]) -> Vec<T> {
+        let n = sorted.len();
+        let k = HISTOGRAM_BUCKETS.min(n - 1);
+        (0..=k).map(|j| sorted[j * (n - 1) / k].clone()).collect()
+    }
+
+    /// The fraction of values strictly below `x`, or `None` when `x` is not
+    /// on this histogram's axis -- a comparison Cypher answers with null.
+    pub fn fraction_below(&self, x: &PropertyValue) -> Option<f64> {
+        fn cdf<T: PartialOrd>(bounds: &[T], x: &T, within: impl Fn(&T, &T) -> f64) -> f64 {
+            let k = bounds.len() - 1;
+            // The first bound at or above x: the buckets before it are below.
+            let j = bounds.partition_point(|b| b < x);
+            if j == 0 {
+                return 0.0;
+            }
+            if j > k {
+                return 1.0;
+            }
+            ((j - 1) as f64 + within(&bounds[j - 1], &bounds[j])) / k as f64
+        }
+        match (self, x) {
+            (Histogram::Text { bounds }, PropertyValue::String(t)) => {
+                let t: String = t.chars().take(HISTOGRAM_TEXT_BOUND).collect();
+                // No arithmetic between strings: half a bucket.
+                Some(cdf(bounds, &t, |_, _| 0.5))
+            }
+            (Histogram::Numeric { axis, bounds }, _) => {
+                let (a, v) = HistogramAxis::of(x)?;
+                if a != *axis {
+                    return None;
+                }
+                Some(cdf(bounds, &v, |lo, hi| if hi > lo { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 1.0 }))
+            }
+            _ => None,
+        }
+    }
+}
 
 impl GraphStatistics {
     /// Estimate the number of rows from a label scan
@@ -353,6 +507,87 @@ impl GraphStatistics {
             return ps.selectivity.min(remaining_mass.max(f64::EPSILON));
         }
         remaining_mass / remaining_distinct as f64
+    }
+
+    /// Estimate the selectivity of a range on `property` -- the fraction of
+    /// `label`'s nodes with `lower <(=) value <(=) upper`, either end open --
+    /// from the property's histogram (#478). Each bound is `(value,
+    /// inclusive)`.
+    ///
+    /// `None` when there is no histogram, or a bound is not on its axis; the
+    /// caller keeps its fixed guess, which is what it used for every range
+    /// before. The mass at a bound is the equality estimate, so `<` and `<=`
+    /// differ by the value's own frequency -- on a skewed property, the
+    /// difference between none of the rows and half of them.
+    pub fn estimate_range_selectivity(
+        &self,
+        label: &Label,
+        property: &str,
+        lower: Option<(&PropertyValue, bool)>,
+        upper: Option<(&PropertyValue, bool)>,
+    ) -> Option<f64> {
+        let ps = self.property_stats.get(&(label.clone(), property.to_string()))?;
+        let non_null = (1.0 - ps.null_fraction).clamp(0.0, 1.0);
+        // Every distinct value the sample saw is in the most-common list: the
+        // range is the sum of the ones it admits, exactly. A histogram's
+        // buckets are 1/64 of the values wide, which cannot resolve a tail of
+        // a few values holding 1% each -- the low-cardinality skewed property
+        // this is most often asked of.
+        if !ps.most_common.is_empty() && ps.most_common.len() >= ps.distinct_count {
+            let mut kept = 0.0;
+            for (v, freq) in &ps.most_common {
+                let admits = |bound: Option<(&PropertyValue, bool)>, below: bool| -> Option<bool> {
+                    let Some((b, inclusive)) = bound else { return Some(true) };
+                    let ord = histogram_order(v, b)?;
+                    Some(match (below, ord) {
+                        (_, std::cmp::Ordering::Equal) => inclusive,
+                        (true, o) => o == std::cmp::Ordering::Less,
+                        (false, o) => o == std::cmp::Ordering::Greater,
+                    })
+                };
+                if admits(upper, true)? && admits(lower, false)? {
+                    kept += freq;
+                }
+            }
+            return Some(kept.clamp(0.0, 1.0) * non_null);
+        }
+        let h = ps.histogram.as_ref()?;
+        // The fraction of non-null values below (or at, when inclusive) `v`.
+        let at_or_below = |v: &PropertyValue, inclusive: bool| -> Option<f64> {
+            let below = h.fraction_below(v)?;
+            let at = if inclusive { self.estimate_equality_selectivity_for_value(label, property, v) } else { 0.0 };
+            Some((below + at).clamp(0.0, 1.0))
+        };
+        let hi = match upper {
+            Some((v, inclusive)) => at_or_below(v, inclusive)?,
+            None => 1.0,
+        };
+        // Below the lower bound is what the range excludes: everything under
+        // it, and the bound itself when it is exclusive.
+        let lo = match lower {
+            Some((v, inclusive)) => at_or_below(v, !inclusive)?,
+            None => 0.0,
+        };
+        Some((hi - lo).max(0.0) * non_null)
+    }
+
+    /// [`Self::estimate_range_selectivity`] for one comparison, `property op
+    /// value`. `None` for an operator that is not a range.
+    pub fn estimate_comparison_selectivity(
+        &self,
+        label: &Label,
+        property: &str,
+        op: &crate::query::ast::BinaryOp,
+        value: &PropertyValue,
+    ) -> Option<f64> {
+        use crate::query::ast::BinaryOp;
+        match op {
+            BinaryOp::Lt => self.estimate_range_selectivity(label, property, None, Some((value, false))),
+            BinaryOp::Le => self.estimate_range_selectivity(label, property, None, Some((value, true))),
+            BinaryOp::Gt => self.estimate_range_selectivity(label, property, Some((value, false)), None),
+            BinaryOp::Ge => self.estimate_range_selectivity(label, property, Some((value, true)), None),
+            _ => None,
+        }
     }
 
     /// Format statistics as human-readable text
@@ -1087,6 +1322,9 @@ pub struct GraphStore {
     /// interior mutability the vector index needs for concurrent search has no
     /// counterpart here.
     pub fulltext: crate::index::fulltext::FullTextIndexes,
+    /// R-tree point indexes (NDS-04, #1618), maintained on the same paths as
+    /// the full-text indexes.
+    pub point_index: crate::index::point::PointIndexes,
 
     /// Property indices manager
     pub property_index: Arc<IndexManager>,
@@ -1160,6 +1398,18 @@ pub struct GraphStore {
     /// is `Relaxed`: a reader that sees a stale epoch re-executes the query,
     /// which is the safe direction.
     epoch: std::sync::atomic::AtomicU64,
+    /// Where this graph's data came from, from the `.sgsnap` headers it was
+    /// imported from or a converter that built it (#1911). Written back into
+    /// the header of every export.
+    snapshot_sources: Vec<crate::snapshot::format::SnapshotSource>,
+    /// The data epoch when `snapshot_sources` was last added to. An export at
+    /// a later epoch flags the sources as possibly stale.
+    snapshot_sources_epoch: u64,
+    /// Set once some recorded source is known not to describe the data any
+    /// more -- it arrived flagged, or the graph changed before more sources
+    /// were added -- and kept until `clear`, so adding sources never makes a
+    /// stale one current again.
+    snapshot_sources_stale: bool,
 }
 
 
@@ -1224,6 +1474,7 @@ impl GraphStore {
             bulk_load_finishes: 0,
             vector_index: Arc::new(VectorIndexManager::new()),
             fulltext: Default::default(),
+            point_index: Default::default(),
             property_index: Arc::new(IndexManager::new()),
             index_catalog_dirty: std::sync::atomic::AtomicBool::new(false),
             hierarchy_index: Arc::new(HierarchyIndexManager::new()),
@@ -1238,6 +1489,9 @@ impl GraphStore {
             catalog: GraphCatalog::new(),
             statistics_cache: std::sync::RwLock::new(None),
             epoch: std::sync::atomic::AtomicU64::new(0),
+            snapshot_sources: Vec::new(),
+            snapshot_sources_epoch: 0,
+            snapshot_sources_stale: false,
         }
     }
 
@@ -1445,8 +1699,8 @@ impl GraphStore {
     /// Resident bytes of every index the store holds, one row each, largest
     /// first (COST-06, NDS-14).
     ///
-    /// All four kinds: property indexes and unique constraints, full-text,
-    /// vector (with its HNSW graph) and hierarchy. The property kinds alone
+    /// All five kinds: property indexes and unique constraints, full-text,
+    /// vector (with its HNSW graph), hierarchy and point. The property kinds alone
     /// were reported before, so an index overhead figure left out the two
     /// structures most likely to be the largest.
     pub fn index_memory(&self) -> Vec<crate::index::IndexMemory> {
@@ -1461,6 +1715,16 @@ impl GraphStore {
             name: Some(h.name),
             bytes: h.bytes,
         }));
+        out.extend(self.point_index.index_memory().into_iter().map(
+            |(name, label, property, bytes, entries)| crate::index::IndexMemory {
+                kind: "point",
+                entries,
+                label,
+                property,
+                name: Some(name),
+                bytes,
+            },
+        ));
         out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.label.cmp(&b.label)));
         out
     }
@@ -1982,6 +2246,13 @@ NodeDeleted { .. } => {
         //
         // A property-less node indexes nothing, so the local call is skipped
         // rather than allocating to feed a loop that iterates zero times (#491).
+        if !self.point_index.is_empty() {
+            for (key, value) in &indexed_properties {
+                for label in &labels {
+                    self.point_index.on_property_set(label.as_str(), key, node_id, Some(value));
+                }
+            }
+        }
         // Full-text, which neither branch below reaches: it is fed on the
         // property-set path only, so a node created with its properties
         // through this call was never findable by a full-text search on a
@@ -2498,6 +2769,7 @@ NodeDeleted { .. } => {
         // through `on_property_removed` per label, because by the time a
         // reader asks, the labels are what is being torn down.
         self.fulltext.on_node_deleted(id);
+        self.point_index.on_node_removed(None, id);
 
         // `label_index` changes here, so the derived bitsets are stale (#730).
         self.invalidate_label_bits();
@@ -2603,6 +2875,9 @@ NodeDeleted { .. } => {
             let at = self.current_version;
             self.push_node_undo(node_id, NodeUndo::Label { at, label: label.clone(), had: true });
         }
+        if had && !self.point_index.is_empty() {
+            self.point_index.on_node_removed(Some(label.as_str()), node_id);
+        }
         let current_version = self.current_version;
 
         let node = self
@@ -2689,6 +2964,11 @@ NodeDeleted { .. } => {
         } else {
             self.node_properties_full(node_id)
         };
+        if !self.point_index.is_empty() {
+            for (k, v) in &properties {
+                self.point_index.on_property_set(label.as_str(), k, node_id, Some(v));
+            }
+        }
         let constrained: Vec<(&String, &PropertyValue)> =
             if self.property_index.has_any_unique_constraints() {
                 properties
@@ -3871,6 +4151,13 @@ NodeDeleted { .. } => {
                 }
             }
         }
+        if !self.point_index.is_empty() {
+            if let Some(node) = self.get_node(node_id) {
+                for label in &node.labels {
+                    self.point_index.on_property_set(label.as_str(), key, node_id, None);
+                }
+            }
+        }
         self.node_columns.remove_property(node_id.as_u64() as usize, key);
         let current_version = self.current_version;
         if let Some(node) = self.get_node_mut(node_id) {
@@ -4583,6 +4870,52 @@ NodeDeleted { .. } => {
         self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Where this graph's data came from (#1911). Empty for a graph built by
+    /// queries alone.
+    pub fn snapshot_sources(&self) -> &[crate::snapshot::format::SnapshotSource] {
+        &self.snapshot_sources
+    }
+
+    /// Record inputs this graph's data now comes from: the file a converter
+    /// just read. Appended, so two inputs into one graph keep both. The new
+    /// sources are taken as describing the graph as it is now; the ones
+    /// already held keep their state, so if the graph changed since they were
+    /// recorded, they stay flagged as possibly stale.
+    pub fn add_snapshot_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
+    ) {
+        let earlier_current = self.snapshot_sources_are_current();
+        self.record_snapshot_sources(sources, earlier_current, false);
+    }
+
+    /// [`add_snapshot_sources`](Self::add_snapshot_sources) for a caller that
+    /// changed the graph itself before recording, as an import does: whether
+    /// the sources already held were still current is judged by the caller
+    /// before its own writes (`earlier_current`), and `incoming_stale` says the
+    /// new sources arrived already flagged. Either one keeps the flag set.
+    pub fn record_snapshot_sources(
+        &mut self,
+        sources: impl IntoIterator<Item = crate::snapshot::format::SnapshotSource>,
+        earlier_current: bool,
+        incoming_stale: bool,
+    ) {
+        if !earlier_current || incoming_stale {
+            self.snapshot_sources_stale = true;
+        }
+        self.snapshot_sources.extend(sources);
+        self.snapshot_sources_epoch = self.epoch();
+    }
+
+    /// Whether every recorded source still describes the data: none was
+    /// flagged, and the data is unchanged since they were last recorded.
+    /// `false` means an export should say they may be stale. True for a graph
+    /// with no sources, which has nothing to be stale.
+    pub fn snapshot_sources_are_current(&self) -> bool {
+        self.snapshot_sources.is_empty()
+            || (!self.snapshot_sources_stale && self.epoch() == self.snapshot_sources_epoch)
+    }
+
     /// Declare that query-visible data changed.
     ///
     /// `&self` rather than `&mut self` so the paths that hand out an interior
@@ -5067,6 +5400,11 @@ NodeDeleted { .. } => {
             // holding every distinct value seen.
             let mut property_values: HashMap<String, HashMap<u64, (PropertyValue, usize)>> =
                 HashMap::new();
+            // The sampled values a histogram can order (#478). Others -- maps,
+            // lists, vectors -- are not kept, so an embedding property costs
+            // nothing here.
+            let mut property_samples: HashMap<String, Vec<PropertyValue>> = HashMap::new();
+            let mut unorderable: HashSet<String> = HashSet::new();
 
             for (i, &node_id) in node_ids.iter().enumerate() {
                 if i >= sample_size { break; }
@@ -5088,6 +5426,12 @@ NodeDeleted { .. } => {
                             hasher.finish()
                         };
                         property_distinct.entry(key.clone()).or_default().insert(hash);
+
+                        if matches!(val, PropertyValue::String(_)) || HistogramAxis::of(val).is_some() {
+                            property_samples.entry(key.clone()).or_default().push(val.clone());
+                        } else if !matches!(val, PropertyValue::Null) {
+                            unorderable.insert(key.clone());
+                        }
 
                         let counts = property_values.entry(key.clone()).or_default();
                         // Bound the working set: once enough distinct values
@@ -5121,11 +5465,18 @@ NodeDeleted { .. } => {
                     }
                 }
 
+                let histogram = if unorderable.contains(prop) {
+                    None
+                } else {
+                    property_samples.get(prop).and_then(|v| Histogram::build(v))
+                };
+
                 property_stats.insert((label.clone(), prop.clone()), PropertyStats {
                     null_fraction: 1.0 - (*count as f64 / sample_size as f64),
                     distinct_count: distinct,
                     selectivity,
                     most_common,
+                    histogram,
                 });
             }
         }
@@ -6136,6 +6487,8 @@ NodeDeleted { .. } => {
     /// Clear all data from the graph
     pub fn clear(&mut self) {
         self.invalidate_statistics_cache();
+        self.snapshot_sources.clear();
+        self.snapshot_sources_stale = false;
         self.nodes.clear();
         self.edge_type_table.clear();
         self.edge_type_to_id.clear();
@@ -6229,6 +6582,13 @@ NodeDeleted { .. } => {
         for label in labels {
             self.property_index.index_insert(label, key, new_value.clone(), id);
         }
+        // Point indexes on the same choke point (#1618): a value that is not
+        // a point removes the node from the index.
+        if !self.point_index.is_empty() {
+            for label in labels {
+                self.point_index.on_property_set(label.as_str(), key, id, Some(new_value));
+            }
+        }
         // Full-text maintenance on the same choke point as the property
         // index. A full-text index maintained from the callers of
         // this function instead would go stale at whichever caller was
@@ -6311,6 +6671,9 @@ NodeDeleted { .. } => {
             |(name, label, property)| IndexDefinition::FullText { name, label, property },
         ));
         definitions.extend(self.vector_index.definitions());
+        definitions.extend(self.point_index.listing().into_iter().map(
+            |(name, label, property)| IndexDefinition::Point { name, label, property },
+        ));
         // Sorted so two runs of the same DDL produce byte-identical records and
         // a diff of the catalog is a diff of the indexes, not of hash order.
         definitions.sort_by_key(|d| match d {
@@ -6329,6 +6692,9 @@ NodeDeleted { .. } => {
                 property.clone(),
                 name.clone().unwrap_or_default(),
             ),
+            IndexDefinition::Point { name, label, property } => {
+                (4u8, label.clone(), property.clone(), name.clone())
+            }
         });
         IndexCatalog { definitions }
     }
@@ -6530,6 +6896,10 @@ NodeDeleted { .. } => {
                     self.create_fulltext_index(name, label, property);
                     report.fulltext += 1;
                 }
+                IndexDefinition::Point { name, label, property } => {
+                    self.create_point_index(name, label, property);
+                    report.point += 1;
+                }
                 IndexDefinition::Vector {
                     name,
                     label,
@@ -6602,6 +6972,29 @@ NodeDeleted { .. } => {
             })
             .collect();
         self.fulltext.rebuild(name, docs)
+    }
+
+    /// `CREATE POINT INDEX` — declare the R-tree and fill it from the nodes
+    /// already present (#1618). Returns the points indexed.
+    pub fn create_point_index(&mut self, name: &str, label: &str, property: &str) -> usize {
+        self.bump_epoch();
+        self.mark_index_catalog_changed();
+        self.point_index.create(name, label, property);
+        let points: Vec<(NodeId, PropertyValue)> = self
+            .node_ids_by_label(&Label::new(label), None)
+            .into_iter()
+            .filter_map(|id| self.node_properties_merged(id).get(property).cloned().map(|v| (id, v)))
+            .collect();
+        self.point_index.rebuild(name, points)
+    }
+
+    pub fn drop_point_index(&mut self, name: &str) -> bool {
+        self.bump_epoch();
+        let dropped = self.point_index.drop_index(name);
+        if dropped {
+            self.mark_index_catalog_changed();
+        }
+        dropped
     }
 
     pub fn drop_fulltext_index(&mut self, name: &str) -> bool {
@@ -7134,6 +7527,8 @@ mod tests {
             ("txn_create_node", "reserves an id inside the transaction; the node enters the store at commit_transaction, which bumps (#1200)"),
             ("begin_session_transaction", "opens the session transaction and advances the version; no row changes, and the statements that follow bump on their own paths (#1200 step 6)"),
             ("commit_session_transaction", "drops the rollback journal, keeping every write already applied and already bumped; rollback_session_transaction, which does change rows, bumps (#1200 step 6)"),
+            ("add_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
+            ("record_snapshot_sources", "records where the data came from, for the next export's header; no query reads it, and it must not bump: it records the current epoch to tell later writes apart (#1911)"),
         ];
 
         let src = std::fs::read_to_string(concat!(

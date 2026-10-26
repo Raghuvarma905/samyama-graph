@@ -522,12 +522,12 @@ fn with_clause_carries_its_own_filter_and_row_counts() {
 fn set_items_of_every_form() {
     let q = ok("MATCH (n) SET n.a = 1, n = {b: 2}, n += {c: 3}, n:L1:L2");
     let s = &q.set_clauses[0];
-    assert_eq!(s.items.len(), 1);
-    assert_eq!(s.entity_items.len(), 2);
-    assert!(!s.entity_items[0].merge);
-    assert!(s.entity_items[1].merge);
-    assert_eq!(s.label_items.len(), 1);
-    assert_eq!(s.label_items[0].labels.len(), 2);
+    assert_eq!(s.items().count(), 1);
+    assert_eq!(s.entity_items().count(), 2);
+    assert!(!s.entity_items().next().unwrap().merge);
+    assert!(s.entity_items().nth(1).unwrap().merge);
+    assert_eq!(s.label_items().count(), 1);
+    assert_eq!(s.label_items().next().unwrap().labels.len(), 2);
 }
 
 #[test]
@@ -537,12 +537,12 @@ fn merge_statement_with_every_action() {
                 ON MATCH SET n.c = 3, n = {k: 1}, n:Seen \
                 SET n.d = 4 REMOVE n.e RETURN n");
     let m = q.merge_clause.as_ref().unwrap();
-    assert_eq!(m.on_create_set.len(), 1);
-    assert_eq!(m.on_create_entity_set.len(), 1);
-    assert_eq!(m.on_create_labels.len(), 1);
-    assert_eq!(m.on_match_set.len(), 1);
-    assert_eq!(m.on_match_entity_set.len(), 1);
-    assert_eq!(m.on_match_labels.len(), 1);
+    assert_eq!(m.on_create_set().count(), 1);
+    assert_eq!(m.on_create_entity_set().count(), 1);
+    assert_eq!(m.on_create_labels().count(), 1);
+    assert_eq!(m.on_match_set().count(), 1);
+    assert_eq!(m.on_match_entity_set().count(), 1);
+    assert_eq!(m.on_match_labels().count(), 1);
     assert_eq!(q.set_clauses.len(), 1);
     assert_eq!(q.remove_clauses.len(), 1);
     assert!(q.return_clause.is_some());
@@ -554,12 +554,12 @@ fn inline_merge_with_every_action() {
                 ON CREATE SET b.x = 1, b += {y: 2}, b:C \
                 ON MATCH SET b.z = 1, b = {z: 2}, b:D RETURN b");
     let m = q.merge_clause.as_ref().unwrap();
-    assert_eq!(m.on_create_set.len(), 1);
-    assert_eq!(m.on_create_entity_set.len(), 1);
-    assert_eq!(m.on_create_labels.len(), 1);
-    assert_eq!(m.on_match_set.len(), 1);
-    assert_eq!(m.on_match_entity_set.len(), 1);
-    assert_eq!(m.on_match_labels.len(), 1);
+    assert_eq!(m.on_create_set().count(), 1);
+    assert_eq!(m.on_create_entity_set().count(), 1);
+    assert_eq!(m.on_create_labels().count(), 1);
+    assert_eq!(m.on_match_set().count(), 1);
+    assert_eq!(m.on_match_entity_set().count(), 1);
+    assert_eq!(m.on_match_labels().count(), 1);
 }
 
 #[test]

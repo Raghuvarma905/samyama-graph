@@ -144,5 +144,33 @@ CALL algo.or.solve({
 })
 ```
 
+### What a solve returns
+
+Every row reports how good the answer is, not only the answer (OPT-09):
+
+| Column | Meaning |
+|---|---|
+| `fitness` | Objective plus constraint penalty: what the solver minimised. A list for a multi-objective solve. |
+| `objective` | The objective alone, without the penalty. Equal to `fitness` when the answer is feasible. |
+| `feasible` | `true` when the answer meets every constraint (`budget`, `minTotal`). Strict: any violation is `false`. |
+| `gap` | `objective - bestKnown`, in the objective's units; negative means the answer beat it. `null` unless you pass `bestKnown`, because no solver here can prove a bound. |
+| `iterations` / `max_iterations` | Iterations run, and the cap you set. |
+| `total_time_ms` | Wall-clock time of the solve alone, in milliseconds. |
+| `algorithm`, `history` | The solver, and its best fitness per iteration. Multi-objective solves return `front_size` in place of `history`. |
+
+`bestKnown` (or `best_known`) must be a finite number, and applies to
+single-objective solves only: a Pareto front has no single best known value,
+so passing it there is an error rather than a `gap` that is silently `null`.
+
+```cypher
+CALL algo.or.solve({label: 'Factory', property: 'production', cost_property: 'cost',
+                    budget: 50000.0, bestKnown: 41000.0})
+YIELD objective, feasible, gap, total_time_ms
+```
+
+`/optimize/solve` reports `feasible` and `gap` in its `done` event as well:
+`gap` against the benchmark's known optimum, and both `null` for a
+multi-objective benchmark (see #1795 for why feasibility cannot be read there yet).
+
 ## License
 Apache-2.0

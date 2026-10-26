@@ -31,6 +31,7 @@ async fn main() {
         Some("queries") => std::process::exit(cmd_queries(&argv)),
         Some("snapshot-read-only") => std::process::exit(cmd_snapshot_read_only(&argv)),
         Some("results-build") => std::process::exit(cmd_results_build(&argv)),
+        Some("convert") => std::process::exit(cmd_convert(&argv)),
         _ => {}
     }
 
@@ -774,6 +775,331 @@ fn cmd_auth_token(argv: &[String]) -> i32 {
 /// run is refused before any query executes: a catalog from another build
 /// checks another graph's answers. A snapshot whose header names no catalog
 /// verifies exactly as before.
+/// `samyama convert <input> <output>`: convert a graph file to another format,
+/// offline, with a loss report (#1909, #1905). A thin command over
+/// [`samyama::convert`].
+///
+/// Exit codes: 0 converted (the report may list losses); 1 converted, but
+/// `--require-lossless` was given and something was dropped; 2 usage (unknown
+/// or unsupported format, missing argument); 65 the input could not be
+/// parsed; 66 the input could not be opened; 73 the output could not be
+/// written. 0 and 2 match `samyama queries run`; 65, 66 and 73 are the
+/// sysexits codes `verify` already uses.
+fn cmd_convert(argv: &[String]) -> i32 {
+    use samyama::convert::{self, EndpointPolicy, Format, Options};
+
+    let usage = || {
+        eprintln!(
+            "usage: samyama convert <input> <output> [--from FMT] [--to FMT]\n\
+             \x20                      [--missing-endpoints fail|placeholder|drop]\n\
+             \x20                      [--report report.json] [--require-lossless]\n\
+             \x20      samyama convert --formats\n\n\
+             The format comes from each file's extension; --from / --to override it.\n\
+             A path with no extension is a CSV directory.\n\n{}",
+            convert::format_matrix()
+        );
+    };
+    let rest = &argv[2..];
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        usage();
+        return 0;
+    }
+    if rest.iter().any(|a| a == "--formats") {
+        print!("{}", convert::format_matrix());
+        return 0;
+    }
+
+    // Flags that take a value, and the positional arguments around them.
+    const VALUED: [&str; 6] = ["--from", "--to", "--missing-endpoints", "--report", "--mapping", "--preset"];
+    let mut positional = Vec::new();
+    let mut values = std::collections::HashMap::new();
+    let mut require_lossless = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if VALUED.contains(&a) {
+            match rest.get(i + 1).filter(|v| !v.starts_with("--")) {
+                Some(v) => {
+                    values.insert(a, v.as_str());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("convert: {a} needs a value");
+                    return 2;
+                }
+            }
+        } else if a == "--require-lossless" {
+            require_lossless = true;
+            i += 1;
+        } else if a.starts_with("--") {
+            eprintln!("convert: unknown option {a}");
+            usage();
+            return 2;
+        } else {
+            positional.push(a);
+            i += 1;
+        }
+    }
+    let [input, output] = positional[..] else {
+        eprintln!("convert: needs exactly an <input> and an <output>, got {}", positional.len());
+        usage();
+        return 2;
+    };
+    // The RDF mapping arrives with #1910; until then a flag that would change
+    // the result is refused rather than ignored.
+    for flag in ["--mapping", "--preset"] {
+        if values.contains_key(flag) {
+            eprintln!("convert: {flag} is not supported yet (#1910)");
+            return 2;
+        }
+    }
+    let on_missing_endpoint = match values.get("--missing-endpoints").copied() {
+        None | Some("fail") => EndpointPolicy::Fail,
+        Some("placeholder") => EndpointPolicy::Placeholder,
+        Some("drop") => EndpointPolicy::Drop,
+        Some(other) => {
+            eprintln!("convert: --missing-endpoints is fail, placeholder or drop, not {other:?}");
+            return 2;
+        }
+    };
+    let pick = |flag: &str, path: &str| -> Result<Format, i32> {
+        match values.get(flag) {
+            Some(name) => Format::from_name(name).ok_or_else(|| {
+                eprintln!("convert: {flag} {name:?} is not a format; see --formats");
+                2
+            }),
+            None => Format::from_path(std::path::Path::new(path)).ok_or_else(|| {
+                eprintln!("convert: cannot tell the format of {path} from its extension; pass {flag}");
+                2
+            }),
+        }
+    };
+    let from = match pick("--from", input) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    let to = match pick("--to", output) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    // Both checked before the input is opened: an unsupported output must not
+    // cost a read of a large input.
+    if !from.can_read() {
+        eprintln!("convert: {}", convert::ConvertError::CannotRead(from));
+        return 2;
+    }
+    if !to.can_write() {
+        eprintln!("convert: {}", convert::ConvertError::CannotWrite(to));
+        return 2;
+    }
+
+    // The report is written last and unconditionally, so a report path that is
+    // the input or the output would replace that graph with JSON. Refused
+    // before anything is read or written.
+    if let Some(report) = values.get("--report") {
+        for (role, graph) in [("input", input), ("output", output)] {
+            if same_path(std::path::Path::new(report), std::path::Path::new(graph)) {
+                eprintln!("convert: --report {report} is the {role} {graph}; name a different file");
+                return 2;
+            }
+        }
+    }
+
+    // Losses are judged here, after writing, so exit 1 means "converted, and
+    // something was dropped" -- the report is still written.
+    let opts = Options { on_missing_endpoint, require_lossless: false };
+    let file = match std::fs::File::open(input) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("convert: could not open {input}: {e}");
+            return 66;
+        }
+    };
+    let mut store = samyama::graph::GraphStore::new();
+    let read = match convert::read(from, std::io::BufReader::new(file), &mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("convert: could not read {input} as {from}: {e}");
+            return 65;
+        }
+    };
+    eprintln!("read {from}: {} nodes, {} edges", read.node_count(), read.edge_count());
+    let written = if Format::from_path(std::path::Path::new(output)) == Some(to) {
+        convert::write_path(&store, std::path::Path::new(output), &opts)
+    } else {
+        // `--to` overrides the extension (or names a format for a path that has
+        // none we know), so the writer is chosen by format and the file is
+        // still replaced whole: written to a new, uniquely named file beside
+        // it, then renamed. An existing `<output>.tmp` or a symlink is never
+        // truncated or followed, and the staging file removes itself on error.
+        write_as(&store, to, std::path::Path::new(output), &opts)
+    };
+    let written = match written {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("convert: could not write {output} as {to}: {e}");
+            return 73;
+        }
+    };
+    let report = convert::ConvertReport { input_format: from, output_format: to, input: read, output: written };
+    let dropped: Vec<String> = report.dropped().iter().map(|d| format!("{} {}", d.count, d.what)).collect();
+    eprintln!(
+        "{from} → {to}: {} nodes, {} edges; dropped: {}",
+        report.output.node_count(),
+        report.output.edge_count(),
+        if dropped.is_empty() { "nothing".to_string() } else { dropped.join(", ") }
+    );
+
+    if let Some(path) = values.get("--report") {
+        let side = |r: &convert::FormatReport| {
+            serde_json::json!({
+                "nodes": r.node_count(),
+                "edges": r.edge_count(),
+                "dropped": r.dropped(),
+            })
+        };
+        let json = serde_json::json!({
+            "input": { "path": input, "format": from.to_string(), "report": side(&report.input) },
+            "output": { "path": output, "format": to.to_string(), "report": side(&report.output) },
+            "lossless": report.lossless(),
+        });
+        // Checked again now that the output exists and the report's directory
+        // has been made: both resolve to real files, so no spelling of either
+        // path can hide that they are the same one. The graph stays as written.
+        let report_path = std::path::Path::new(path);
+        if let Some(dir) = report_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        for (role, graph) in [("input", input), ("output", output)] {
+            if same_path(report_path, std::path::Path::new(graph)) {
+                eprintln!("convert: --report {path} is the {role} {graph}; the report was not written");
+                return 2;
+            }
+        }
+        // Staged and renamed, so a symlink at the report path is replaced
+        // rather than followed onto a graph file.
+        let bytes = serde_json::to_vec_pretty(&json).unwrap_or_default();
+        let written = write_staged(std::path::Path::new(path), |out| {
+            std::io::Write::write_all(out, &bytes).map_err(|e| samyama::convert::ConvertError::Io { path: path.into(), source: e })
+        });
+        if let Err(e) = written {
+            eprintln!("convert: could not write the report {path}: {e}");
+            return 73;
+        }
+    }
+
+    if require_lossless && !report.lossless() {
+        eprintln!("convert: --require-lossless was given and the conversion dropped {}", dropped.join(", "));
+        return 1;
+    }
+    0
+}
+
+/// Write `store` as `format` to `output` whatever its extension says, through
+/// a fresh staging file beside it renamed into place.
+fn write_as(
+    store: &samyama::graph::GraphStore,
+    format: samyama::convert::Format,
+    output: &std::path::Path,
+    opts: &samyama::convert::Options,
+) -> Result<samyama::convert::FormatReport, samyama::convert::ConvertError> {
+    write_staged(output, |out| samyama::convert::write(format, store, out, opts))
+}
+
+/// Write `path` through a new, uniquely named staging file beside it
+/// (`.<name>.XXXXXX.tmp`), synced and then renamed over `path`. An existing
+/// `<path>.tmp` is never truncated, and a symlink at `path` is replaced by the
+/// rename, not written through, so it cannot redirect the write onto another
+/// file. The staging file removes itself on error.
+fn write_staged<T>(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T, samyama::convert::ConvertError>,
+) -> Result<T, samyama::convert::ConvertError> {
+    use samyama::convert::ConvertError;
+    let io = |p: &std::path::Path, source: std::io::Error| ConvertError::Io { path: p.into(), source };
+    let parent = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| io(parent, e))?;
+    let (file, staged) = staging.into_parts();
+    let mut out = std::io::BufWriter::new(file);
+    let written = write(&mut out)?;
+    let file = out.into_inner().map_err(|e| io(&staged, e.into_error()))?;
+    file.sync_all().map_err(|e| io(&staged, e))?;
+    staged.persist(path).map_err(|e| io(path, e.error))?;
+    Ok(written)
+}
+
+/// Whether `a` and `b` name the same file: the same path once symlinks and
+/// `.`/`..` are resolved, or, on Unix, the same inode, which catches hard
+/// links. A path that does not exist yet -- an output whose directory the
+/// writer will create -- is resolved through its nearest existing ancestor,
+/// with the rest normalized by name.
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn resolved(p: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::path::Component;
+        let mut absolute = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().ok()?.join(p) };
+        // A dangling symlink does not canonicalize, but what it names is where
+        // a write through it lands: follow it, by hand, to its target. Bounded
+        // like the OS's own limit, so a loop of links cannot hang this.
+        for _ in 0..40 {
+            let is_link = std::fs::symlink_metadata(&absolute).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            if !is_link || std::fs::canonicalize(&absolute).is_ok() {
+                break;
+            }
+            let target = std::fs::read_link(&absolute).ok()?;
+            absolute = absolute.parent()?.join(target);
+        }
+        // Walk up to the deepest ancestor that exists, so its symlinks resolve.
+        let mut base = absolute.as_path();
+        let mut full = loop {
+            if let Ok(c) = std::fs::canonicalize(base) {
+                break c;
+            }
+            base = base.parent()?;
+        };
+        // The rest is walked a component at a time. A `..` can climb back out
+        // of a missing directory into ones that exist, so wherever the path so
+        // far exists it is canonicalized again, and a symlink met there is
+        // followed (`new/../alias/x` with `alias -> real` is `real/x`).
+        let tail = absolute.strip_prefix(base).ok()?;
+        for part in tail.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    full.pop();
+                }
+                Component::Normal(name) => full.push(name),
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+            if let Ok(c) = std::fs::canonicalize(&full) {
+                full = c;
+            }
+        }
+        Some(full)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if (ma.dev(), ma.ino()) == (mb.dev(), mb.ino()) {
+                return true;
+            }
+        }
+    }
+    match (resolved(a), resolved(b)) {
+        (Some(ra), Some(rb)) => ra == rb,
+        _ => a == b,
+    }
+}
+
 fn cmd_verify(argv: &[String]) -> i32 {
     let flag = |name: &str| argv.iter().position(|a| a == name).and_then(|i| argv.get(i + 1));
     let Some(snapshot) = argv.get(2).filter(|s| !s.starts_with("--")) else {
@@ -879,6 +1205,17 @@ fn cmd_verify(argv: &[String]) -> i32 {
     let total = report.results.len();
     let failed: Vec<_> = report.failed().collect();
     println!("verify {snapshot}");
+    // Where the data came from, when a converter recorded it (#1911).
+    for src in &header.sources {
+        println!(
+            "  source {} ({}), sha256 {}, by {}{}",
+            src.file,
+            src.format,
+            src.sha256,
+            src.converter,
+            if src.mapping.is_some() { ", with a mapping" } else { "" }
+        );
+    }
     println!("  catalog {catalog_path}: {total} entries");
     if header.queries.is_some() {
         println!("  catalog sha256 matches the snapshot header");

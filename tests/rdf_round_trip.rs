@@ -37,9 +37,12 @@ fn round_trip(source: &GraphStore) -> GraphStore {
         .sync_to_rdf(source, &mut rdf)
         .expect("export");
     let mut out = GraphStore::new();
-    RdfToGraphMapper::new(BASE)
+    let report = RdfToGraphMapper::new(BASE)
         .map_to_graph(&rdf, &mut out)
         .expect("import");
+    // Samyama's own RDF is the case the mapping exists for: nothing in it may
+    // be skipped or flattened (#1906).
+    assert!(report.lossless(), "a Samyama export did not import losslessly: {report:?}");
     out
 }
 

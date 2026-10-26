@@ -53,13 +53,18 @@ reason rather than "Unknown procedure":
 ```text
 CALL gds.pageRank.write()
 -> `gds.pageRank.write` is not supported: this engine streams results, and
-   GDS's `write` mode writes them. Call `gds.pagerank.stream` or
-   `algo.pagerank` and write the result yourself with SET.
+   GDS's `write` mode returns a summary row instead. To store the result on
+   each node, call `algo.pagerank({writeProperty: 'name'})`; it streams the
+   rows as well.
 ```
 
-Aliasing a write mode onto the streaming implementation would run a different
-operation under a name the user already trusts. That is worse than not
-recognising the name.
+The write itself exists: `algo.<name>({writeProperty: '...'})` stores each
+node's result (see "Write-back" in `ALGORITHM-CONVENTIONS.md`). It is not
+aliased onto `gds.<name>.write` because GDS's write mode returns one summary
+row (`nodePropertiesWritten`, ...) where ours returns the rows, and running a
+different result shape under a name the user already trusts is worse than not
+recognising the name. `mutate` needs graph projections, which do not exist
+yet.
 
 ### Divergent semantics
 
