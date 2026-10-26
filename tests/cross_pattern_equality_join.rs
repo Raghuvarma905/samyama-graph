@@ -448,3 +448,11 @@ fn an_equality_within_one_pattern_is_not_a_join() {
     let got = agreed(&indexed, &plain, q);
     assert_eq!(got.len(), 2, "a reflexive equality excludes nothing: {got:?}");
 }
+
+#[test]
+fn one_row_scans_keep_the_cheaper_product_plan() {
+    let mut s=GraphStore::new();
+    write(&mut s,"CREATE (:TinyA {k: 1}), (:TinyB {k: 1})");
+    let text=plan(&s,"MATCH (a:TinyA) MATCH (b:TinyB) WHERE a.k = b.k RETURN a");
+    assert!(!text.contains("ExpressionHashJoin"),"{text}");
+}

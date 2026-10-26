@@ -6449,9 +6449,12 @@ impl QueryPlanner {
         // With LIMIT a lazy filtered product can stop early, whereas the hash
         // join materializes both inputs. Preserve that cheaper startup plan.
         fn estimate(op: &mut OperatorBox, store: &GraphStore) -> Option<f64> {
-            let children: Vec<Option<f64>> = op.children_mut().into_iter()
-                .map(|child| estimate(child, store)).collect();
-            op.estimate_rows(store, &children)
+            // Expansion estimates can floor to one even for many matching
+            // paths. Only use direct scan counts to prove a product is tiny.
+            match op.describe().name.as_str() {
+                "NodeScan" | "SingleRow" => op.estimate_rows(store, &[]),
+                _ => None,
+            }
         }
         let product_is_cheaper = match (estimate(&mut left, store), estimate(&mut right, store)) {
             (Some(l), Some(r)) => l * r <= l + r,
