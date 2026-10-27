@@ -23,6 +23,8 @@ use samyama_optimization::common::{
     duration_ms, gap_to_best_known, is_feasible, MultiObjectiveProblem, Problem, SimpleProblem,
     SolverConfig,
 };
+use samyama_optimization::benchmarks::{DTLZ, DTLZ_FRONT_SAMPLES_PER_AXIS, ZDT, ZDT_FRONT_SAMPLES};
+use samyama_optimization::moo::{quality_metrics, QualityMetrics};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, convert::Infallible, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, Mutex};
@@ -262,7 +264,19 @@ fn benchmark_catalog() -> Vec<BenchmarkInfo> {
         BenchmarkInfo { id: "zdt1",       name: "ZDT1",       dim: 30, lower: 0.0,      upper: 1.0,     num_objectives: 2, ty: "multi",  optimum: None },
         BenchmarkInfo { id: "zdt2",       name: "ZDT2",       dim: 30, lower: 0.0,      upper: 1.0,     num_objectives: 2, ty: "multi",  optimum: None },
         BenchmarkInfo { id: "zdt3",       name: "ZDT3",       dim: 30, lower: 0.0,      upper: 1.0,     num_objectives: 2, ty: "multi",  optimum: None },
+        // ZDT5 is binary-coded and cannot be posed to these continuous
+        // solvers, so the ZDT suite here is the other five (OPT-03).
+        BenchmarkInfo { id: "zdt4",       name: "ZDT4",       dim: 10, lower: 0.0,      upper: 1.0,     num_objectives: 2, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "zdt6",       name: "ZDT6",       dim: 10, lower: 0.0,      upper: 1.0,     num_objectives: 2, ty: "multi",  optimum: None },
+        // The usual DTLZ sizes at three objectives: k = 5 distance variables
+        // for DTLZ1, 10 for DTLZ2-6, 20 for DTLZ7 (Deb et al. 2002).
         BenchmarkInfo { id: "dtlz1",      name: "DTLZ1",      dim: 7,  lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "dtlz2",      name: "DTLZ2",      dim: 12, lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "dtlz3",      name: "DTLZ3",      dim: 12, lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "dtlz4",      name: "DTLZ4",      dim: 12, lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "dtlz5",      name: "DTLZ5",      dim: 12, lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "dtlz6",      name: "DTLZ6",      dim: 12, lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
+        BenchmarkInfo { id: "dtlz7",      name: "DTLZ7",      dim: 22, lower: 0.0,      upper: 1.0,     num_objectives: 3, ty: "multi",  optimum: None },
         BenchmarkInfo { id: "uc2_dosing", name: "UC2 — Drug-combination dosing", dim: 6, lower: 0.0, upper: 1.0, num_objectives: 3, ty: "usecase", optimum: None },
     ]
 }
@@ -299,50 +313,39 @@ fn single_obj(name: &str, dim: usize, lower: f64, upper: f64) -> SimpleProblem<f
     }
 }
 
-struct ZDT { variant: u8, dim: usize }
-impl MultiObjectiveProblem for ZDT {
-    fn dim(&self) -> usize { self.dim }
-    fn num_objectives(&self) -> usize { 2 }
-    fn bounds(&self) -> (Array1<f64>, Array1<f64>) {
-        (Array1::zeros(self.dim), Array1::ones(self.dim))
-    }
-    fn objectives(&self, x: &Array1<f64>) -> Vec<f64> {
-        let f1 = x[0];
-        let n = self.dim as f64;
-        let g = 1.0 + 9.0 * x.iter().skip(1).sum::<f64>() / (n - 1.0);
-        let f2 = match self.variant {
-            1 => g * (1.0 - (f1 / g).sqrt()),
-            2 => g * (1.0 - (f1 / g).powi(2)),
-            3 => g * (1.0 - (f1 / g).sqrt() - (f1 / g) * (10.0 * std::f64::consts::PI * f1).sin()),
-            _ => g * (1.0 - (f1 / g).sqrt()),
-        };
-        vec![f1, f2]
-    }
+/// A catalogue benchmark with a known Pareto front: a ZDT or DTLZ problem
+/// from `samyama-optimization`, at the catalogue's size.
+///
+/// The crate's definitions, not copies of them: this file used to carry its
+/// own ZDT and DTLZ1, and its ZDT quietly ran ZDT1 for any variant it did not
+/// know. One definition means the problem a client solves is the one its
+/// quality is measured against.
+enum FrontProblem {
+    Zdt(ZDT),
+    Dtlz(DTLZ),
 }
 
-struct DTLZ1 { dim: usize, m: usize }
-impl MultiObjectiveProblem for DTLZ1 {
-    fn dim(&self) -> usize { self.dim }
-    fn num_objectives(&self) -> usize { self.m }
-    fn bounds(&self) -> (Array1<f64>, Array1<f64>) {
-        (Array1::zeros(self.dim), Array1::ones(self.dim))
-    }
-    fn objectives(&self, x: &Array1<f64>) -> Vec<f64> {
-        let k = self.dim - self.m + 1;
-        let xm: f64 = x.iter().skip(self.dim - k).map(|&v| {
-            (v - 0.5).powi(2) - (20.0 * std::f64::consts::PI * (v - 0.5)).cos()
-        }).sum();
-        let g = 100.0 * (k as f64 + xm);
-        let mut f = vec![0.5 * (1.0 + g); self.m];
-        for i in 0..self.m {
-            for j in 0..(self.m - 1 - i) {
-                f[i] *= x[j];
-            }
-            if i > 0 {
-                f[i] *= 1.0 - x[self.m - 1 - i];
-            }
+impl FrontProblem {
+    /// The problem for a catalogue id, or `None` for one that has no known
+    /// front (single-objective, or a use case such as `uc2_dosing`).
+    fn for_benchmark(bench_id: &str) -> Option<Self> {
+        let info = benchmark_catalog()
+            .into_iter()
+            .find(|b| b.id == bench_id && b.ty == "multi")?;
+        if let Some(variant) = bench_id.strip_prefix("zdt") {
+            return Some(FrontProblem::Zdt(ZDT { variant: variant.parse().ok()?, dim: info.dim }));
         }
-        f
+        let variant = bench_id.strip_prefix("dtlz")?.parse().ok()?;
+        Some(FrontProblem::Dtlz(DTLZ { variant, dim: info.dim, m: info.num_objectives }))
+    }
+
+    /// The known front, sampled; see `ZDT::reference_front` and
+    /// `DTLZ::reference_front`.
+    fn reference_front(&self) -> Vec<Vec<f64>> {
+        match self {
+            FrontProblem::Zdt(p) => p.reference_front(ZDT_FRONT_SAMPLES),
+            FrontProblem::Dtlz(p) => p.reference_front(DTLZ_FRONT_SAMPLES_PER_AXIS),
+        }
     }
 }
 
@@ -385,6 +388,9 @@ enum SseEvent {
         /// `final_fitness` minus the benchmark's known optimum (OPT-09, #1776);
         /// null when the benchmark has no single known optimum.
         gap: Option<f64>,
+        /// The five front-quality measures (OPT-03, #1753); see
+        /// [`SolverOutcome::quality`] for when it is null.
+        quality: Option<QualityMetrics>,
     },
     Error { message: String },
 }
@@ -524,11 +530,13 @@ async fn start_solve(
             let started = std::time::Instant::now();
             let outcome =
                 run_solver(&algo.id, algo.multi_objective, &bench.id, bench.num_objectives, dim, cfg, seed);
-            (outcome, started.elapsed())
+            let elapsed = started.elapsed();
+            // Measured after the clock stops: `total_time_ms` is the solve.
+            (outcome.map(|o| with_quality(o, bench.id)), elapsed)
         });
 
         match compute.await {
-            Ok((Ok(SolverOutcome { history, final_fitness, final_pareto, feasible, gap }), elapsed)) => {
+            Ok((Ok(SolverOutcome { history, final_fitness, final_pareto, feasible, gap, quality }), elapsed)) => {
                 let total_time_ms = duration_ms(elapsed);
                 let iterations = history.len();
                 let last_iter = iterations.saturating_sub(1);
@@ -558,6 +566,7 @@ async fn start_solve(
                         total_time_ms,
                         feasible,
                         gap,
+                        quality,
                     })
                     .await;
             }
@@ -593,6 +602,21 @@ struct SolverOutcome {
     /// (OPT-09, #1776). None when the catalog lists no optimum, which is every
     /// multi-objective benchmark: a front has no single optimum to subtract.
     gap: Option<f64>,
+    /// Hypervolume, IGD, IGD+, spread and coverage of the final front against
+    /// the benchmark's known front (OPT-03, #1753). None for a single-objective
+    /// run and for a benchmark with no known front (`uc2_dosing`). Filled in
+    /// by [`with_quality`] after the solve's clock has stopped, so measuring
+    /// the answer is not billed to `total_time_ms`.
+    quality: Option<QualityMetrics>,
+}
+
+/// Measure `outcome`'s final front against `bench_id`'s known front, if both
+/// exist. Runs after the solve is timed.
+fn with_quality(mut outcome: SolverOutcome, bench_id: &str) -> SolverOutcome {
+    if let (Some(front), Some(problem)) = (&outcome.final_pareto, FrontProblem::for_benchmark(bench_id)) {
+        outcome.quality = quality_metrics(front, &problem.reference_front());
+    }
+    outcome
 }
 
 /// Apply the request's seed to a solver, if one was given.
@@ -611,6 +635,42 @@ macro_rules! seeded {
     }};
 }
 
+/// What one multi-objective run hands back: its convergence history, the best
+/// first objective on its final front, and the front's finite points.
+type MultiObjectiveRun = (Vec<f64>, f64, Vec<Vec<f64>>);
+
+/// Run one multi-objective solver on `problem`: its convergence history, the
+/// best first objective on the final front, and the front's finite points.
+///
+/// One function for every multi-objective benchmark; each used to repeat the
+/// same solver `match` and the same post-processing.
+fn solve_multi_objective<P: MultiObjectiveProblem>(
+    algo_id: &str,
+    cfg: SolverConfig,
+    seed: Option<u64>,
+    problem: &P,
+) -> Result<MultiObjectiveRun, String> {
+    let r = match algo_id {
+        "mo_bmr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMR), seed).solve(problem),
+        "mo_bwr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBWR), seed).solve(problem),
+        "mo_bmwr"   => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMWR), seed).solve(problem),
+        "mo_rao_de" => seeded!(MORaoDESolver::new(cfg), seed).solve(problem),
+        "nsga2"     => seeded!(NSGA2Solver::new(cfg), seed).solve(problem),
+        _           => return Err(format!("algorithm {} not multi-objective", algo_id)),
+    };
+    let final_first = r.pareto_front.iter()
+        .map(|ind| ind.fitness[0])
+        .fold(f64::INFINITY, f64::min);
+    // Drop individuals with non-finite objective values — serde_json
+    // serializes NaN/Inf as null, which breaks downstream consumers
+    // (e.g. the samyama-insight Pareto chart).
+    let pareto: Vec<Vec<f64>> = r.pareto_front.iter()
+        .filter(|ind| ind.fitness.iter().all(|v| v.is_finite()))
+        .map(|ind| ind.fitness.clone())
+        .collect();
+    Ok((r.history, final_first, pareto))
+}
+
 fn run_solver(
     algo_id: &str,
     multi_objective: bool,
@@ -621,72 +681,14 @@ fn run_solver(
     seed: Option<u64>,
 ) -> Result<SolverOutcome, String> {
     if multi_objective {
-        let (hist, final_f, pareto) = match bench_id {
-            "zdt1" | "zdt2" | "zdt3" => {
-                let v = bench_id.chars().last().unwrap().to_digit(10).unwrap() as u8;
-                let problem = ZDT { variant: v, dim: 30 };
-                let r = match algo_id {
-                    "mo_bmr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMR), seed).solve(&problem),
-                    "mo_bwr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBWR), seed).solve(&problem),
-                    "mo_bmwr"   => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMWR), seed).solve(&problem),
-                    "mo_rao_de" => seeded!(MORaoDESolver::new(cfg), seed).solve(&problem),
-                    "nsga2"     => seeded!(NSGA2Solver::new(cfg), seed).solve(&problem),
-                    _           => return Err(format!("algorithm {} not multi-objective", algo_id)),
-                };
-                let final_first = r.pareto_front.iter()
-                    .map(|ind| ind.fitness[0])
-                    .fold(f64::INFINITY, f64::min);
-                // Drop individuals with non-finite objective values — serde_json
-                // serializes NaN/Inf as null, which breaks downstream consumers
-                // (e.g. the samyama-insight Pareto chart).
-                let pareto: Vec<Vec<f64>> = r.pareto_front.iter()
-                    .filter(|ind| ind.fitness.iter().all(|v| v.is_finite()))
-                    .map(|ind| ind.fitness.clone())
-                    .collect();
-                (r.history, final_first, pareto)
+        let (hist, final_f, pareto) = if bench_id == "uc2_dosing" {
+            solve_multi_objective(algo_id, cfg, seed, &super::uc_problems::UC2DosingProblem::new())?
+        } else {
+            match FrontProblem::for_benchmark(bench_id) {
+                Some(FrontProblem::Zdt(problem)) => solve_multi_objective(algo_id, cfg, seed, &problem)?,
+                Some(FrontProblem::Dtlz(problem)) => solve_multi_objective(algo_id, cfg, seed, &problem)?,
+                None => return Err(format!("benchmark {} is not multi-objective", bench_id)),
             }
-            "uc2_dosing" => {
-                let problem = super::uc_problems::UC2DosingProblem::new();
-                let r = match algo_id {
-                    "mo_bmr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMR), seed).solve(&problem),
-                    "mo_bwr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBWR), seed).solve(&problem),
-                    "mo_bmwr"   => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMWR), seed).solve(&problem),
-                    "mo_rao_de" => seeded!(MORaoDESolver::new(cfg), seed).solve(&problem),
-                    "nsga2"     => seeded!(NSGA2Solver::new(cfg), seed).solve(&problem),
-                    _           => return Err(format!("algorithm {} not multi-objective", algo_id)),
-                };
-                let final_first = r.pareto_front.iter()
-                    .map(|ind| ind.fitness[0])
-                    .fold(f64::INFINITY, f64::min);
-                let pareto: Vec<Vec<f64>> = r.pareto_front.iter()
-                    .filter(|ind| ind.fitness.iter().all(|v| v.is_finite()))
-                    .map(|ind| ind.fitness.clone())
-                    .collect();
-                (r.history, final_first, pareto)
-            }
-            "dtlz1" => {
-                let problem = DTLZ1 { dim: 7, m: 3 };
-                let r = match algo_id {
-                    "mo_bmr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMR), seed).solve(&problem),
-                    "mo_bwr"    => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBWR), seed).solve(&problem),
-                    "mo_bmwr"   => seeded!(MOBMWRSolver::new(cfg, MOBMWRVariant::MOBMWR), seed).solve(&problem),
-                    "mo_rao_de" => seeded!(MORaoDESolver::new(cfg), seed).solve(&problem),
-                    "nsga2"     => seeded!(NSGA2Solver::new(cfg), seed).solve(&problem),
-                    _           => return Err(format!("algorithm {} not multi-objective", algo_id)),
-                };
-                let final_first = r.pareto_front.iter()
-                    .map(|ind| ind.fitness[0])
-                    .fold(f64::INFINITY, f64::min);
-                // Drop individuals with non-finite objective values — serde_json
-                // serializes NaN/Inf as null, which breaks downstream consumers
-                // (e.g. the samyama-insight Pareto chart).
-                let pareto: Vec<Vec<f64>> = r.pareto_front.iter()
-                    .filter(|ind| ind.fitness.iter().all(|v| v.is_finite()))
-                    .map(|ind| ind.fitness.clone())
-                    .collect();
-                (r.history, final_first, pareto)
-            }
-            other => return Err(format!("benchmark {} is not multi-objective", other)),
         };
         Ok(SolverOutcome {
             history: hist,
@@ -694,6 +696,7 @@ fn run_solver(
             final_pareto: Some(pareto),
             feasible: None,
             gap: None,
+            quality: None,
         })
     } else {
         let bench = benchmark_catalog().into_iter().find(|b| b.id == bench_id)
@@ -729,6 +732,7 @@ fn run_solver(
             final_pareto: None,
             feasible: Some(is_feasible(problem.penalty(&result.best_variables))),
             gap: bench.optimum.map(|optimum| gap_to_best_known(objective, optimum)),
+            quality: None,
         })
     }
 }
@@ -760,7 +764,7 @@ async fn stream_solve(
                     "pareto_front": pareto_front,
                 }))
                 .unwrap(),
-            SseEvent::Done { final_fitness, iterations, final_pareto, seed, total_time_ms, feasible, gap } => Event::default()
+            SseEvent::Done { final_fitness, iterations, final_pareto, seed, total_time_ms, feasible, gap, quality } => Event::default()
                 .event("done")
                 .json_data(serde_json::json!({
                     "final_fitness": final_fitness,
@@ -773,6 +777,8 @@ async fn stream_solve(
                     // The rest of the result envelope (OPT-09, #1776).
                     "feasible": feasible,
                     "gap": gap,
+                    // How good the front is against the known one (OPT-03).
+                    "quality": quality,
                 }))
                 .unwrap(),
             SseEvent::Error { message } => Event::default()
