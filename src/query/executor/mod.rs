@@ -1207,7 +1207,7 @@ fn substitute_expr(expr: &mut crate::query::ast::Expression, params: &HashMap<St
             if let Some(val) = params.get(name.as_str()) {
                 *expr = Expression::Literal(val.clone());
             } else {
-                return Err(ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)));
+                return Err(operator::unresolved_parameter(name));
             }
         }
         Expression::Binary { left, right, .. } => {

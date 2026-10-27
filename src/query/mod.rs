@@ -79,6 +79,7 @@ pub mod validate;
 pub mod executor;
 pub mod csv_source;
 pub mod span;
+pub mod suggest;
 pub mod metrics;
 
 use std::num::NonZeroUsize;

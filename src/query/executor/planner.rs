@@ -899,6 +899,34 @@ fn plan_return_projection(
     (operator, output_columns)
 }
 
+/// The `db.*` procedures `plan_call` dispatches, spelled as it accepts them.
+/// Offered as "did you mean" for an unknown procedure (DX-06);
+/// `every_listed_procedure_plans` keeps the list honest.
+pub const KNOWN_DB_PROCEDURES: &[&str] = &[
+    "db.checkIntegrity",
+    "db.index.fulltext.queryNodes",
+    "db.index.point.nearest",
+    "db.index.vector.queryNodes",
+    "db.labels",
+    "db.propertyKeys",
+    "db.relationshipTypes",
+    "db.schema.forLLM",
+    "db.schema.visualization",
+];
+
+/// The refusal for a procedure name nothing dispatches: a likely intended
+/// name when there is one, and otherwise where the procedures are.
+pub fn unknown_procedure_message(name: &str) -> String {
+    match crate::query::suggest::closest(name, KNOWN_DB_PROCEDURES.iter().copied()) {
+        Some(known) => format!("Unknown procedure: `{name}`. Did you mean `{known}`?"),
+        None => format!(
+            "Unknown procedure: `{name}`. The schema procedures are {}; graph \
+             algorithms are called as `algo.<name>()`.",
+            KNOWN_DB_PROCEDURES.join(", ")
+        ),
+    }
+}
+
 impl QueryPlanner {
     /// Create a new query planner
     pub fn new() -> Self {
@@ -4036,8 +4064,9 @@ impl QueryPlanner {
             // Its own code: the procedure surface is fine and this name is not
             // on it, which is a different recovery from "the planner could not
             // build a plan".
-            Err(ExecutionError::unknown_procedure(format!(
-                "Unknown procedure: {}", call_clause.procedure_name)))
+            Err(ExecutionError::unknown_procedure(
+                unknown_procedure_message(&call_clause.procedure_name),
+            ))
         }
     }
 
