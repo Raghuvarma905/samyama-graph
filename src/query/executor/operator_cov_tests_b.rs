@@ -6630,3 +6630,33 @@ fn write_back_removes_the_property_for_a_null_result() {
     assert_eq!(store.node_property(a, "wb"), None);
     assert_eq!(store.node_property(b, "wb"), None);
 }
+
+// ---------- graph projection safety net (ALGO-05, #1681) ----------
+//
+// Every algorithm today either builds a view through `view()` or is listed in
+// `NOT_ON_A_PROJECTION`, so no Cypher call reaches this check; it guards an
+// algorithm added later that does neither. Driven directly for that reason.
+
+#[test]
+fn a_graph_the_algorithm_never_used_is_refused_not_ignored() {
+    let op = AlgorithmOperator::new(
+        "algo.someFutureAlgorithm".to_string(),
+        vec![lmap(&[("graph", pstr("p"))])],
+    );
+    let err = op.check_projection_used().unwrap_err().to_string();
+    assert!(err.contains("does not build a graph view"), "{err}");
+    // Once a view was taken from the projection, it passes.
+    op.projection_used.set(true);
+    assert!(op.check_projection_used().is_ok());
+    // And a call that names no projection never trips it.
+    let plain = AlgorithmOperator::new("algo.someFutureAlgorithm".to_string(), vec![]);
+    assert!(plain.check_projection_used().is_ok());
+}
+
+#[test]
+fn reset_forgets_that_a_projection_was_used() {
+    let mut op = AlgorithmOperator::new("algo.pageRank".to_string(), vec![lmap(&[("graph", pstr("p"))])]);
+    op.projection_used.set(true);
+    op.reset();
+    assert!(op.check_projection_used().is_err(), "a re-run must take its view again");
+}
