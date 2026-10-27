@@ -26,13 +26,33 @@
 //! | [`CpuFallbackReason::UnsupportedOption`] | `debug` | every call (the caller chose the option) |
 //! | [`CpuFallbackReason::KernelFailed`] | `warn` | every call (a busy or lost device can recover) |
 //!
-//! "Once" means once *seen*: a permanent reason is only marked as reported when
-//! a subscriber will record its event. A call made before logging is set up,
-//! or while the `samyama::gpu` target is filtered out, does not use it up, so
-//! the first call after logging is enabled still says it.
+//! "Once" means once per logging setup, not once forever:
+//!
+//! - A call the current subscriber would not record at all (none is installed,
+//!   or the `samyama::gpu` target is filtered out) does not use up the report.
+//! - Whenever the logging setup changes -- a subscriber is installed, or a
+//!   filter is reloaded -- every once-only report is re-armed, so the next call
+//!   says it again to whoever is listening now.
+//!
+//! The second rule is there because the first cannot be complete. A subscriber
+//! can turn an event down at the last step, from its field values
+//! (`Subscriber::event_enabled`), and `tracing` does not tell the caller: the
+//! check is not public, and dispatching an event returns nothing. So a report
+//! can be used up by an event that was then discarded. `tracing` does announce
+//! every change of setup to registered callsites (`Callsite::set_interest`),
+//! and [`LoggingChanges`] listens for it, so such a report comes back as soon
+//! as the setup that discarded it is replaced. A subscriber that changes its
+//! answer without telling `tracing` cannot be detected by anyone.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
+
+use tracing_core::callsite::{Callsite, Identifier};
+use tracing_core::field::FieldSet;
+use tracing_core::metadata::Kind;
+use tracing_core::subscriber::Interest;
+use tracing_core::{Level, Metadata};
 
 /// The `tracing` target every fallback is logged on.
 pub const LOG_TARGET: &str = "samyama::gpu";
@@ -140,52 +160,97 @@ pub enum FallbackLevel {
     Warn,
 }
 
-/// Remembers which algorithms have already reported a permanent reason, so it
-/// is said once per algorithm. Separate from the global instance so tests can
-/// start from a clean slate.
+/// How many times the logging setup has changed, as `tracing` announces it.
+///
+/// Every once-only report is tied to the value this had when it was made, so a
+/// change re-arms them all. See [`LoggingChanges`].
+static LOGGING_SETUP: AtomicU64 = AtomicU64::new(0);
+
+/// Never reported in this setup. `LOGGING_SETUP` is stored plus one, so zero
+/// is free to mean this.
+const NEVER_REPORTED: u64 = 0;
+
+/// Remembers which algorithms have reported a permanent reason in the current
+/// logging setup, so it is said once per algorithm per setup.
+///
+/// Separate from the global instance so tests can start from a clean slate
+/// and count setups of their own.
 pub struct FallbackLog {
-    reported: [AtomicBool; GpuAlgorithm::ALL.len()],
+    /// Per algorithm, the setup it last reported in, plus one.
+    reported: [AtomicU64; GpuAlgorithm::ALL.len()],
+    /// The counter of logging setups this log follows.
+    setup: &'static AtomicU64,
 }
 
 impl FallbackLog {
     pub const fn new() -> Self {
+        Self::following(&LOGGING_SETUP)
+    }
+
+    /// A log that counts logging setups with `setup` instead of the
+    /// process-wide counter.
+    const fn following(setup: &'static AtomicU64) -> Self {
         Self {
-            reported: [const { AtomicBool::new(false) }; GpuAlgorithm::ALL.len()],
+            reported: [const { AtomicU64::new(NEVER_REPORTED) }; GpuAlgorithm::ALL.len()],
+            setup,
         }
     }
 
+    /// The current setup, as stored in `reported`.
+    fn this_setup(&self) -> u64 {
+        self.setup.load(Ordering::Acquire) + 1
+    }
+
+    /// Whether this call may report: always, for a reason that can change;
+    /// for a permanent one, only the first time in this logging setup.
+    ///
+    /// The swap is the claim, so two threads that race on the first call do
+    /// not both report.
+    fn claim(&self, algorithm: GpuAlgorithm, reason: &CpuFallbackReason) -> bool {
+        if !reason.is_permanent() {
+            return true;
+        }
+        let now = self.this_setup();
+        self.reported[algorithm.index()].swap(now, Ordering::AcqRel) != now
+    }
+
+    /// The level and text this fallback is logged with. Claims nothing.
+    fn render(
+        &self,
+        algorithm: GpuAlgorithm,
+        reason: &CpuFallbackReason,
+    ) -> (FallbackLevel, String) {
+        let once = if reason.is_permanent() {
+            " (reported once per logging setup)"
+        } else {
+            ""
+        };
+        (
+            reason.level(),
+            format!(
+                "{} ran on the CPU, not a GPU: {reason}{once}",
+                algorithm.name()
+            ),
+        )
+    }
+
     /// The log line this fallback should produce, or `None` when it has
-    /// already been said. Pure apart from the once-per-algorithm memory, so it
-    /// is what the tests check; [`note_cpu_fallback`] only emits it.
+    /// already been said in this logging setup. [`FallbackLog::note`] emits it.
     pub fn message(
         &self,
         algorithm: GpuAlgorithm,
         reason: &CpuFallbackReason,
     ) -> Option<(FallbackLevel, String)> {
-        if reason.is_permanent() && self.reported[algorithm.index()].swap(true, Ordering::Relaxed) {
-            return None;
-        }
-        let level = reason.level();
-        let once = if reason.is_permanent() {
-            " (reported once per process)"
-        } else {
-            ""
-        };
-        Some((
-            level,
-            format!(
-                "{} ran on the CPU, not a GPU: {reason}{once}",
-                algorithm.name()
-            ),
-        ))
+        self.claim(algorithm, reason)
+            .then(|| self.render(algorithm, reason))
     }
 }
 
 impl FallbackLog {
-    /// Whether `algorithm` has already reported a permanent reason.
+    /// Whether `algorithm` has reported a permanent reason in this setup.
     #[cfg(test)]
     fn has_reported(&self, algorithm: GpuAlgorithm) -> bool {
-        self.reported[algorithm.index()].load(Ordering::Relaxed)
+        self.reported[algorithm.index()].load(Ordering::Acquire) == self.this_setup()
     }
 }
 
@@ -199,9 +264,12 @@ impl FallbackLog {
     /// Log why `algorithm` ran on the CPU through `tracing`.
     ///
     /// Asks the current subscriber first, and does nothing when it would
-    /// discard the event: a permanent reason's single report is only used up
-    /// by an event that is actually recorded.
+    /// discard the event by its metadata, so such a call does not use up a
+    /// permanent reason's report. A report used up by an event the subscriber
+    /// discards later, from its fields, comes back when the logging setup
+    /// changes (see the module docs).
     pub fn note(&self, algorithm: GpuAlgorithm, reason: &CpuFallbackReason) {
+        watch_logging_changes();
         if !level_enabled(reason.level()) {
             return;
         }
@@ -235,6 +303,47 @@ fn level_enabled(level: FallbackLevel) -> bool {
     }
 }
 
+/// A callsite that is never logged from, registered so that `tracing` tells it
+/// whenever the logging setup changes.
+///
+/// `tracing` calls `set_interest` on every registered callsite when one is
+/// registered, when a subscriber is created (`Dispatch::new`, which installing
+/// one goes through), and when interest is rebuilt
+/// (`callsite::rebuild_interest_cache`, which a reloaded filter calls). Each
+/// call moves [`LOGGING_SETUP`] on, which re-arms every once-only report.
+struct LoggingChanges;
+
+static LOGGING_CHANGES: LoggingChanges = LoggingChanges;
+
+/// A hint, not an event: nothing is ever emitted from this callsite.
+static LOGGING_CHANGES_META: Metadata<'static> = Metadata::new(
+    "cpu fallback: logging setup",
+    LOG_TARGET,
+    Level::TRACE,
+    Some(file!()),
+    Some(line!()),
+    Some(module_path!()),
+    FieldSet::new(&[], Identifier(&LOGGING_CHANGES)),
+    Kind::HINT,
+);
+
+impl Callsite for LoggingChanges {
+    fn set_interest(&self, _: Interest) {
+        LOGGING_SETUP.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn metadata(&self) -> &Metadata<'_> {
+        &LOGGING_CHANGES_META
+    }
+}
+
+static WATCHING: Once = Once::new();
+
+/// Register [`LoggingChanges`], once per process.
+fn watch_logging_changes() {
+    WATCHING.call_once(|| tracing_core::callsite::register(&LOGGING_CHANGES));
+}
+
 /// The process-wide record of what has been reported.
 static FALLBACK_LOG: FallbackLog = FallbackLog::new();
 
@@ -256,8 +365,8 @@ pub(crate) fn note_not_compiled(algorithm: GpuAlgorithm) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Mutex};
 
     /// A graph size and threshold for the below-threshold reason.
     const NODES: usize = 500;
@@ -275,11 +384,22 @@ mod tests {
     /// Only events with a `message` field, as every fallback event has.
     const WITH_MESSAGE: Filter = |metadata| metadata.fields().field("message").is_some();
 
-    /// A subscriber that records the events its `filter` lets through, and
-    /// counts them.
+    /// A log with a logging-setup counter of its own, so a test's "said once"
+    /// is not undone by another test installing a subscriber meanwhile.
+    fn private_log() -> (FallbackLog, &'static AtomicU64) {
+        let setup: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        (FallbackLog::following(setup), setup)
+    }
+
+    /// A subscriber that records the events its `filter` lets through, keeps
+    /// their messages, and can turn events down at the last step, as
+    /// `Subscriber::event_enabled` may.
     struct Recorder {
         filter: Filter,
         recorded: Arc<AtomicUsize>,
+        messages: Arc<Mutex<Vec<String>>>,
+        /// `event_enabled`'s answer; accepts everything when `None`.
+        accept_events: Option<Arc<AtomicBool>>,
     }
 
     impl Recorder {
@@ -287,6 +407,27 @@ mod tests {
             Self {
                 filter,
                 recorded: Arc::clone(recorded),
+                messages: Arc::default(),
+                accept_events: None,
+            }
+        }
+
+        /// Accepts every event's metadata, then decides from `accept`.
+        fn deciding_late(recorded: &Arc<AtomicUsize>, accept: &Arc<AtomicBool>) -> Self {
+            Self {
+                accept_events: Some(Arc::clone(accept)),
+                ..Self::new(ON_TARGET, recorded)
+            }
+        }
+    }
+
+    /// Collects an event's `message` field.
+    struct MessageText<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageText<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
             }
         }
     }
@@ -303,13 +444,21 @@ mod tests {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
             (self.filter)(metadata)
         }
+        fn event_enabled(&self, _: &tracing::Event<'_>) -> bool {
+            self.accept_events
+                .as_ref()
+                .is_none_or(|accept| accept.load(Ordering::Relaxed))
+        }
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
         }
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, _: &tracing::Event<'_>) {
+        fn event(&self, event: &tracing::Event<'_>) {
             self.recorded.fetch_add(1, Ordering::Relaxed);
+            let mut text = String::new();
+            event.record(&mut MessageText(&mut text));
+            self.messages.lock().unwrap().push(text);
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -343,7 +492,7 @@ mod tests {
 
     #[test]
     fn a_permanent_reason_is_kept_until_a_subscriber_records_it() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let recorded = Arc::new(AtomicUsize::new(0));
         // Before any subscriber is installed, and while one filters the target out.
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
@@ -373,7 +522,7 @@ mod tests {
             ("events only", EVENTS_ONLY),
             ("with a message", WITH_MESSAGE),
         ] {
-            let log = FallbackLog::new();
+            let (log, _) = private_log();
             let recorded = Arc::new(AtomicUsize::new(0));
             tracing::subscriber::with_default(Recorder::new(filter, &recorded), || {
                 log.note(GpuAlgorithm::Lcc, &CpuFallbackReason::NoDevice);
@@ -396,7 +545,7 @@ mod tests {
 
     #[test]
     fn a_per_call_reason_is_recorded_on_every_call() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let recorded = Arc::new(AtomicUsize::new(0));
         let reason = CpuFallbackReason::KernelFailed("device lost".to_string());
         tracing::subscriber::with_default(Recorder::new(ON_TARGET, &recorded), || {
@@ -415,7 +564,7 @@ mod tests {
 
     #[test]
     fn a_build_without_gpu_support_says_so_once_per_algorithm() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let (level, message) = log
             .message(GpuAlgorithm::PageRank, &CpuFallbackReason::NotCompiled)
             .expect("the first call is reported");
@@ -435,7 +584,7 @@ mod tests {
 
     #[test]
     fn a_missing_device_is_a_warning_reported_once() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let (level, message) = log
             .message(GpuAlgorithm::Cdlp, &CpuFallbackReason::NoDevice)
             .expect("reported");
@@ -449,7 +598,7 @@ mod tests {
 
     #[test]
     fn a_kernel_failure_is_a_warning_on_every_call() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let reason = CpuFallbackReason::KernelFailed("device lost".to_string());
         for _ in 0..2 {
             let (level, message) = log
@@ -462,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_small_graph_is_reported_at_debug_with_both_numbers() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let reason = CpuFallbackReason::BelowThreshold {
             nodes: NODES,
             min_nodes: MIN_NODES,
@@ -479,7 +628,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_option_names_the_option() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let reason = CpuFallbackReason::UnsupportedOption("dangling redistribution");
         let (level, message) = log.message(GpuAlgorithm::PageRank, &reason).unwrap();
         assert_eq!(level, FallbackLevel::Debug);
@@ -488,7 +637,7 @@ mod tests {
 
     #[test]
     fn a_per_call_reason_does_not_use_up_the_permanent_report() {
-        let log = FallbackLog::new();
+        let (log, _) = private_log();
         let small = CpuFallbackReason::BelowThreshold {
             nodes: NODES,
             min_nodes: MIN_NODES,
@@ -527,18 +676,96 @@ mod tests {
     #[test]
     fn every_gpu_eligible_algorithm_reports_its_fallback_in_the_default_build() {
         let view = triangle();
-        // A report only counts once a subscriber records it.
+        // Read from what this test's own subscriber recorded, not from the
+        // global log's state: other tests install subscribers concurrently,
+        // and each of those starts a new logging setup.
         let recorded = Arc::new(AtomicUsize::new(0));
-        tracing::subscriber::with_default(Recorder::new(ON_TARGET, &recorded), || {
+        let recorder = Recorder::new(ON_TARGET, &recorded);
+        let messages = Arc::clone(&recorder.messages);
+        tracing::subscriber::with_default(recorder, || {
             crate::pagerank::page_rank(&view, crate::pagerank::PageRankConfig::default());
             crate::cdlp::cdlp(&view, &crate::cdlp::CdlpConfig::default());
             crate::lcc::local_clustering_coefficient(&view);
             crate::topology::count_triangles(&view);
         });
+        let messages = messages.lock().unwrap();
+        for &algorithm in GpuAlgorithm::ALL {
+            let said = format!("{} ran on the CPU", algorithm.name());
+            assert!(
+                messages.iter().any(|m| m.starts_with(&said)),
+                "{} said nothing: {messages:?}",
+                algorithm.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_the_subscriber_turns_down_late_comes_back_with_the_next_setup() {
+        // #1936 review: a subscriber can accept an event's metadata and still
+        // turn the event down in `event_enabled`, from its fields. `tracing`
+        // does not tell the caller, so that report is used up; it must come
+        // back once the logging setup changes.
+        let (log, setup) = private_log();
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let accept = Arc::new(AtomicBool::new(false));
+        tracing::subscriber::with_default(Recorder::deciding_late(&recorded, &accept), || {
+            log.note(GpuAlgorithm::TriangleCount, &CpuFallbackReason::NoDevice);
+            assert_eq!(recorded.load(Ordering::Relaxed), 0, "turned down");
+
+            // The same setup starts accepting: nothing announced the change,
+            // so there is nothing to act on, and the report stays used.
+            accept.store(true, Ordering::Relaxed);
+            log.note(GpuAlgorithm::TriangleCount, &CpuFallbackReason::NoDevice);
+            assert_eq!(recorded.load(Ordering::Relaxed), 0);
+
+            // The setup changes, as `set_interest` announces: reported again,
+            // once.
+            setup.fetch_add(1, Ordering::AcqRel);
+            log.note(GpuAlgorithm::TriangleCount, &CpuFallbackReason::NoDevice);
+            log.note(GpuAlgorithm::TriangleCount, &CpuFallbackReason::NoDevice);
+        });
+        assert_eq!(recorded.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn installing_a_subscriber_or_reloading_a_filter_starts_a_new_logging_setup() {
+        // What makes the rule above happen in a real process: `tracing`
+        // announces both to `LoggingChanges`. Compared as "moved on", not by
+        // how far, because other tests install subscribers at the same time.
+        // Registered the way a real process registers it, by reporting a
+        // fallback, so a `note` that stopped registering would fail here.
+        note_cpu_fallback(
+            GpuAlgorithm::PageRank,
+            &CpuFallbackReason::KernelFailed("test".to_string()),
+        );
+        let before = LOGGING_SETUP.load(Ordering::Acquire);
+        let _installed = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let after_install = LOGGING_SETUP.load(Ordering::Acquire);
+        assert!(after_install > before, "a new subscriber was not announced");
+        tracing_core::callsite::rebuild_interest_cache();
+        assert!(
+            LOGGING_SETUP.load(Ordering::Acquire) > after_install,
+            "a reloaded filter was not announced"
+        );
+    }
+
+    #[test]
+    fn a_new_logging_setup_re_arms_every_once_only_report() {
+        let (log, setup) = private_log();
+        for &algorithm in GpuAlgorithm::ALL {
+            assert!(log
+                .message(algorithm, &CpuFallbackReason::NoDevice)
+                .is_some());
+            assert!(log
+                .message(algorithm, &CpuFallbackReason::NoDevice)
+                .is_none());
+        }
+        setup.fetch_add(1, Ordering::AcqRel);
         for &algorithm in GpuAlgorithm::ALL {
             assert!(
-                FALLBACK_LOG.has_reported(algorithm),
-                "{} said nothing",
+                log.message(algorithm, &CpuFallbackReason::NoDevice)
+                    .is_some(),
+                "{} was not re-armed",
                 algorithm.name()
             );
         }
