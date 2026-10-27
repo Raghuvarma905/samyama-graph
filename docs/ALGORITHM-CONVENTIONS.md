@@ -250,10 +250,15 @@ algorithms run on one build of it instead of each building its own (ALGO-05):
 
 ```cypher
 CREATE GRAPH PROJECTION social NODES :Person RELATIONSHIPS :KNOWS WEIGHT cost
+
 CALL algo.pageRank({graph: 'social'}) YIELD node, score
+
 CALL algo.louvain({graph: 'social'}) YIELD node, communityId
+
 SHOW GRAPH PROJECTIONS
+
 REFRESH GRAPH PROJECTION social
+
 DROP GRAPH PROJECTION social
 ```
 
