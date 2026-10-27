@@ -4783,7 +4783,7 @@ fn filter_evaluates_every_expression_kind() {
         filter_count(&store, &rows, Expression::Parameter("missing".into()))
             .unwrap_err()
             .to_string()
-            .contains("Unresolved parameter: $missing")
+            .contains("Unresolved parameter: `$missing`")
     );
     assert!(filter_count(&store, &rows, Expression::PathVariable("nope".into())).is_err());
     assert!(filter_count(&store, &rows, var("nope")).is_err());

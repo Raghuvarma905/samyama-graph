@@ -1023,8 +1023,14 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             // graph, not an exceptional one (#457). The logical and comparison operators
             // already propagate null this way; arithmetic was the outlier.
             (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError(
-                "`+` requires numeric or string operands".to_string())),
+            _ => {
+                return Err(operand_error(
+                    "+",
+                    "numeric or string",
+                    &left_prop,
+                    &right_prop,
+                ))
+            }
         },
         BinaryOp::Sub => match (&left_prop, &right_prop) {
             (PropertyValue::Integer(l), PropertyValue::Integer(r)) => PropertyValue::Integer(l.checked_sub(*r).ok_or_else(|| int_out_of_range(*l, "-", *r))?),
@@ -1067,7 +1073,7 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
                                     *n1 as i128 - *n2 as i128)
             }
             (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("Sub requires numeric operands".to_string())),
+            _ => return Err(operand_error("-", "numeric", &left_prop, &right_prop)),
         },
         BinaryOp::Mul => match (&left_prop, &right_prop) {
             // duration * number, either way round (#787).
@@ -1087,7 +1093,7 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 * r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l * *r as f64),
             (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("Mul requires numeric operands".to_string())),
+            _ => return Err(operand_error("*", "numeric", &left_prop, &right_prop)),
         },
         BinaryOp::Div => match (&left_prop, &right_prop) {
             // duration / number. Not commutative, so only this order.
@@ -1106,22 +1112,31 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
                 }
                 scale_duration(*months, *days, *seconds, *nanos, 1.0 / f)?
             }
-            (PropertyValue::Integer(_), PropertyValue::Integer(0)) => return Err(ExecutionError::RuntimeError("Division by zero".to_string())),
-            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => PropertyValue::Integer(l.checked_div(*r).ok_or_else(|| int_out_of_range(*l, "/", *r))?),
+            (PropertyValue::Integer(_), PropertyValue::Integer(0)) => {
+                return Err(by_zero_error("Division", "/"))
+            }
+            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => PropertyValue::Integer(
+                l.checked_div(*r)
+                    .ok_or_else(|| int_out_of_range(*l, "/", *r))?,
+            ),
             (PropertyValue::Float(l), PropertyValue::Float(r)) => PropertyValue::Float(l / r),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 / r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l / *r as f64),
             (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("Div requires numeric operands".to_string())),
+            _ => return Err(operand_error("/", "numeric", &left_prop, &right_prop)),
         },
         BinaryOp::Mod => match (&left_prop, &right_prop) {
-            (PropertyValue::Integer(_), PropertyValue::Integer(0)) => return Err(ExecutionError::RuntimeError("Modulo by zero".to_string())),
-            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => PropertyValue::Integer(l.checked_rem(*r).unwrap_or(0)),
+            (PropertyValue::Integer(_), PropertyValue::Integer(0)) => {
+                return Err(by_zero_error("Modulo", "%"))
+            }
+            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => {
+                PropertyValue::Integer(l.checked_rem(*r).unwrap_or(0))
+            }
             (PropertyValue::Float(l), PropertyValue::Float(r)) => PropertyValue::Float(l % r),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 % r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l % *r as f64),
             (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("Mod requires numeric operands".to_string())),
+            _ => return Err(operand_error("%", "numeric", &left_prop, &right_prop)),
         },
         BinaryOp::StartsWith => string_position_op(StringPositionOp::StartsWith, &left_prop, &right_prop),
         BinaryOp::EndsWith => string_position_op(StringPositionOp::EndsWith, &left_prop, &right_prop),
@@ -1231,12 +1246,14 @@ fn eval_index(collection: Value, index: Value, store: &GraphStore) -> ExecutionR
         // wrong operand.
         (Value::Property(p), _) if p.as_list_items().is_some() => {
             Err(ExecutionError::TypeError(format!(
-                "a list index must be an integer, not {}",
+                "a list index must be an integer, not {}. Convert it with \
+                 toInteger(), e.g. `list[toInteger(i)]`.",
                 type_name_of(&index)
             )))
         }
         (Value::List(_), _) => Err(ExecutionError::TypeError(format!(
-            "a list index must be an integer, not {}",
+            "a list index must be an integer, not {}. Convert it with \
+             toInteger(), e.g. `list[toInteger(i)]`.",
             type_name_of(&index)
         ))),
         (Value::Property(PropertyValue::Map(_)) | Value::Map(_), _) => {
@@ -1268,6 +1285,45 @@ fn eval_index(collection: Value, index: Value, store: &GraphStore) -> ExecutionR
 
 /// A value's type, for an error message that names the operand rather than
 /// saying something went wrong somewhere.
+/// The refusal for an arithmetic operator given operands it cannot combine:
+/// names the operator and both types, and says how to make them combinable
+/// (DX-06). The operator is backticked so the error's span points at it.
+fn operand_error(
+    op: &str,
+    accepts: &str,
+    left: &PropertyValue,
+    right: &PropertyValue,
+) -> ExecutionError {
+    ExecutionError::TypeError(format!(
+        "`{op}` requires {accepts} operands, got {} and {}. Convert the other \
+         side with toInteger(), toFloat() or toString() first.",
+        left.type_name(),
+        right.type_name()
+    ))
+}
+
+/// The refusal for an integer `/` or `%` by zero, with the usual guard
+/// (DX-06).
+fn by_zero_error(what: &str, op: &str) -> ExecutionError {
+    ExecutionError::RuntimeError(format!(
+        "{what} by zero: `{op}` with a divisor of 0. Guard it, e.g. \
+         `CASE WHEN d = 0 THEN null ELSE n {op} d END`."
+    ))
+}
+
+/// The refusal for a `$name` no value was supplied for, saying how to supply
+/// one on each surface (DX-06). Every place that resolves a parameter raises
+/// this one, so the advice cannot differ between them. No quote sits inside
+/// another, so `compat::Refusal::cause` blanks each name and groups every
+/// unresolved parameter as one cause.
+pub(crate) fn unresolved_parameter(name: &str) -> ExecutionError {
+    ExecutionError::RuntimeError(format!(
+        "Unresolved parameter: `${name}`. Supply it with the request: as key \
+         `{name}` in the `params` object over HTTP, or as `{name} <value>` after the \
+         query in GRAPH.QUERY over RESP."
+    ))
+}
+
 fn type_name_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -1563,7 +1619,7 @@ pub(crate) fn eval_expression(expr: &Expression, record: &Record, store: &GraphS
             // Parameters are resolved by substituting them with bound variables prefixed with `$`
             // The executor is responsible for binding params to `$name` before execution
             record.get(&format!("${}", name)).cloned()
-                .ok_or_else(|| ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)))
+                .ok_or_else(|| unresolved_parameter(name))
         }
     }
 }
@@ -3213,15 +3269,19 @@ fn min_arity(name: &str) -> Option<usize> {
     MIN_ARITY.iter().find(|(n, _)| *n == lower).map(|(_, m)| *m)
 }
 
+/// Argument names shown in an arity refusal's "call it as" example.
+const ARGUMENT_PLACEHOLDERS: [&str; 4] = ["a", "b", "c", "d"];
+
 pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> ExecutionResult<Value> {
     // Arity before dispatch. Every arm below is free to index `args` because
     // this ran first.
     if let Some(min) = min_arity(name) {
         if args.len() < min {
             return Err(ExecutionError::bad_argument(format!(
-                "`{name}()` takes at least {min} argument{}; got {}",
+                "`{name}()` takes at least {min} argument{}; got {}. Call it as `{name}({})`.",
                 if min == 1 { "" } else { "s" },
-                args.len()
+                args.len(),
+                ARGUMENT_PLACEHOLDERS[..min.min(ARGUMENT_PLACEHOLDERS.len())].join(", ")
             )));
         }
     }
@@ -4828,7 +4888,11 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 _ => Ok(Value::Null),
             }
         }
-        _ => Err(ExecutionError::RuntimeError(format!("Unknown function: {}", name))),
+        _ => Err(ExecutionError::RuntimeError(format!(
+            "Unknown function: `{name}`.{}",
+            crate::query::suggest::closest(name, KNOWN_FUNCTIONS.iter().copied())
+                .map_or_else(String::new, |known| format!(" Did you mean `{known}()`?"))
+        ))),
     }
 }
 
@@ -7688,10 +7752,10 @@ impl FilterOperator {
             Expression::PathVariable(var) => {
                 record.get(var).cloned().ok_or_else(|| unbound(record, var))
             }
-            Expression::Parameter(name) => {
-                record.get(&format!("${}", name)).cloned()
-                    .ok_or_else(|| ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)))
-            }
+            Expression::Parameter(name) => record
+                .get(&format!("${}", name))
+                .cloned()
+                .ok_or_else(|| unresolved_parameter(name)),
         }
     }
 
@@ -10802,10 +10866,10 @@ impl ProjectOperator {
             Expression::PathVariable(var) => {
                 record.get(var).cloned().ok_or_else(|| unbound(record, var))
             }
-            Expression::Parameter(name) => {
-                record.get(&format!("${}", name)).cloned()
-                    .ok_or_else(|| ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)))
-            }
+            Expression::Parameter(name) => record
+                .get(&format!("${}", name))
+                .cloned()
+                .ok_or_else(|| unresolved_parameter(name)),
         }
     }
 }
@@ -11541,10 +11605,10 @@ impl AggregateOperator {
             Expression::PathVariable(var) => {
                 record.get(var).cloned().ok_or_else(|| unbound(record, var))
             }
-            Expression::Parameter(name) => {
-                record.get(&format!("${}", name)).cloned()
-                    .ok_or_else(|| ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)))
-            }
+            Expression::Parameter(name) => record
+                .get(&format!("${}", name))
+                .cloned()
+                .ok_or_else(|| unresolved_parameter(name)),
         }
     }
 }
@@ -13632,10 +13696,10 @@ impl SortOperator {
             Expression::PathVariable(var) => {
                 record.get(var).cloned().ok_or_else(|| unbound(record, var))
             }
-            Expression::Parameter(name) => {
-                record.get(&format!("${}", name)).cloned()
-                    .ok_or_else(|| ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)))
-            }
+            Expression::Parameter(name) => record
+                .get(&format!("${}", name))
+                .cloned()
+                .ok_or_else(|| unresolved_parameter(name)),
         }
     }
 }
@@ -15718,9 +15782,11 @@ impl PhysicalOperator for DropIndexOperator {
         // Through the store, so the drop reaches the persisted catalog. A drop
         // that only cleared memory came back on the next restart (#1477).
         if !store.drop_property_index(&self.label, &self.property) {
-            return Err(ExecutionError::RuntimeError(
-                format!("Index on :{}({}) does not exist", self.label.as_str(), self.property)
-            ));
+            return Err(ExecutionError::RuntimeError(format!(
+                "Index on `:{}({})` does not exist. SHOW INDEXES lists the ones that do.",
+                self.label.as_str(),
+                self.property
+            )));
         }
 
         self.executed = true;
@@ -23711,10 +23777,10 @@ impl WithBarrierOperator {
             Expression::PathVariable(var) => {
                 record.get(var).cloned().ok_or_else(|| unbound(record, var))
             }
-            Expression::Parameter(name) => {
-                record.get(&format!("${}", name)).cloned()
-                    .ok_or_else(|| ExecutionError::RuntimeError(format!("Unresolved parameter: ${}", name)))
-            }
+            Expression::Parameter(name) => record
+                .get(&format!("${}", name))
+                .cloned()
+                .ok_or_else(|| unresolved_parameter(name)),
         }
     }
 
