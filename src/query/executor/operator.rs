@@ -17458,6 +17458,35 @@ pub struct AlgorithmOperator {
     /// while `... RETURN count(*)` succeeded -- the form looked supported right
     /// up to the point of using it (samyama-graph#1318).
     aliases: Vec<(String, String)>,
+    /// Whether the algorithm took its graph from the projection `graph` named
+    /// (ALGO-05). Checked after it runs, so a `graph` an algorithm never asked
+    /// for is refused instead of silently ignored. A `Cell` because the view
+    /// is handed out from `&self`.
+    projection_used: std::cell::Cell<bool>,
+}
+
+/// The graph an algorithm runs on: built for this call, or a named projection's.
+///
+/// Dereferences to the view, so every algorithm takes `&view` as before and
+/// cannot tell the two apart -- which is the point: a projection must give the
+/// same answer the view it was built from would.
+pub(crate) enum AlgoView {
+    /// Built from the store for this call, dropped after it.
+    Built(crate::algo::GraphView),
+    /// A projection's view, shared; it outlives a refresh or drop that happens
+    /// while the algorithm runs.
+    Projected(std::sync::Arc<crate::algo::GraphView>),
+}
+
+impl std::ops::Deref for AlgoView {
+    type Target = crate::algo::GraphView;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            AlgoView::Built(view) => view,
+            AlgoView::Projected(view) => view,
+        }
+    }
 }
 
 impl AlgorithmOperator {
@@ -17497,7 +17526,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     pub fn new(name: String, args: Vec<crate::query::ast::Expression>) -> Self {
         Self { name, args, results: Vec::new(), current: 0, executed: false,
-               aliases: Vec::new() }
+               aliases: Vec::new(), projection_used: std::cell::Cell::new(false) }
     }
 
     /// Record the `YIELD` aliases so the produced records carry them.
@@ -17542,7 +17571,9 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// The allowed list is the keys the function actually reads. `writeProperty`
     /// is accepted by every algorithm that can store one value per node, and
     /// validated in `write_back_plan` (ALGO-06); `mutate` is refused with the
-    /// reason, because there are no graph projections to mutate.
+    /// reason: a graph projection (ALGO-05) holds topology and one weight, and
+    /// has nowhere yet to keep a property an algorithm writes into it.
+    /// `graph` is accepted everywhere and checked by the projection checks.
     /// Every solver `or.solve` can actually run.
     ///
     /// Fourteen of the twenty-nine in `samyama-optimization` used to be absent
@@ -17614,6 +17645,120 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// The config key that asks an algorithm to store its result on each node
     /// (ALGO-06, #1683): `CALL algo.pageRank({writeProperty: 'rank'})`.
     pub const WRITE_PROPERTY_KEY: &'static str = "writeProperty";
+
+    /// The config key naming a graph projection to run on (ALGO-05, #1681):
+    /// `CALL algo.pageRank({graph: 'social'})`.
+    pub const GRAPH_KEY: &'static str = "graph";
+
+    /// Algorithms that cannot run on a projection, and why. A projection keeps
+    /// topology and one weight; these read more of the graph than that, or no
+    /// graph view at all. Matched on the canonical name.
+    const NOT_ON_A_PROJECTION: &'static [(&'static str, &'static str)] = &[
+        ("temporalreachability", "it reads each relationship's time, which a projection does not keep"),
+        ("propagationranking", "it reads each relationship's time, which a projection does not keep"),
+        ("temporalshortestpath", "it reads each relationship's time, which a projection does not keep"),
+        ("symptomexplanation", "it reads each relationship's time, which a projection does not keep"),
+        ("pca", "it reads node properties, which a projection does not keep"),
+        ("or.solve", "it optimises over node properties, not over a graph view"),
+    ];
+
+    /// The projection `graph` names, or `None` when the call names none.
+    fn requested_projection(
+        &self,
+        store: &GraphStore,
+    ) -> ExecutionResult<Option<std::sync::Arc<crate::graph::projection::GraphProjection>>> {
+        let mut name = None;
+        for arg in &self.args {
+            if let Expression::Literal(PropertyValue::Map(m)) = arg {
+                match m.get(Self::GRAPH_KEY) {
+                    None => {}
+                    Some(PropertyValue::String(n)) if !n.trim().is_empty() => name = Some(n.clone()),
+                    Some(other) => {
+                        return Err(ExecutionError::bad_argument(format!(
+                            "{}: `{}` must be a graph projection's name, got {other:?}",
+                            self.name,
+                            Self::GRAPH_KEY
+                        )))
+                    }
+                }
+            }
+        }
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        match store.graph_projections.get(&name) {
+            Some(projection) => Ok(Some(projection)),
+            None => Err(ExecutionError::bad_argument(format!(
+                "{}: {}",
+                self.name,
+                crate::graph::projection::ProjectionError::NotFound(name)
+            ))),
+        }
+    }
+
+    /// Refuse `graph` on an algorithm in [`Self::NOT_ON_A_PROJECTION`], before
+    /// it runs.
+    fn check_projection_support(&self) -> ExecutionResult<()> {
+        if !Self::config_has_key(&self.args, Self::GRAPH_KEY) {
+            return Ok(());
+        }
+        let canonical = Self::canonical_name(&self.name);
+        match Self::NOT_ON_A_PROJECTION.iter().find(|(name, _)| *name == canonical) {
+            Some((_, why)) => Err(ExecutionError::bad_argument(format!(
+                "{} cannot run on a graph projection: {why}",
+                self.name
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// After the algorithm ran: a `graph` it never took a view from is an
+    /// error, not a silent no-op. Catches an algorithm missing from
+    /// [`Self::NOT_ON_A_PROJECTION`], including one added later.
+    fn check_projection_used(&self) -> ExecutionResult<()> {
+        if Self::config_has_key(&self.args, Self::GRAPH_KEY) && !self.projection_used.get() {
+            Err(ExecutionError::bad_argument(format!(
+                "{} does not build a graph view, so `{}` cannot apply to it",
+                self.name,
+                Self::GRAPH_KEY
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The graph for this call: the projection `graph` names, or a view built
+    /// from the store with these filters, exactly as before projections.
+    ///
+    /// A projection already fixes the nodes, relationships and weight, so a
+    /// filter given alongside `graph` is refused rather than quietly ignored or
+    /// quietly applied to a different graph than the one named.
+    fn view(
+        &self,
+        store: &GraphStore,
+        label: Option<&str>,
+        edge_type: Option<&str>,
+        weight_property: Option<&str>,
+    ) -> ExecutionResult<AlgoView> {
+        let Some(projection) = self.requested_projection(store)? else {
+            return Ok(AlgoView::Built(crate::algo::build_view(store, label, edge_type, weight_property)));
+        };
+        let given: Vec<&str> = [("a label", label), ("a relationship type", edge_type), ("a weight", weight_property)]
+            .into_iter()
+            .filter_map(|(what, value)| value.map(|_| what))
+            .collect();
+        if !given.is_empty() {
+            return Err(ExecutionError::bad_argument(format!(
+                "{}: the graph projection `{}` already decides the nodes, relationships and weight \
+                 the algorithm sees, so {} cannot also be given",
+                self.name,
+                projection.name,
+                given.join(" and ")
+            )));
+        }
+        self.projection_used.set(true);
+        Ok(AlgoView::Projected(std::sync::Arc::clone(&projection.view)))
+    }
 
     /// Does this `CALL` write to the graph, given its arguments as well as its
     /// name?
@@ -17838,7 +17983,9 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 let mut unknown: Vec<&String> = m
                     .keys()
                     .filter(|k| {
-                        k.as_str() != Self::WRITE_PROPERTY_KEY && !allowed.contains(&k.as_str())
+                        k.as_str() != Self::WRITE_PROPERTY_KEY
+                            && k.as_str() != Self::GRAPH_KEY
+                            && !allowed.contains(&k.as_str())
                     })
                     .collect();
                 unknown.sort();
@@ -17856,9 +18003,10 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                         },
                         allowed.join(", "),
                         if unknown.iter().any(|k| k.starts_with("mutate")) {
-                            " `mutate` mode writes into a graph projection, and this engine \
-                             has no projections yet (ALGO-05, ALGO-06); `writeProperty` \
-                             stores the result on the nodes instead."
+                            " `mutate` mode writes the result into a graph projection, and a \
+                             projection cannot hold a written property yet (ALGO-06); \
+                             `writeProperty` stores the result on the nodes instead, and \
+                             `graph` runs the algorithm on a projection."
                         } else {
                             ""
                         },
@@ -17900,7 +18048,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         }
 
         // Build view and run
-        let view = crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None);
+        let view = self.view(store, label.as_deref(), edge_type.as_deref(), None)?;
         let scores = crate::algo::page_rank(&view, config);
 
         // Convert to records
@@ -17948,7 +18096,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         }
         
         // Build view
-        let view = crate::algo::build_view(store, None, None, weight_prop.as_deref());
+        let view = self.view(store, None, None, weight_prop.as_deref())?;
         
         // Run Algorithm
         let result = if let Some(prop) = weight_prop.as_deref() {
@@ -17996,7 +18144,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         }
 
         // Build view and run WCC
-        let view = crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None);
+        let view = self.view(store, label.as_deref(), edge_type.as_deref(), None)?;
         let result = crate::algo::weakly_connected_components(&view);
 
         // Convert to records
@@ -18315,7 +18463,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 label = Some(s.clone());
             }
         }
-        let view = crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None);
+        let view = self.view(store, label.as_deref(), edge_type.as_deref(), None)?;
         // Undirected by default: centrality on a social or dependency graph is
         // almost always asked of the undirected reading, and a caller who
         // wants the directed one says so. Stated here because the two give
@@ -18390,7 +18538,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 }
             }
         }
-        let view = crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None);
+        let view = self.view(store, label.as_deref(), edge_type.as_deref(), None)?;
 
         let ids: Vec<u64> = self
             .args
@@ -18441,7 +18589,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     }
 
     /// The label/edgeType projection every structural algorithm shares.
-    fn structural_view(&self, store: &GraphStore) -> crate::algo::GraphView {
+    fn structural_view(&self, store: &GraphStore) -> ExecutionResult<AlgoView> {
         let (mut label, mut edge_type) = (None, None);
         for arg in &self.args {
             if let Expression::Literal(PropertyValue::Map(m)) = arg {
@@ -18458,7 +18606,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 label = Some(v.clone());
             }
         }
-        crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None)
+        self.view(store, label.as_deref(), edge_type.as_deref(), None)
     }
 
     fn bind_node(&self, store: &GraphStore, rec: &mut Record, key: &str, id: u64) {
@@ -18477,7 +18625,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// a question with no answer, and a build system acting on it would run
     /// steps out of order.
     fn execute_topological_sort(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         match crate::algo::topological_sort(&view) {
             crate::algo::TopoResult::Order(order) => {
                 for (i, id) in order.into_iter().enumerate() {
@@ -18506,7 +18654,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// 200,000-node dependency graph" is not actionable; the four services in
     /// it are.
     fn execute_find_cycle(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         if let Some(cycle) = crate::algo::find_cycle(&view) {
             for (i, id) in cycle.into_iter().enumerate() {
                 let mut rec = Record::new();
@@ -18527,7 +18675,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// node. Both are defined on the undirected graph: what breaks if this
     /// fails does not care which way the dependency was written down.
     fn execute_structural(&mut self, store: &GraphStore, want_bridges: bool) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         if want_bridges {
             for (a, b) in crate::algo::bridges(&view) {
                 let mut rec = Record::new();
@@ -18557,7 +18705,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// traversal budget from it would under-provision.
     fn execute_metric(&mut self, store: &GraphStore, which: Metric) -> ExecutionResult<()> {
         Self::reject_unknown_config_keys(&self.args, &self.name, &["undirected"])?;
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         // Undirected by default, as every one of these is a statement about
         // graph shape rather than about flow.
         let mut und = true;
@@ -18636,7 +18784,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.louvain()` -- community per node, ids renumbered from zero.
     fn execute_louvain(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let comms = crate::algo::louvain(&view, 20);
         // Modularity of the partition just found, on every row. A community
         // id alone tells a caller nothing about whether the partition is any
@@ -18668,7 +18816,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// teams, tenants, regions -- describe the graph's structure better or
     /// worse than the ones an algorithm finds.
     fn execute_modularity(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let list = match self.args.first() {
             Some(Expression::Literal(PropertyValue::Array(a))) => a.clone(),
             _ => {
@@ -18765,8 +18913,8 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 if let Some(PropertyValue::Integer(v)) = m.get("limit") { limit = (*v).max(1) as usize; }
             }
         }
-        let view = crate::algo::build_view(
-            store, label.as_deref(), edge_type.as_deref(), weight.as_deref());
+        let view = self.view(
+            store, label.as_deref(), edge_type.as_deref(), weight.as_deref())?;
         let ids: Vec<u64> = self.args.iter().filter_map(|a| match a {
             Expression::Literal(PropertyValue::Integer(n)) => Some(*n as u64),
             _ => None,
@@ -18849,7 +18997,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 if let Some(PropertyValue::Integer(v)) = m.get("seed") { seed = *v as u64; }
             }
         }
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let src = match self.args.first() {
             Some(Expression::Literal(PropertyValue::Integer(n))) => *n as u64,
             _ => return Err(ExecutionError::bad_argument(format!(
@@ -18877,7 +19025,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 if let Some(PropertyValue::Integer(v)) = m.get("iterations") { iters = (*v).max(1) as usize; }
             }
         }
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let scores = crate::algo::article_rank(&view, damping, iters);
         for (id, s) in crate::algo::ranked(&view, &scores) {
             let mut rec = Record::new();
@@ -18900,7 +19048,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 if let Some(PropertyValue::Float(v)) = m.get("tolerance") { tol = *v; }
             }
         }
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         // Non-convergence is refused, not rounded off. `alpha` above the
         // reciprocal of the largest eigenvalue makes the sum diverge, and the
         // last iterate is still a well-formed vector -- returning it would
@@ -18935,7 +19083,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 if let Some(PropertyValue::Float(v)) = m.get("tolerance") { tol = *v; }
             }
         }
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some((hubs, auth)) = crate::algo::hits(&view, iters, tol) else {
             return Err(ExecutionError::bad_argument(format!(
                 "algo.hits() did not converge in {iters} iterations"
@@ -18958,7 +19106,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.personalizedPageRank([sourceIds], {dampingFactor, iterations})`.
     fn execute_personalised_page_rank(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let mut sources: Vec<usize> = Vec::new();
         let (mut damping, mut iters) = (0.85f64, 100usize);
         for arg in &self.args {
@@ -19006,7 +19154,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 _ => {}
             }
         }
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         // Election order is the result, not a detail: the second choice is
         // second *because* the first suppressed its neighbourhood, so
         // re-sorting by any score would destroy the thing that makes VoteRank
@@ -19051,7 +19199,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         // and unit weights otherwise, which is the right default: an
         // unweighted graph has no negative edges and Bellman-Ford degenerates
         // to BFS, correctly.
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let src = self.temporal_node_arg(&view, 0, "a source")?;
         let Some(dist) = crate::algo::bellman_ford(&view, src) else {
             return Err(ExecutionError::coded(
@@ -19072,7 +19220,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.allPairsShortestPath()` — hop distance for every reachable pair.
     fn execute_all_pairs(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let mut pairs: Vec<((usize, usize), usize)> =
             crate::algo::all_pairs_hops(&view).into_iter().collect();
         pairs.sort();
@@ -19088,7 +19236,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.wienerIndex()` — one number for how spread out the graph is.
     fn execute_wiener(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some(w) = crate::algo::wiener_index(&view) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19105,7 +19253,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.dagLongestPath()`.
     fn execute_dag_longest_path(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some(path) = crate::algo::dag_longest_path(&view) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19125,7 +19273,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.transitiveClosure()` — every reachable ordered pair.
     fn execute_transitive_closure(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for (a, b) in crate::algo::transitive_closure(&view) {
             let mut rec = Record::new();
             self.bind_node(store, &mut rec, "source", view.index_to_node[a]);
@@ -19137,7 +19285,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.bipartite()` yielding `node, side`.
     fn execute_bipartite(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some((left, right)) = crate::algo::bipartite_sets(&view, Self::COLLAPSE) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19158,7 +19306,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.maximalMatching()` yielding `source, target`.
     fn execute_matching(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for (a, b) in crate::algo::maximal_matching(&view, Self::COLLAPSE) {
             let mut rec = Record::new();
             self.bind_node(store, &mut rec, "source", view.index_to_node[a]);
@@ -19170,7 +19318,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.colouring()` yielding `node, colour`.
     fn execute_colouring(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let colours = crate::algo::greedy_colouring(&view, Self::COLLAPSE);
         for (i, c) in colours.iter().enumerate() {
             let mut rec = Record::new();
@@ -19183,7 +19331,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.dominatingSet()`.
     fn execute_dominating_set(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for ix in crate::algo::dominating_set(&view, Self::COLLAPSE) {
             let mut rec = Record::new();
             self.bind_node(store, &mut rec, "node", view.index_to_node[ix]);
@@ -19195,7 +19343,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// `algo.kTruss({k})`.
     fn execute_k_truss(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         let k = self.usize_arg("k", 3);
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for ix in crate::algo::k_truss(&view, k, Self::COLLAPSE) {
             let mut rec = Record::new();
             self.bind_node(store, &mut rec, "node", view.index_to_node[ix]);
@@ -19206,7 +19354,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.transitivity()` — the global clustering coefficient.
     fn execute_transitivity(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some(t) = crate::algo::transitivity(&view, Self::COLLAPSE) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19223,7 +19371,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.globalEfficiency()`.
     fn execute_global_efficiency(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some(e) = crate::algo::global_efficiency(&view, Self::COLLAPSE) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19238,7 +19386,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.squareClustering()` — clustering for graphs with no triangles.
     fn execute_square_clustering(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for i in 0..view.node_count {
             let Some(sc) = crate::algo::square_clustering(&view, i, Self::COLLAPSE) else {
                 continue; // fewer than two neighbours: no square to close
@@ -19254,7 +19402,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     /// `algo.richClub({k})`.
     fn execute_rich_club(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         let k = self.usize_arg("k", 1);
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some(c) = crate::algo::rich_club_coefficient(&view, k, Self::COLLAPSE) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19270,7 +19418,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.biconnectedComponents()` yielding `node, componentId`.
     fn execute_biconnected(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for (cid, comp) in crate::algo::biconnected_components(&view, Self::COLLAPSE)
             .into_iter().enumerate()
         {
@@ -19295,7 +19443,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
                 if let Some(PropertyValue::Float(v)) = m.get("cutoff") { cutoff = *v; }
             }
         }
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for (a, b, s) in crate::algo::node_similarity(&view, k, cutoff) {
             let mut rec = Record::new();
             self.bind_node(store, &mut rec, "node", view.index_to_node[a]);
@@ -19310,7 +19458,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     fn execute_pair_similarity(&mut self, store: &GraphStore, overlap: bool)
         -> ExecutionResult<()>
     {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for a in 0..view.node_count {
             for b in (a + 1)..view.node_count {
                 let s = if overlap {
@@ -19333,7 +19481,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
     fn execute_structural_holes(&mut self, store: &GraphStore, effective: bool)
         -> ExecutionResult<()>
     {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         for i in 0..view.node_count {
             let v = if effective {
                 crate::algo::effective_size(&view, i)
@@ -19351,7 +19499,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     /// `algo.reciprocity()`.
     fn execute_reciprocity(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let Some(r) = crate::algo::reciprocity(&view) else {
             return Err(ExecutionError::coded(
                 crate::query::error_code::BAD_ARGUMENT,
@@ -19390,7 +19538,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             }
         }
 
-        let view = crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None);
+        let view = self.view(store, label.as_deref(), edge_type.as_deref(), None)?;
         let result = crate::algo::cdlp(&view, &config);
 
         for (node_id, community_id) in result.labels {
@@ -19445,7 +19593,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             }
         }
 
-        let view = crate::algo::build_view(store, label.as_deref(), edge_type.as_deref(), None);
+        let view = self.view(store, label.as_deref(), edge_type.as_deref(), None)?;
         let result = crate::algo::local_clustering_coefficient(&view);
 
         for (node_id, coeff) in result.coefficients {
@@ -19486,7 +19634,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             "label", "edgeType", "embeddingDimension", "iterationWeights", "seed",
             "normalize", "writeProperty",
         ])?;
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let mut config = crate::algo::FastRpConfig::default();
         let mut write_property = "embedding".to_string();
         for arg in &self.args {
@@ -19563,7 +19711,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             "label", "edgeType", "embeddingDimension", "walkLength", "walksPerNode",
             "returnFactor", "inOutFactor", "windowSize", "seed", "writeProperty",
         ])?;
-        let view = self.structural_view(store);
+        let view = self.structural_view(store)?;
         let mut config = crate::algo::Node2VecConfig::default();
         let mut write_property = "embedding".to_string();
         for arg in &self.args {
@@ -19769,7 +19917,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         };
 
         // Build view with weights
-        let view = crate::algo::build_view(store, None, None, Some(&weight_prop));
+        let view = self.view(store, None, None, Some(&weight_prop))?;
         Self::refuse_negative_weights(&view, "weightedPath", &weight_prop)?;
 
         let shortest = crate::algo::dijkstra(&view, source_id, target_id)
@@ -20198,7 +20346,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
         }
 
         // Build view
-        let view = crate::algo::build_view(store, None, None, cap_prop.as_deref());
+        let view = self.view(store, None, None, cap_prop.as_deref())?;
 
         // edmonds_karp expects u64 (AlgoNodeId), not crate::graph::NodeId
         match crate::algo::edmonds_karp(&view, source_id, target_id) {
@@ -20229,7 +20377,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
             None
         };
 
-        let view = crate::algo::build_view(store, None, None, weight_prop.as_deref());
+        let view = self.view(store, None, None, weight_prop.as_deref())?;
         let result = crate::algo::prim_mst(&view);
 
         // Return total weight
@@ -20262,7 +20410,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     fn execute_triangle_count(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         // Build view (undirected treatment is handled in the algorithm)
-        let view = crate::algo::build_view(store, None, None, None);
+        let view = self.view(store, None, None, None)?;
         let count = crate::algo::count_triangles(&view);
 
         let mut record = Record::new();
@@ -20274,7 +20422,7 @@ lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
 
     fn execute_scc(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         // Build view and run SCC
-        let view = crate::algo::build_view(store, None, None, None);
+        let view = self.view(store, None, None, None)?;
         let result = crate::algo::strongly_connected_components(&view);
 
         // For SCC, we return (node, componentId)
@@ -20556,6 +20704,7 @@ impl PhysicalOperator for AlgorithmOperator {
                     Self::WRITE_PROPERTY_KEY
                 )));
             }
+            self.check_projection_support()?;
             match Self::canonical_name(&self.name).as_str() {
                 "pagerank" => self.execute_pagerank(store)?,
                 "shortestpath" => self.execute_shortest_path(store)?,
@@ -20628,6 +20777,7 @@ impl PhysicalOperator for AlgorithmOperator {
                 // the same list (#1468).
                 _ => return Err(Self::unknown_algorithm(&self.name)),
             }
+            self.check_projection_used()?;
             self.apply_yield_aliases();
             self.executed = true;
         }
@@ -20646,6 +20796,7 @@ impl PhysicalOperator for AlgorithmOperator {
             // Refused before the algorithm runs, so a request that cannot be
             // honoured costs nothing.
             let write_back = self.write_back_plan()?;
+            self.check_projection_support()?;
             match Self::canonical_name(&self.name).as_str() {
                 "or.solve" => self.execute_or_solve(store, tenant_id)?,
                 "fastrp" => self.execute_fastrp(store, tenant_id)?,
@@ -20726,6 +20877,8 @@ impl PhysicalOperator for AlgorithmOperator {
                 "reciprocity" => self.execute_reciprocity(store)?,
                 _ => return Err(Self::unknown_algorithm(&self.name)),
             }
+            // Before the write-back, so a call refused here writes nothing.
+            self.check_projection_used()?;
             if let Some((property, column)) = write_back {
                 self.write_back(store, tenant_id, &property, column)?;
             }
@@ -20750,6 +20903,7 @@ impl PhysicalOperator for AlgorithmOperator {
         self.current = 0;
         self.executed = false;
         self.results.clear();
+        self.projection_used.set(false);
     }
     fn describe(&self) -> OperatorDescription {
         let args: Vec<String> = self.args.iter().map(format_expression).collect();

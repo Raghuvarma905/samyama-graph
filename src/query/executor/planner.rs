@@ -1567,6 +1567,15 @@ impl QueryPlanner {
             });
         }
 
+        // Handle the graph projection statements (ALGO-05)
+        if let Some(ddl) = &query.graph_projection_ddl {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::projection_ops::GraphProjectionOperator::new(ddl.clone())),
+                output_columns: super::projection_ops::columns_for(ddl),
+                is_write: ddl.is_write(), candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
         // Handle SHOW HIERARCHY INDEXES (ADR-035)
         if query.show_hierarchy_indexes {
             return Ok(ExecutionPlan {
@@ -3998,7 +4007,7 @@ impl QueryPlanner {
                 mode,
                 match mode.to_ascii_lowercase().as_str() {
                     "write" => "returns a summary row instead",
-                    "mutate" => "writes them into a graph projection, and there are no projections here yet",
+                    "mutate" => "writes them into a graph projection, and a projection here cannot hold a written property yet",
                     _ => "returns a summary instead of the rows",
                 }
             )))
@@ -11124,6 +11133,7 @@ mod tests {
             drop_hierarchy_index: None,
             rebuild_hierarchy_index: None,
             show_hierarchy_indexes: false,
+            graph_projection_ddl: None,
             show_indexes: false,
             show_constraints: false,
             profile: false,
