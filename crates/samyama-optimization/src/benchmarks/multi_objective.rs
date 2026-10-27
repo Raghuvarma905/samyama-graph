@@ -186,7 +186,10 @@ pub fn non_dominated(points: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     };
     let mut kept: Vec<Vec<f64>> = Vec::new();
     for (i, p) in points.iter().enumerate() {
-        let beaten = points.iter().enumerate().any(|(k, q)| k != i && dominated(p, q));
+        let beaten = points
+            .iter()
+            .enumerate()
+            .any(|(k, q)| k != i && dominated(p, q));
         if !beaten && !kept.contains(p) {
             kept.push(p.clone());
         }
@@ -244,7 +247,12 @@ impl DTLZ {
     /// curve-shaped front; the grid's duplicates on it are removed.
     pub fn reference_front(&self, samples_per_axis: usize) -> Vec<Vec<f64>> {
         if self.variant == 4 {
-            return DTLZ { variant: 2, dim: self.dim, m: self.m }.reference_front(samples_per_axis);
+            return DTLZ {
+                variant: 2,
+                dim: self.dim,
+                m: self.m,
+            }
+            .reference_front(samples_per_axis);
         }
         let positions = self.m - 1;
         let grid = unit_grid(samples_per_axis);
@@ -331,20 +339,36 @@ mod reference_front_tests {
     const DTLZ_DIM: usize = DTLZ_M - 1 + 10;
 
     fn zdt(variant: u8) -> Vec<Vec<f64>> {
-        ZDT { variant, dim: ZDT_DIM }.reference_front(ZDT_FRONT_SAMPLES)
+        ZDT {
+            variant,
+            dim: ZDT_DIM,
+        }
+        .reference_front(ZDT_FRONT_SAMPLES)
     }
 
     fn dtlz(variant: u8, dim: usize) -> Vec<Vec<f64>> {
-        DTLZ { variant, dim, m: DTLZ_M }.reference_front(DTLZ_FRONT_SAMPLES_PER_AXIS)
+        DTLZ {
+            variant,
+            dim,
+            m: DTLZ_M,
+        }
+        .reference_front(DTLZ_FRONT_SAMPLES_PER_AXIS)
     }
 
     #[test]
     fn zdt1_and_zdt4_lie_on_f2_equals_one_minus_root_f1() {
         for variant in [1, 4] {
             let front = zdt(variant);
-            assert_eq!(front.len(), ZDT_FRONT_SAMPLES, "ZDT{variant}: every sample is optimal");
+            assert_eq!(
+                front.len(),
+                ZDT_FRONT_SAMPLES,
+                "ZDT{variant}: every sample is optimal"
+            );
             for p in &front {
-                assert!((p[1] - (1.0 - p[0].sqrt())).abs() < TOLERANCE, "ZDT{variant}: {p:?}");
+                assert!(
+                    (p[1] - (1.0 - p[0].sqrt())).abs() < TOLERANCE,
+                    "ZDT{variant}: {p:?}"
+                );
             }
         }
     }
@@ -359,8 +383,14 @@ mod reference_front_tests {
     #[test]
     fn zdt3_is_disconnected_so_its_dominated_samples_are_dropped() {
         let front = zdt(3);
-        assert!(front.len() < ZDT_FRONT_SAMPLES, "ZDT3's front is five pieces");
-        assert!(front.iter().any(|p| p[1] < 0.0), "ZDT3's front dips below zero");
+        assert!(
+            front.len() < ZDT_FRONT_SAMPLES,
+            "ZDT3's front is five pieces"
+        );
+        assert!(
+            front.iter().any(|p| p[1] < 0.0),
+            "ZDT3's front dips below zero"
+        );
     }
 
     #[test]
@@ -385,7 +415,10 @@ mod reference_front_tests {
     fn dtlz2_3_and_4_lie_on_the_unit_sphere() {
         for variant in [2, 3, 4] {
             let front = dtlz(variant, DTLZ_DIM);
-            assert!(front.len() > DTLZ_FRONT_SAMPLES_PER_AXIS, "DTLZ{variant}: a surface, not a curve");
+            assert!(
+                front.len() > DTLZ_FRONT_SAMPLES_PER_AXIS,
+                "DTLZ{variant}: a surface, not a curve"
+            );
             for p in &front {
                 let r: f64 = p.iter().map(|v| v * v).sum();
                 assert!((r - 1.0).abs() < TOLERANCE, "DTLZ{variant}: {p:?}");
@@ -397,11 +430,17 @@ mod reference_front_tests {
     fn dtlz5_and_6_are_a_curve_on_the_sphere() {
         for variant in [5, 6] {
             let front = dtlz(variant, DTLZ_DIM);
-            assert!(front.len() <= DTLZ_FRONT_SAMPLES_PER_AXIS, "DTLZ{variant}: a curve");
+            assert!(
+                front.len() <= DTLZ_FRONT_SAMPLES_PER_AXIS,
+                "DTLZ{variant}: a curve"
+            );
             for p in &front {
                 let r: f64 = p.iter().map(|v| v * v).sum();
                 assert!((r - 1.0).abs() < TOLERANCE, "DTLZ{variant}: {p:?}");
-                assert!((p[0] - p[1]).abs() < TOLERANCE, "DTLZ{variant}: f1 = f2 on the front");
+                assert!(
+                    (p[0] - p[1]).abs() < TOLERANCE,
+                    "DTLZ{variant}: f1 = f2 on the front"
+                );
             }
         }
     }
@@ -410,12 +449,22 @@ mod reference_front_tests {
     fn dtlz7_is_disconnected_so_its_dominated_samples_are_dropped() {
         let all = DTLZ_FRONT_SAMPLES_PER_AXIS.pow(DTLZ_M as u32 - 1);
         let front = dtlz(7, DTLZ_DIM);
-        assert!(!front.is_empty() && front.len() < all, "{} of {all}", front.len());
+        assert!(
+            !front.is_empty() && front.len() < all,
+            "{} of {all}",
+            front.len()
+        );
     }
 
     #[test]
     fn every_sampled_front_is_mutually_non_dominated() {
-        let fronts = [zdt(1), zdt(3), zdt(6), dtlz(1, DTLZ1_DIM), dtlz(7, DTLZ_DIM)];
+        let fronts = [
+            zdt(1),
+            zdt(3),
+            zdt(6),
+            dtlz(1, DTLZ1_DIM),
+            dtlz(7, DTLZ_DIM),
+        ];
         for front in fronts {
             assert_eq!(non_dominated(front.clone()).len(), front.len());
         }
@@ -434,9 +483,27 @@ mod reference_front_tests {
 
     #[test]
     fn a_grid_of_zero_or_one_sample_is_handled() {
-        assert!(ZDT { variant: 1, dim: ZDT_DIM }.reference_front(0).is_empty());
-        assert_eq!(ZDT { variant: 1, dim: ZDT_DIM }.reference_front(1).len(), 1);
-        assert!(DTLZ { variant: 2, dim: DTLZ_DIM, m: DTLZ_M }.reference_front(0).is_empty());
+        assert!(ZDT {
+            variant: 1,
+            dim: ZDT_DIM
+        }
+        .reference_front(0)
+        .is_empty());
+        assert_eq!(
+            ZDT {
+                variant: 1,
+                dim: ZDT_DIM
+            }
+            .reference_front(1)
+            .len(),
+            1
+        );
+        assert!(DTLZ {
+            variant: 2,
+            dim: DTLZ_DIM,
+            m: DTLZ_M
+        }
+        .reference_front(0)
+        .is_empty());
     }
 }
-

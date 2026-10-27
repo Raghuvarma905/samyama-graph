@@ -142,7 +142,11 @@ async fn the_benchmark_catalogue_describes_each_problem() {
     let (status, json) = get_json(app(), "/optimize/benchmarks").await;
     assert_eq!(status, StatusCode::OK);
     let b = json.as_array().unwrap();
-    assert_eq!(b.len(), benchmark_catalog().len(), "every catalogue entry is served");
+    assert_eq!(
+        b.len(),
+        benchmark_catalog().len(),
+        "every catalogue entry is served"
+    );
     let sphere = b.iter().find(|x| x["id"] == "sphere").unwrap();
     assert_eq!(sphere["type"], "single");
     assert_eq!(sphere["optimum"], 0.0);
@@ -511,11 +515,20 @@ fn multi_objective_benchmarks() -> Vec<&'static str> {
 fn the_catalogue_reaches_five_zdt_and_all_seven_dtlz_problems() {
     let ids = multi_objective_benchmarks();
     for variant in [1, 2, 3, 4, 6] {
-        assert!(ids.contains(&format!("zdt{variant}").as_str()), "zdt{variant}");
+        assert!(
+            ids.contains(&format!("zdt{variant}").as_str()),
+            "zdt{variant}"
+        );
     }
-    assert!(!ids.contains(&"zdt5"), "ZDT5 is binary-coded and cannot be posed here");
+    assert!(
+        !ids.contains(&"zdt5"),
+        "ZDT5 is binary-coded and cannot be posed here"
+    );
     for variant in 1..=7 {
-        assert!(ids.contains(&format!("dtlz{variant}").as_str()), "dtlz{variant}");
+        assert!(
+            ids.contains(&format!("dtlz{variant}").as_str()),
+            "dtlz{variant}"
+        );
     }
 }
 
@@ -528,7 +541,11 @@ fn each_known_front_benchmark_is_the_crate_problem_at_the_catalogue_size() {
             FrontProblem::Dtlz(p) => (p.dim(), p.num_objectives()),
         };
         assert_eq!((dim, objectives), (b.dim, b.num_objectives), "{}", b.id);
-        assert!(!problem.reference_front().is_empty(), "{}: a known front", b.id);
+        assert!(
+            !problem.reference_front().is_empty(),
+            "{}: a known front",
+            b.id
+        );
     }
     // No known front: a use case, a single-objective benchmark, an unknown id.
     for id in ["uc2_dosing", "sphere", "zdt5", "dtlz9", "moon"] {
@@ -538,34 +555,81 @@ fn each_known_front_benchmark_is_the_crate_problem_at_the_catalogue_size() {
 
 #[test]
 fn every_benchmark_with_a_known_front_reports_all_five_measures() {
-    for bench in multi_objective_benchmarks().into_iter().filter(|b| *b != "uc2_dosing") {
+    for bench in multi_objective_benchmarks()
+        .into_iter()
+        .filter(|b| *b != "uc2_dosing")
+    {
         let out = with_quality(
-            run_solver("nsga2", true, bench, 0, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED))
-                .unwrap_or_else(|e| panic!("{bench}: {e}")),
+            run_solver(
+                "nsga2",
+                true,
+                bench,
+                0,
+                CATALOG_DIM,
+                cfg(),
+                Some(ENVELOPE_SEED),
+            )
+            .unwrap_or_else(|e| panic!("{bench}: {e}")),
             bench,
         );
         let q = out.quality.unwrap_or_else(|| panic!("{bench}: no quality"));
         let objectives = out.final_pareto.unwrap()[0].len();
         assert_eq!(q.reference_point.len(), objectives, "{bench}");
-        assert!(q.hypervolume >= 0.0 && q.hypervolume.is_finite(), "{bench}: {q:?}");
-        assert!(q.igd.is_finite() && q.igd_plus.is_finite() && q.spread.is_finite(), "{bench}: {q:?}");
+        assert!(
+            q.hypervolume >= 0.0 && q.hypervolume.is_finite(),
+            "{bench}: {q:?}"
+        );
+        assert!(
+            q.igd.is_finite() && q.igd_plus.is_finite() && q.spread.is_finite(),
+            "{bench}: {q:?}"
+        );
         assert!((0.0..=1.0).contains(&q.coverage), "{bench}: {q:?}");
-        assert!(q.igd_plus <= q.igd + 1e-12, "{bench}: IGD+ never exceeds IGD");
+        assert!(
+            q.igd_plus <= q.igd + 1e-12,
+            "{bench}: IGD+ never exceeds IGD"
+        );
     }
 }
 
 #[test]
 fn a_run_with_no_known_front_reports_no_quality() {
-    let use_case = run_solver("nsga2", true, "uc2_dosing", 0, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED)).unwrap();
+    let use_case = run_solver(
+        "nsga2",
+        true,
+        "uc2_dosing",
+        0,
+        CATALOG_DIM,
+        cfg(),
+        Some(ENVELOPE_SEED),
+    )
+    .unwrap();
     assert_eq!(with_quality(use_case, "uc2_dosing").quality, None);
-    let single = run_solver("jaya", false, "sphere", 1, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED)).unwrap();
+    let single = run_solver(
+        "jaya",
+        false,
+        "sphere",
+        1,
+        CATALOG_DIM,
+        cfg(),
+        Some(ENVELOPE_SEED),
+    )
+    .unwrap();
     assert_eq!(with_quality(single, "sphere").quality, None);
 }
 
 #[test]
 fn run_solver_leaves_quality_to_be_measured_after_the_clock() {
     // `run_solver` is what is timed; measuring is `with_quality`'s job.
-    let out = run_solver("nsga2", true, "zdt1", 0, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED)).unwrap();
+    let out = run_solver(
+        "nsga2",
+        true,
+        "zdt1",
+        0,
+        CATALOG_DIM,
+        cfg(),
+        Some(ENVELOPE_SEED),
+    )
+    .unwrap();
     assert_eq!(out.quality, None);
 }
 

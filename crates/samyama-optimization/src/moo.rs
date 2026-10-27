@@ -246,12 +246,18 @@ pub fn weakly_dominates(a: &[f64], b: &[f64]) -> bool {
 }
 
 fn distance(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// The shortest distance from `point` to any member of `set`.
 fn distance_to_set(point: &[f64], set: &[Vec<f64>]) -> f64 {
-    set.iter().map(|q| distance(point, q)).fold(f64::INFINITY, f64::min)
+    set.iter()
+        .map(|q| distance(point, q))
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Exact hypervolume of `front` against `reference`, for any number of
@@ -319,7 +325,12 @@ pub fn igd_plus(approx_front: &[Vec<f64>], reference_front: &[Vec<f64>]) -> f64 
     };
     reference_front
         .iter()
-        .map(|z| approx_front.iter().map(|a| shortfall(z, a)).fold(f64::INFINITY, f64::min))
+        .map(|z| {
+            approx_front
+                .iter()
+                .map(|a| shortfall(z, a))
+                .fold(f64::INFINITY, f64::min)
+        })
         .sum::<f64>()
         / reference_front.len() as f64
 }
@@ -341,7 +352,10 @@ pub fn spread(approx_front: &[Vec<f64>], reference_front: &[Vec<f64>]) -> f64 {
     let extremes: Vec<&Vec<f64>> = (0..first.len())
         .filter_map(|j| reference_front.iter().min_by(|a, b| a[j].total_cmp(&b[j])))
         .collect();
-    let to_extremes: f64 = extremes.iter().map(|e| distance_to_set(e, approx_front)).sum();
+    let to_extremes: f64 = extremes
+        .iter()
+        .map(|e| distance_to_set(e, approx_front))
+        .sum();
     let nearest: Vec<f64> = approx_front
         .iter()
         .enumerate()
@@ -373,7 +387,10 @@ pub fn coverage(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
     if b.is_empty() {
         return 0.0;
     }
-    let covered = b.iter().filter(|q| a.iter().any(|p| weakly_dominates(p, q))).count();
+    let covered = b
+        .iter()
+        .filter(|q| a.iter().any(|p| weakly_dominates(p, q)))
+        .count();
     covered as f64 / b.len() as f64
 }
 
@@ -395,7 +412,9 @@ pub fn hv_reference_point(reference_front: &[Vec<f64>]) -> Vec<f64> {
         .map(|j| {
             let (lo, hi) = reference_front
                 .iter()
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p[j]), hi.max(p[j])));
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p[j]), hi.max(p[j]))
+                });
             let range = hi - lo;
             hi + HV_REFERENCE_MARGIN * if range > 0.0 { range } else { 1.0 }
         })
@@ -504,24 +523,37 @@ mod tests {
         assert!(weakly_dominates(&[1.0, 2.0], &[1.0, 2.0]));
         assert!(weakly_dominates(&[1.0, 2.0], &[1.0, 3.0]));
         assert!(!weakly_dominates(&[1.0, 4.0], &[2.0, 3.0]));
-        assert!(!weakly_dominates(&[1.0], &[1.0, 2.0]), "different lengths never dominate");
+        assert!(
+            !weakly_dominates(&[1.0], &[1.0, 2.0]),
+            "different lengths never dominate"
+        );
     }
 
     #[test]
     fn hypervolume_agrees_with_the_2d_one() {
         let front = vec![vec![0.0, 1.0], vec![0.5, 0.5], vec![1.0, 0.0]];
-        assert!(close(hypervolume(&front, &[2.0, 2.0]), hypervolume_2d(&front, [2.0, 2.0])));
+        assert!(close(
+            hypervolume(&front, &[2.0, 2.0]),
+            hypervolume_2d(&front, [2.0, 2.0])
+        ));
     }
 
     #[test]
     fn hypervolume_in_three_dimensions_by_hand() {
         // One point at the origin: the whole box, 2 x 3 x 4.
-        assert!(close(hypervolume(&[vec![0.0, 0.0, 0.0]], &[2.0, 3.0, 4.0]), 24.0));
+        assert!(close(
+            hypervolume(&[vec![0.0, 0.0, 0.0]], &[2.0, 3.0, 4.0]),
+            24.0
+        ));
         // In a 2x2x2 box, (0,1,1) dominates [0,2]x[1,2]x[1,2] (volume 2) and
         // (1,0,1) dominates [1,2]x[0,2]x[1,2] (volume 2); they overlap in
         // [1,2]x[1,2]x[1,2] (volume 1), so together they dominate 3.
         let front = vec![vec![0.0, 1.0, 1.0], vec![1.0, 0.0, 1.0]];
-        assert!(close(hypervolume(&front, &[2.0, 2.0, 2.0]), 3.0), "{}", hypervolume(&front, &[2.0, 2.0, 2.0]));
+        assert!(
+            close(hypervolume(&front, &[2.0, 2.0, 2.0]), 3.0),
+            "{}",
+            hypervolume(&front, &[2.0, 2.0, 2.0])
+        );
         // A dominated point adds nothing.
         let mut with_dominated = front.clone();
         with_dominated.push(vec![1.5, 1.5, 1.5]);
@@ -550,18 +582,29 @@ mod tests {
 
     #[test]
     fn spread_is_zero_for_an_even_front_that_reaches_both_ends() {
-        let reference: Vec<Vec<f64>> = (0..=10).map(|i| vec![i as f64 / 10.0, 1.0 - i as f64 / 10.0]).collect();
+        let reference: Vec<Vec<f64>> = (0..=10)
+            .map(|i| vec![i as f64 / 10.0, 1.0 - i as f64 / 10.0])
+            .collect();
         assert!(close(spread(&reference, &reference), 0.0));
         // Bunched in the middle and missing the ends: clearly worse.
         let bunched = vec![vec![0.45, 0.55], vec![0.5, 0.5], vec![0.6, 0.4]];
-        assert!(spread(&bunched, &reference) > 0.5, "{}", spread(&bunched, &reference));
+        assert!(
+            spread(&bunched, &reference) > 0.5,
+            "{}",
+            spread(&bunched, &reference)
+        );
         assert!(spread(&[], &reference).is_infinite());
     }
 
     #[test]
     fn coverage_counts_what_is_weakly_dominated() {
         let a = vec![vec![1.0, 1.0]];
-        let b = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![0.0, 3.0], vec![3.0, 0.0]];
+        let b = vec![
+            vec![1.0, 1.0],
+            vec![2.0, 2.0],
+            vec![0.0, 3.0],
+            vec![3.0, 0.0],
+        ];
         assert!(close(coverage(&a, &b), 0.5));
         assert!(close(coverage(&b, &a), 1.0), "not symmetric");
         assert_eq!(coverage(&a, &[]), 0.0);
@@ -571,7 +614,10 @@ mod tests {
     fn the_reference_point_sits_past_the_nadir_by_the_margin() {
         let front = vec![vec![0.0, 1.0], vec![1.0, 0.0]];
         let r = hv_reference_point(&front);
-        assert!(close(r[0], 1.0 + HV_REFERENCE_MARGIN) && close(r[1], 1.0 + HV_REFERENCE_MARGIN), "{r:?}");
+        assert!(
+            close(r[0], 1.0 + HV_REFERENCE_MARGIN) && close(r[1], 1.0 + HV_REFERENCE_MARGIN),
+            "{r:?}"
+        );
         // An objective with no range still gets a point strictly beyond it.
         let flat = vec![vec![0.0, 2.0], vec![1.0, 2.0]];
         assert!(hv_reference_point(&flat)[1] > 2.0);
@@ -580,14 +626,22 @@ mod tests {
 
     #[test]
     fn quality_metrics_of_the_reference_front_itself_are_ideal() {
-        let reference: Vec<Vec<f64>> = (0..=20).map(|i| vec![i as f64 / 20.0, 1.0 - i as f64 / 20.0]).collect();
+        let reference: Vec<Vec<f64>> = (0..=20)
+            .map(|i| vec![i as f64 / 20.0, 1.0 - i as f64 / 20.0])
+            .collect();
         let q = quality_metrics(&reference, &reference).unwrap();
         assert!(close(q.igd, 0.0) && close(q.igd_plus, 0.0) && close(q.spread, 0.0));
-        assert!(close(q.coverage, 1.0), "every point equals a front point, so is weakly dominated");
+        assert!(
+            close(q.coverage, 1.0),
+            "every point equals a front point, so is weakly dominated"
+        );
         assert!(q.hypervolume > 0.0);
         assert_eq!(q.reference_front_size, 21);
         // A worse front scores worse on every measure that has a direction.
-        let worse: Vec<Vec<f64>> = reference.iter().map(|p| vec![p[0] + 0.2, p[1] + 0.2]).collect();
+        let worse: Vec<Vec<f64>> = reference
+            .iter()
+            .map(|p| vec![p[0] + 0.2, p[1] + 0.2])
+            .collect();
         let w = quality_metrics(&worse, &reference).unwrap();
         assert!(w.hypervolume < q.hypervolume && w.igd > q.igd && w.igd_plus > q.igd_plus);
     }
@@ -597,8 +651,13 @@ mod tests {
         // A front strictly behind the known one: every point is beaten by it,
         // and it beats none of the known front. Measured the other way round,
         // C(front, known) would read 0 and call a poor front perfect.
-        let reference: Vec<Vec<f64>> = (0..=4).map(|i| vec![i as f64 / 4.0, 1.0 - i as f64 / 4.0]).collect();
-        let behind: Vec<Vec<f64>> = reference.iter().map(|p| vec![p[0] + 0.1, p[1] + 0.1]).collect();
+        let reference: Vec<Vec<f64>> = (0..=4)
+            .map(|i| vec![i as f64 / 4.0, 1.0 - i as f64 / 4.0])
+            .collect();
+        let behind: Vec<Vec<f64>> = reference
+            .iter()
+            .map(|p| vec![p[0] + 0.1, p[1] + 0.1])
+            .collect();
         let q = quality_metrics(&behind, &reference).unwrap();
         assert!(close(q.coverage, 1.0), "{}", q.coverage);
         assert!(close(coverage(&behind, &reference), 0.0));
@@ -609,7 +668,10 @@ mod tests {
         let reference = vec![vec![0.0, 1.0]];
         assert!(quality_metrics(&[], &reference).is_none());
         assert!(quality_metrics(&reference, &[]).is_none());
-        assert!(quality_metrics(&[vec![0.0, 1.0, 2.0]], &reference).is_none(), "objective counts differ");
+        assert!(
+            quality_metrics(&[vec![0.0, 1.0, 2.0]], &reference).is_none(),
+            "objective counts differ"
+        );
     }
 
     #[test]
