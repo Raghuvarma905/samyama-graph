@@ -3107,6 +3107,14 @@ pub async fn restore_snapshot_handler(
                 "merges_by_key": stats.merges_by_key.iter()
                     .map(|(k, n)| json!({"key": k, "merged": n}))
                     .collect::<Vec<_>>(),
+                // Values a merge dropped because the existing node had a
+                // different one; first writer wins (#1951).
+                "property_conflicts_by_key": stats.property_conflicts_by_key.iter()
+                    .map(|(k, n)| json!({"key": k, "conflicts": n}))
+                    .collect::<Vec<_>>(),
+                "property_conflict_samples": stats.property_conflict_samples.iter()
+                    .map(|c| json!({"key": c.key, "kept": c.kept, "discarded": c.discarded}))
+                    .collect::<Vec<_>>(),
                 "edges_imported": stats.edge_count,
                 "labels": stats.labels,
                 "edge_types": stats.edge_types,

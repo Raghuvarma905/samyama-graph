@@ -31,7 +31,7 @@ use crate::graph::store::GraphStore;
 use crate::graph::types::NodeId;
 use codec::{json_to_property, property_to_json};
 use format::{
-    ExportStats, ImportStats, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex,
+    ExportStats, ImportStats, PropertyConflict, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex,
     SnapshotIndexCatalog, SnapshotNode, SNAPSHOT_VERSION,
 };
 
@@ -999,7 +999,11 @@ fn import_tenant_inner(
     // Which key did the merging, and how many records landed on each target
     // (#1808). A bare count cannot distinguish duplicate pairs from a collapse.
     let mut merges_by_key: HashMap<String, u64> = HashMap::new();
-    let mut merge_group_sizes: HashMap<NodeId, u64> = HashMap::new();
+    // Properties a merge kept from the existing node over a different incoming
+    // value, per key, with a few examples (#1951).
+    let mut property_conflicts: HashMap<String, u64> = HashMap::new();
+    let mut property_conflict_samples: Vec<PropertyConflict> = Vec::new();
+let mut merge_group_sizes: HashMap<NodeId, u64> = HashMap::new();
     let mut imported_labels: HashSet<String> = HashSet::new();
     let mut imported_edge_types: HashSet<String> = HashSet::new();
     let mut hierarchy_decls: Vec<SnapshotHierarchyIndex> = Vec::new();
@@ -1147,6 +1151,27 @@ fn import_tenant_inner(
 
                 // Merge properties from snapshot into existing node (additive only)
                 for (key, json_val) in &snap_node.props {
+                    // First writer wins. When both sides have the key and
+                    // disagree, count what is dropped (#1951).
+                    let held = store.node_columns.get_property(eid.as_u64() as usize, key);
+                    if held != PropertyValue::Null && !json_val.is_null() {
+                        // Both sides through the same rendering, so a value
+                        // the snapshot encodes (a date, say) compares as the
+                        // store holds it.
+                        let kept = held.to_json();
+                        let incoming = json_to_property(json_val).to_json();
+                        if !same_merged_value(&kept, &incoming) {
+                            let n = property_conflicts.entry(key.clone()).or_insert(0);
+                            *n += 1;
+                            if *n <= PROPERTY_CONFLICT_SAMPLES as u64 {
+                                property_conflict_samples.push(PropertyConflict {
+                                    key: key.clone(),
+                                    kept: sample_value(kept),
+                                    discarded: sample_value(incoming),
+                                });
+                            }
+                        }
+                    }
                     let pv = json_to_property(json_val);
                     match &pv {
                         PropertyValue::String(_) | PropertyValue::Integer(_)
@@ -1440,6 +1465,8 @@ fn import_tenant_inner(
     let largest_merge_group = merge_group_sizes.values().copied().max().map_or(0, |m| m + 1);
     let mut merges_by_key_sorted: Vec<(String, u64)> = merges_by_key.into_iter().collect();
     merges_by_key_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut property_conflicts_by_key: Vec<(String, u64)> = property_conflicts.into_iter().collect();
+    property_conflicts_by_key.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     if merged_node_count > 0 {
         // Not "duplicate nodes": that is the claim under test. A merge means two
@@ -1473,6 +1500,18 @@ fn import_tenant_inner(
                 .unwrap_or_else(|| "unknown".to_string());
             eprintln!(
                 "[dedup] WARNING: {lost_pct:.1}% of this source merged away, above the                  {SUSPECT_MERGE_FRACTION:.0}% a well-identified corpus would show. Most merges                  came from {worst}. If that key is not an entity identifier -- a gene symbol, a                  display name -- it is collapsing distinct entities, and a larger merge count is                  the symptom, not the result. Re-run with identifier keys only to compare."
+            );
+        }
+        // Which source's value survived depends on the order the sources
+        // were imported in; this says how often that mattered (#1951).
+        if !property_conflicts_by_key.is_empty() {
+            let by_key = property_conflicts_by_key
+                .iter()
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "[dedup] property conflicts (existing value kept, incoming dropped): {by_key}"
             );
         }
         if largest_merge_group > 2 {
@@ -1598,12 +1637,45 @@ fn import_tenant_inner(
         merge_groups,
         largest_merge_group,
         merges_by_key: merges_by_key_sorted,
+        property_conflicts_by_key,
+        property_conflict_samples,
         labels,
         edge_types,
         hierarchy_count,
         indexes,
         index_conflicts,
     })
+}
+
+/// How many conflicts per key [`ImportStats::property_conflict_samples`]
+/// keeps (#1951).
+pub const PROPERTY_CONFLICT_SAMPLES: usize = 5;
+
+/// Whether a merge's existing and incoming values are the same value: strings
+/// as the dedup lookup compares them, numbers by value, anything else exactly
+/// (#1951).
+fn same_merged_value(kept: &serde_json::Value, incoming: &serde_json::Value) -> bool {
+    use serde_json::Value as J;
+    match (kept, incoming) {
+        (J::String(a), J::String(b)) => a.trim().to_lowercase() == b.trim().to_lowercase(),
+        (J::Number(a), J::Number(b)) => match (a.as_i64(), b.as_i64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.as_f64() == b.as_f64(),
+        },
+        _ => kept == incoming,
+    }
+}
+
+/// A value as a conflict sample shows it. Long strings are cut, so a sample
+/// stays small whatever the property holds.
+fn sample_value(value: serde_json::Value) -> serde_json::Value {
+    const MAX_CHARS: usize = 200;
+    match value {
+        serde_json::Value::String(s) if s.chars().count() > MAX_CHARS => {
+            serde_json::Value::String(format!("{}…", s.chars().take(MAX_CHARS).collect::<String>()))
+        }
+        other => other,
+    }
 }
 
 /// The target's definition that `incoming` would silently replace, if any.

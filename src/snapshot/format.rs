@@ -224,6 +224,15 @@ pub struct SnapshotIndexCatalog {
     pub definitions: Vec<crate::index::catalog::IndexDefinition>,
 }
 
+/// One property a merge kept from the node already in the graph, with the
+/// incoming value it dropped (#1951).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyConflict {
+    pub key: String,
+    pub kept: serde_json::Value,
+    pub discarded: serde_json::Value,
+}
+
 /// Stats returned from import
 #[derive(Debug)]
 pub struct ImportStats {
@@ -256,6 +265,21 @@ pub struct ImportStats {
     /// and the lookup falls through to `symbol`. This names the key that actually
     /// did the merging.
     pub merges_by_key: Vec<(String, u64)>,
+    /// Per property key, how many merges found a value on both nodes and the
+    /// two disagreed, highest first (#1951).
+    ///
+    /// The node already in the graph keeps its value and the incoming one is
+    /// dropped, so which value survives depends on import order. These counts
+    /// are how much was dropped. Strings are compared as the dedup lookup
+    /// compares them, trimmed and case-folded, and numbers by value, so
+    /// `"TP53"` against `" tp53 "` or `1` against `1.0` is not a conflict. A
+    /// property only one side carries is the ordinary additive merge.
+    pub property_conflicts_by_key: Vec<(String, u64)>,
+    /// Up to [`PROPERTY_CONFLICT_SAMPLES`] conflicts per key, in import order,
+    /// to look at (#1951).
+    ///
+    /// [`PROPERTY_CONFLICT_SAMPLES`]: crate::snapshot::PROPERTY_CONFLICT_SAMPLES
+    pub property_conflict_samples: Vec<PropertyConflict>,
     pub labels: Vec<String>,
     pub edge_types: Vec<String>,
     /// Hierarchy indexes rebuilt from declarations in the snapshot.
