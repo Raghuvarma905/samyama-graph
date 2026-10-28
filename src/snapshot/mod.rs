@@ -1003,7 +1003,7 @@ fn import_tenant_inner(
     // value, per key, with a few examples (#1951).
     let mut property_conflicts: HashMap<String, u64> = HashMap::new();
     let mut property_conflict_samples: Vec<PropertyConflict> = Vec::new();
-let mut merge_group_sizes: HashMap<NodeId, u64> = HashMap::new();
+    let mut merge_group_sizes: HashMap<NodeId, u64> = HashMap::new();
     let mut imported_labels: HashSet<String> = HashSet::new();
     let mut imported_edge_types: HashSet<String> = HashSet::new();
     let mut hierarchy_decls: Vec<SnapshotHierarchyIndex> = Vec::new();
