@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "samyama"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3222,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "samyama-graph-algorithms"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "ndarray",
  "rand 0.8.8",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "samyama-optimization"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "ndarray",
  "rand 0.8.8",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "samyama-python"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "pyo3",
  "samyama-sdk",
@@ -3253,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "samyama-sdk"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "async-trait",
  "ndarray",
