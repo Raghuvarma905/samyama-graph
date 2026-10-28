@@ -23,6 +23,7 @@ from it.
 | [ai-research-kg](#ai-research-kg) | 1,000 open problems in AI/ML | 29,707 / 62,842 | not decided yet | not published |
 | [assetops-kg](#assetops-kg) | Industrial assets, sensors, failure modes, work orders | 12,647 / 12,662 | Apache 2.0 | build it |
 | [bank-model-risk-kg](#bank-model-risk-kg) | Model governance, lineage and regulation (synthetic) | 520 / 2,391 | Apache 2.0 | HuggingFace |
+| [banking-kg](#banking-kg) | A city's 2023 lending market plus one fictional bank's customers | 75,179 / 241,222 | public sources + synthetic; repo is proprietary | build it |
 | [clinicaltrials-kg](#clinicaltrials-kg) | ClinicalTrials.gov with MeSH, RxNorm, FAERS, PubMed | 7.8M / 27M | mixed, per source | HuggingFace, snapshot |
 | [cricket-kg](#cricket-kg) | Ball-by-ball cricket, 21,324 matches | 36,619 / 1,392,017 | CC BY 4.0 | HuggingFace, snapshot |
 | [dbms-research-kg](#dbms-research-kg) | 1,053 open problems in database systems | 20,211 / 53,721 | CC BY 4.0 | snapshot |
@@ -116,6 +117,28 @@ real institution.
 
 ```cypher
 MATCH (ds:DataSource)<-[:DEPENDS_ON]-(m:Model)-[:FEEDS]->(s:Submission) WHERE ds.name = "Core Banking Ledger" RETURN s.name AS submission, count(DISTINCT m) AS models_affected ORDER BY models_affected DESC
+```
+
+### banking-kg
+
+[samyama-ai/banking-kg](https://github.com/samyama-ai/banking-kg). A bank and its market in one
+graph: Washington DC's 2023 lending market from four public regulatory filings, and one
+fictional bank's 5,000 customers.
+
+- **Scale:** 75,179 nodes, 241,222 relationships. The market layer is real and public (31,128 /
+  83,640); the bank layer is synthetic (44,044 / 152,795), and every synthetic node carries
+  `synthetic: true` (DATASET_CARD.md).
+- **Schema:** 29 node types, including Card, Application, Account, Loan, Customer, Lender,
+  SBALoan and Filing; 33 relationship types, including SPENDS_AT, FILED_WITH, ORIGINATED_BY and
+  SOLD_TO.
+- **Data licence:** the sources are US government public data (HMDA, FDIC BankFind, SBA FOIA)
+  and GLEIF LEI data (CC0 1.0); the bank layer is synthetic, with no real person or
+  institution. The repository's own LICENSE marks its code, schema and compiled graph
+  proprietary to Samyama.ai.
+- **Get it:** build it with the repository's ETL. No snapshot is published.
+
+```cypher
+MATCH (l:Lender {name: 'Citibank, National Association'})<-[:ORIGINATED_BY]-(n:Loan) WHERE NOT (n)-[:SOLD_TO]->() RETURN count(n)
 ```
 
 ### clinicaltrials-kg
@@ -512,4 +535,3 @@ The repository has no sample query yet.
 
 - **Private repositories** are left out, because a reader outside the organisation cannot
   open them.
-- **One public repository** is left out until its owner reviews it.
