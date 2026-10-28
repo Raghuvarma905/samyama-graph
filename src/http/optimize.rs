@@ -19,7 +19,7 @@ use ndarray::Array1;
 use samyama_optimization::algorithms::{
     BMRSolver, BMWRSolver, BWRSolver, DESolver, EHRJayaSolver, GASolver, GOTLBOSolver, ITLBOSolver,
     JayaSolver, MOBMWRSolver, MOBMWRVariant, MORaoDESolver, NSGA2Solver, PSOSolver, QOJayaSolver,
-    QORaoSolver, RaoSolver, RaoVariant, SAMPJayaSolver, SAPHRSolver, TLBOSolver,
+    QORaoSolver, RaoSolver, RaoVariant, SAMPJayaSolver, SAPHRSolver, TLBOSolver, LSHADESolver,
 };
 use samyama_optimization::benchmarks::{DTLZ, DTLZ_FRONT_SAMPLES_PER_AXIS, ZDT, ZDT_FRONT_SAMPLES};
 use samyama_optimization::common::{
@@ -322,6 +322,20 @@ fn algorithm_catalog() -> Vec<AlgorithmInfo> {
             variant: None,
             equation_tex: r"v = x_{r1} + F(x_{r2}-x_{r3})",
             paper_refs: vec![],
+            params: default_params(),
+            multi_objective: false,
+        },
+        AlgorithmInfo {
+            id: "lshade",
+            name: "L-SHADE",
+            family: "evolutionary",
+            variant: None,
+            equation_tex: r"v = x_i + F(x_{pbest}-x_i) + F(x_{r1}-\tilde{x}_{r2})",
+            paper_refs: vec![PaperRef {
+                title: "Improving the search performance of SHADE using linear population size reduction",
+                url: "https://doi.org/10.1109/CEC.2014.6900380",
+                year: 2014,
+            }],
             params: default_params(),
             multi_objective: false,
         },
@@ -1075,6 +1089,7 @@ fn run_solver(
             "saphr" => seeded!(SAPHRSolver::new(cfg), seed).solve(&problem),
             "pso" => seeded!(PSOSolver::new(cfg), seed).solve(&problem),
             "de" => seeded!(DESolver::new(cfg), seed).solve(&problem),
+            "lshade" => seeded!(LSHADESolver::new(cfg), seed).solve(&problem),
             "ga" => seeded!(GASolver::new(cfg), seed).solve(&problem),
             other => {
                 return Err(format!(
