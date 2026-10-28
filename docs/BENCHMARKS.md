@@ -158,7 +158,7 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 | **pass rate, of evaluated** | **99.9%** |
 | gate `CH-TCK ≥ 85%` | **met** |
 | gate *≥ best competitor* | **met** — 17.6 points ahead (judge path, 3,766 scenarios, measured at `7708d60`; not re-run at `d2df42a`) |
-| wrong answers, of the 2 failures | 0 |
+| wrong answers, of the 2 failures | see the `CH-TCK` envelope for `d2df42a` |
 
 Measured at `d2df42a`; the CI floor is a **count**, currently `--min-pass 3700`,
 and rises with each merge that earns it.
