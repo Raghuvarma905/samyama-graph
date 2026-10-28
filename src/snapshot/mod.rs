@@ -31,7 +31,7 @@ use crate::graph::store::GraphStore;
 use crate::graph::types::NodeId;
 use codec::{json_to_property, property_to_json};
 use format::{
-    ExportStats, ImportStats, PropertyConflict, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex,
+    ExportStats, ImportStats, PropertyConflict, UnusedDedupKey, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex,
     SnapshotIndexCatalog, SnapshotNode, SNAPSHOT_VERSION,
 };
 
@@ -733,13 +733,42 @@ pub fn edit_header(
     Ok(header)
 }
 
-/// A qualified rule is eligible only for its named label; bare keys retain
-/// the historical behavior for every label.
-fn dedup_property<'a>(rule: &'a str, labels: &[String]) -> Option<&'a str> {
-    match rule.split_once('.') {
-        Some((label, key)) if labels.iter().any(|l| l == label) => Some(key),
-        Some(_) => None,
-        None => Some(rule),
+/// A dedup rule, `[Label.]name[=alias|alias...]`.
+///
+/// A label scopes it to that label (#1946). Aliases are other property names
+/// for the same identifier (#1948): UMLS writes `cui` and SIDER `umls_cui`,
+/// so `cui=umls_cui` lets the two meet. Every name's values are indexed under
+/// the rule, so a value found under one name matches the same value under
+/// another. The names are tried in the order given, the first one first.
+struct DedupRule<'a> {
+    label: Option<&'a str>,
+    names: Vec<&'a str>,
+}
+
+fn parse_dedup_rule(rule: &str) -> DedupRule<'_> {
+    let (head, aliases) = match rule.split_once('=') {
+        Some((head, aliases)) => (head, Some(aliases)),
+        None => (rule, None),
+    };
+    let (label, name) = match head.split_once('.') {
+        Some((label, name)) => (Some(label.trim()), name.trim()),
+        None => (None, head.trim()),
+    };
+    let mut names = vec![name];
+    if let Some(aliases) = aliases {
+        names.extend(aliases.split('|').map(str::trim));
+    }
+    DedupRule { label, names }
+}
+
+/// The property names a rule reads on a node with these labels. A qualified
+/// rule is eligible only for its named label; bare keys retain the historical
+/// behavior for every label.
+fn dedup_properties<'a>(rule: &'a str, labels: &[String]) -> Vec<&'a str> {
+    let rule = parse_dedup_rule(rule);
+    match rule.label {
+        Some(label) if !labels.iter().any(|l| l == label) => Vec::new(),
+        _ => rule.names,
     }
 }
 
@@ -755,18 +784,19 @@ fn existing_dedup_entries(
     let Some(node) = store.get_node(id) else { return out };
     let labels: Vec<String> = node.labels.iter().map(|l| l.as_str().to_string()).collect();
     for &key in dedup_keys {
-        let Some(property) = dedup_property(key, &labels) else { continue };
-        match node.get_property(property) {
-            Some(PropertyValue::String(s)) => out.push((key.to_string(), normalize_dedup(s))),
-            Some(PropertyValue::Integer(i)) => out.push((key.to_string(), i.to_string())),
-            _ => {}
-        }
-        match store.node_columns.get_property(id.as_u64() as usize, property) {
-            PropertyValue::String(s) if !s.is_empty() => {
-                out.push((key.to_string(), normalize_dedup(&s)))
+        for property in dedup_properties(key, &labels) {
+            match node.get_property(property) {
+                Some(PropertyValue::String(s)) => out.push((key.to_string(), normalize_dedup(s))),
+                Some(PropertyValue::Integer(i)) => out.push((key.to_string(), i.to_string())),
+                _ => {}
             }
-            PropertyValue::Integer(i) => out.push((key.to_string(), i.to_string())),
-            _ => {}
+            match store.node_columns.get_property(id.as_u64() as usize, property) {
+                PropertyValue::String(s) if !s.is_empty() => {
+                    out.push((key.to_string(), normalize_dedup(&s)))
+                }
+                PropertyValue::Integer(i) => out.push((key.to_string(), i.to_string())),
+                _ => {}
+            }
         }
     }
     out
@@ -957,10 +987,14 @@ fn import_tenant_inner(
     let header: SnapshotHeader = serde_json::from_str(&header_line)?;
     // Validate rules before creating or merging any rows.
     for rule in dedup_keys {
-        if let Some((label, key)) = rule.split_once('.') {
-            if label.is_empty() || key.is_empty() || !header.labels.iter().any(|l| l == label) {
+        let parsed = parse_dedup_rule(rule);
+        if let Some(label) = parsed.label {
+            if label.is_empty() || !header.labels.iter().any(|l| l == label) {
                 return Err(format!("unknown snapshot label or empty property in dedup rule {rule:?}").into());
             }
+        }
+        if parsed.names.iter().any(|name| name.is_empty()) {
+            return Err(format!("empty property in dedup rule {rule:?}").into());
         }
     }
 
@@ -1003,6 +1037,9 @@ fn import_tenant_inner(
     // value, per key, with a few examples (#1951).
     let mut property_conflicts: HashMap<String, u64> = HashMap::new();
     let mut property_conflict_samples: Vec<PropertyConflict> = Vec::new();
+    // Incoming nodes carrying a value for each rule, so a rule that merged
+    // nothing can say whether it had anything to merge on (#1948).
+    let mut dedup_key_carriers: HashMap<&str, u64> = HashMap::new();
     let mut merge_group_sizes: HashMap<NodeId, u64> = HashMap::new();
     let mut imported_labels: HashSet<String> = HashSet::new();
     let mut imported_edge_types: HashSet<String> = HashSet::new();
@@ -1091,9 +1128,20 @@ fn import_tenant_inner(
             // the first value *found*, so an identifier listed first does not
             // shield a free-text key listed after it (#1808).
             let mut matched_key: Option<&str> = None;
+            for &key in dedup_keys.iter() {
+                let carried = dedup_properties(key, &snap_labels).iter().any(|p| {
+                    matches!(
+                        snap_node.props.get(*p),
+                        Some(serde_json::Value::String(_) | serde_json::Value::Number(_))
+                    )
+                });
+                if carried {
+                    *dedup_key_carriers.entry(key).or_insert(0) += 1;
+                }
+            }
             'dedup: for &key in dedup_keys.iter() {
-                let Some(property) = dedup_property(key, &snap_labels) else { continue };
-                if let Some(json_val) = snap_node.props.get(property) {
+                for property in dedup_properties(key, &snap_labels) {
+                    let Some(json_val) = snap_node.props.get(property) else { continue };
                     let val_str = match json_val {
                         serde_json::Value::String(s) => normalize_dedup(s),
                         serde_json::Value::Number(n) => n.to_string(),
@@ -1114,10 +1162,22 @@ fn import_tenant_inner(
             if !allow_conflicts {
                 if let Some(eid) = existing_id {
                     let conflict = dedup_keys.iter().any(|key| {
-                        let Some(property) = dedup_property(key, &snap_labels) else { return false };
-                        let Some(incoming) = snap_node.props.get(property) else { return false };
-                        let Some(existing) = store.node_property(eid, property) else { return false };
-                        if existing == PropertyValue::Null || incoming.is_null() { return false; }
+                        // Each side's value under the first of the rule's
+                        // names it carries: with aliases the two sides may
+                        // spell the key differently (#1948).
+                        let properties = dedup_properties(key, &snap_labels);
+                        let Some(incoming) = properties
+                            .iter()
+                            .find_map(|p| snap_node.props.get(*p).filter(|v| !v.is_null()))
+                        else {
+                            return false;
+                        };
+                        let Some(existing) = properties
+                            .iter()
+                            .find_map(|p| store.node_property(eid, p).filter(|v| *v != PropertyValue::Null))
+                        else {
+                            return false;
+                        };
                         let old = existing.to_json();
                         match (&old, incoming) {
                             (serde_json::Value::String(a), serde_json::Value::String(b)) =>
@@ -1301,8 +1361,8 @@ fn import_tenant_inner(
                 }
                 // Register in dedup index
                 for &key in dedup_keys {
-                    let Some(property) = dedup_property(key, &snap_labels) else { continue };
-                    if let Some(json_val) = snap_node.props.get(property) {
+                    for property in dedup_properties(key, &snap_labels) {
+                        let Some(json_val) = snap_node.props.get(property) else { continue };
                         let val_str = match json_val {
                             serde_json::Value::String(s) => normalize_dedup(s),
                             serde_json::Value::Number(n) => n.to_string(),
@@ -1330,8 +1390,10 @@ fn import_tenant_inner(
                 }
                 // Register in dedup index
                 for &key in dedup_keys {
-                    let Some(property) = dedup_property(key, &snap_labels) else { continue };
-                    if let Some(pv) = store.get_node(new_id).and_then(|n| n.get_property(property)) {
+                    for property in dedup_properties(key, &snap_labels) {
+                        let Some(pv) = store.get_node(new_id).and_then(|n| n.get_property(property)) else {
+                            continue;
+                        };
                         let val_str = match pv {
                             PropertyValue::String(s) => normalize_dedup(s),
                             PropertyValue::Integer(i) => i.to_string(),
@@ -1467,6 +1529,31 @@ fn import_tenant_inner(
     merges_by_key_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut property_conflicts_by_key: Vec<(String, u64)> = property_conflicts.into_iter().collect();
     property_conflicts_by_key.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let dedup_keys_unused: Vec<UnusedDedupKey> = dedup_keys
+        .iter()
+        .filter(|key| !merges_by_key_sorted.iter().any(|(k, _)| k == *key))
+        .map(|key| UnusedDedupKey {
+            key: key.to_string(),
+            incoming_nodes_with_key: dedup_key_carriers.get(key).copied().unwrap_or(0),
+        })
+        .collect();
+    // Printed whether or not anything merged: a load where every key is dead
+    // is the one that most needs to say so (#1948).
+    if !dedup_keys_unused.is_empty() {
+        let unused = dedup_keys_unused
+            .iter()
+            .map(|u| match u.incoming_nodes_with_key {
+                0 => format!("{} (on no incoming node)", u.key),
+                n => format!("{} (on {n} incoming nodes, none matched)", u.key),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[dedup] keys that merged nothing: {unused}. A key on no incoming node is a typo, \
+             an absent property or a label the rule does not name; one that never matched may \
+             be spelled differently in the existing data (alias it: `cui=umls_cui`)."
+        );
+    }
 
     if merged_node_count > 0 {
         // Not "duplicate nodes": that is the claim under test. A merge means two
@@ -1639,6 +1726,7 @@ fn import_tenant_inner(
         merges_by_key: merges_by_key_sorted,
         property_conflicts_by_key,
         property_conflict_samples,
+        dedup_keys_unused,
         labels,
         edge_types,
         hierarchy_count,

@@ -3115,6 +3115,11 @@ pub async fn restore_snapshot_handler(
                 "property_conflict_samples": stats.property_conflict_samples.iter()
                     .map(|c| json!({"key": c.key, "kept": c.kept, "discarded": c.discarded}))
                     .collect::<Vec<_>>(),
+                // Keys that merged nothing; 0 carriers means no incoming node
+                // had the property under any of its names (#1948).
+                "dedup_keys_unused": stats.dedup_keys_unused.iter()
+                    .map(|u| json!({"key": u.key, "incoming_nodes_with_key": u.incoming_nodes_with_key}))
+                    .collect::<Vec<_>>(),
                 "edges_imported": stats.edge_count,
                 "labels": stats.labels,
                 "edge_types": stats.edge_types,

@@ -233,6 +233,15 @@ pub struct PropertyConflict {
     pub discarded: serde_json::Value,
 }
 
+/// A dedup key that merged nothing in an import (#1948).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnusedDedupKey {
+    /// The rule as given, aliases included.
+    pub key: String,
+    /// Incoming nodes carrying a value under any of the rule's names.
+    pub incoming_nodes_with_key: u64,
+}
+
 /// Stats returned from import
 #[derive(Debug)]
 pub struct ImportStats {
@@ -280,6 +289,16 @@ pub struct ImportStats {
     ///
     /// [`PROPERTY_CONFLICT_SAMPLES`]: crate::snapshot::PROPERTY_CONFLICT_SAMPLES
     pub property_conflict_samples: Vec<PropertyConflict>,
+    /// The dedup keys that merged nothing in this import, in the order given
+    /// (#1948).
+    ///
+    /// A key that never fires is otherwise silent: nine of thirteen keys in
+    /// one federation load merged nothing, and the load reported success.
+    /// `incoming_nodes_with_key` tells the two causes apart. Zero means no
+    /// incoming node carried the property under any of the key's names: a
+    /// typo, an absent property, or a label the rule does not name. More than
+    /// zero means the values were there and none matched an existing node.
+    pub dedup_keys_unused: Vec<UnusedDedupKey>,
     pub labels: Vec<String>,
     pub edge_types: Vec<String>,
     /// Hierarchy indexes rebuilt from declarations in the snapshot.
