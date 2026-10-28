@@ -19,6 +19,7 @@ static CALLS_WITHOUT_USAGE: AtomicU64 = AtomicU64::new(0);
 static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
 static COMPLETION_TOKENS: AtomicU64 = AtomicU64::new(0);
 static DURATION_MICROS: AtomicU64 = AtomicU64::new(0);
+const MICROS_PER_SECOND: f64 = 1_000_000.0;
 
 /// Count a call that returned an answer.
 pub fn record_call(latency: Duration, usage: &TokenUsage) {
@@ -55,7 +56,15 @@ pub struct Snapshot {
     pub calls_without_usage: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    pub duration_seconds: f64,
+    /// Kept in whole microseconds, as counted, so two snapshots compare
+    /// exactly; seconds are for rendering only.
+    pub duration_micros: u64,
+}
+
+impl Snapshot {
+    pub fn duration_seconds(&self) -> f64 {
+        self.duration_micros as f64 / MICROS_PER_SECOND
+    }
 }
 
 pub fn snapshot() -> Snapshot {
@@ -65,7 +74,7 @@ pub fn snapshot() -> Snapshot {
         calls_without_usage: CALLS_WITHOUT_USAGE.load(Ordering::Relaxed),
         prompt_tokens: PROMPT_TOKENS.load(Ordering::Relaxed),
         completion_tokens: COMPLETION_TOKENS.load(Ordering::Relaxed),
-        duration_seconds: DURATION_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        duration_micros: DURATION_MICROS.load(Ordering::Relaxed),
     }
 }
 
@@ -104,7 +113,7 @@ fn render_snapshot(s: &Snapshot) -> String {
         (
             "samyama_llm_call_duration_seconds_total",
             "Wall-clock time spent waiting on model calls.",
-            s.duration_seconds.to_string(),
+            s.duration_seconds().to_string(),
         ),
     ];
     let mut out = String::new();
@@ -132,7 +141,7 @@ mod tests {
             calls_without_usage: 1,
             prompt_tokens: 412,
             completion_tokens: 17,
-            duration_seconds: 1.5,
+            duration_micros: 1_500_000,
         };
         let out = render_snapshot(&s);
         for (name, value) in [
@@ -165,7 +174,9 @@ mod tests {
         assert!(after.calls > before.calls);
         assert!(after.prompt_tokens >= before.prompt_tokens + 412);
         assert!(after.completion_tokens >= before.completion_tokens + 17);
-        assert!(after.duration_seconds >= before.duration_seconds + 0.25);
+        // Compared in whole microseconds: in seconds, as floats, `x + 0.25`
+        // can round past what was counted, and did on an ARM runner.
+        assert!(after.duration_micros >= before.duration_micros + 250_000);
     }
 
     #[test]
@@ -182,6 +193,6 @@ mod tests {
         let after = snapshot();
         assert!(after.failed_calls > before.failed_calls);
         assert!(after.calls > before.calls);
-        assert!(after.duration_seconds >= before.duration_seconds + 0.1);
+        assert!(after.duration_micros >= before.duration_micros + 100_000);
     }
 }
