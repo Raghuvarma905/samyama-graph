@@ -36,6 +36,7 @@ from it.
 | [imdb-kg](#imdb-kg) | Movies, series, people, genres | 1.94M / 2.63M | IMDb non-commercial | snapshot |
 | [legal-judgments-graph-kg](#legal-judgments-graph-kg) | 589 Indian Supreme Court judgments (2016) | 4,462 / 8,363 | CC BY 4.0 | HuggingFace, snapshot |
 | [maths-research-kg](#maths-research-kg) | 1,161 open problems in mathematics | 34,073 / 78,162 | open question | build it |
+| [market-structure-kg](#market-structure-kg) | A market maker's entities, venues, clearing and 1,764 ETFs | 45,227 / 71,640 | SEC public, GLEIF CC0 | build it |
 | [marketing-attribution-kg](#marketing-attribution-kg) | Media measurement claims with lineage (synthetic) | 20,102 / 78,752 | Apache 2.0 | build it |
 | [mental-health-kg](#mental-health-kg) | US behavioural-health facilities and clinicians | 113,710 / 1,665,153 | public domain | HuggingFace |
 | [pathways-kg](#pathways-kg) | Reactome, STRING, GO, WikiPathways, UniProt | 119K / 835K | CC BY 4.0 | snapshot |
@@ -351,6 +352,28 @@ hard problems in mathematics, what is proved toward each, and what blocks it.
 MATCH (p:Problem {status: 'open'})-[:INVOLVES]->(c:Concept), (p)-[:IN_TOPIC]->(t:Topic) RETURN c.name, count(DISTINCT t) AS topics, count(DISTINCT p) AS open_problems ORDER BY topics DESC, open_problems DESC LIMIT 5
 ```
 
+### market-structure-kg
+
+[samyama-ai/market-structure-kg](https://github.com/samyama-ai/market-structure-kg). One market
+maker's legal entities, venues, regulators and clearing, the 1,764 ETFs it is authorised
+participant for, and what the ten largest of them hold. Public data plus a synthetic layer.
+
+- **Scale:** 45,227 nodes, 71,640 relationships: public 44,638 / 69,773, synthetic 589 / 1,867
+  (DATASET_CARD.md).
+- **Schema:** 21 labels (14 base and 7 sub-labels), including LegalEntity, Issuer,
+  Counterparty, Instrument, ETF, Venue and Regulator; 28 relationship types, 15 public (such as
+  SUBSIDIARY_OF, ISSUES, HOLDS, AUTHORIZED_PARTICIPANT_FOR, CLEARS_VIA) and 13 synthetic.
+- **Data licence:** per source (DATA-LICENSES.md). SEC N-CEN and N-PORT data is public and
+  redistributable with credit to the SEC; GLEIF data is CC0; only a 15-venue subset of the
+  ISO MIC list is kept, which its terms allow; the synthetic layer is Apache 2.0 and marked
+  `synthetic: true`.
+- **Get it:** build it. The repository asks that a snapshot or CSV export not be sent out
+  before a legal review, so none is published.
+
+```cypher
+MATCH (i:Issuer {name: 'NVIDIA Corp.'})-[:ISSUES]->(:Instrument)<-[h:HOLDS]-(e:ETF) <-[:AUTHORIZED_PARTICIPANT_FOR]-(:Counterparty {name: 'MARKET MAKER CAPITAL, LLC'}) RETURN e.name, round(h.weight * 10000) / 100 AS pct ORDER BY pct DESC LIMIT 5
+```
+
 ### marketing-attribution-kg
 
 [samyama-ai/marketing-attribution-kg](https://github.com/samyama-ai/marketing-attribution-kg).
@@ -489,4 +512,4 @@ The repository has no sample query yet.
 
 - **Private repositories** are left out, because a reader outside the organisation cannot
   open them.
-- **Two public repositories** are left out until their owners review them.
+- **One public repository** is left out until its owner reviews it.
