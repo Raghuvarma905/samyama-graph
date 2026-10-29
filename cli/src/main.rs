@@ -2,6 +2,7 @@
 //!
 //! Uses the samyama-sdk RemoteClient to connect to a running server.
 
+use crate::snapshot_keys::run_snapshot_keys;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use comfy_table::{Table, ContentArrangement};
