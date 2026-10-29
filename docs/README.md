@@ -1,6 +1,6 @@
 # Samyama Graph — Documentation Index
 
-**Last updated:** 2026-10-23 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
+**Last updated:** 2026-10-29 · **Engine version:** see [Releases](https://github.com/samyama-ai/samyama-graph/releases) — documents below state the version they were verified against
 
 ## Primary sources
 
@@ -39,6 +39,7 @@ eight of eighteen documents (#1450).
 ### The query language
 
 - **[CYPHER-COMPATIBILITY.md](./CYPHER-COMPATIBILITY.md)** — OpenCypher coverage against the TCK, with the pass rate quoted beside its coverage.
+- **[GQL-GAP-ANALYSIS.md](./GQL-GAP-ANALYSIS.md)** — a historical planning analysis of possible GQL gaps, explicitly not a GQL conformance claim.
 - **[FULL-TEXT-SEARCH.md](./FULL-TEXT-SEARCH.md)** — the full-text index and how it is queried.
 - **[INDEX-CONTRACT.md](./INDEX-CONTRACT.md)** — the six clauses every index structure implements (build, maintain under MVCC, cost, plan, persist, snapshot), and how to add one.
 - **[GDS-COMPATIBILITY.md](./GDS-COMPATIBILITY.md)** — which `gds.*` names resolve here, and which deliberately do not.

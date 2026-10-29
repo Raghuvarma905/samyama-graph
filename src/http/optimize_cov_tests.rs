@@ -265,9 +265,10 @@ async fn a_multi_objective_solve_stamps_the_pareto_front_on_the_last_iteration()
     let (name, done) = events.last().unwrap();
     assert_eq!(name, "done");
     assert_solve_was_timed(done);
-    // A front has no single optimum, and its feasibility cannot be read on
-    // this surface (#1795): both fields are present and null, never guessed.
-    assert!(done.get("feasible").is_some_and(|v| v.is_null()), "{done}");
+    // A front has no single optimum, so `gap` is null. Its feasibility is
+    // read from each point's constraint violation (#1795); ZDT1 has no
+    // constraints, so every point is feasible.
+    assert_eq!(done["feasible"], true, "{done}");
     assert!(done.get("gap").is_some_and(|v| v.is_null()), "{done}");
     let front = done["final_pareto"].as_array().expect("a pareto front");
     assert!(!front.is_empty());
@@ -434,14 +435,116 @@ fn every_single_objective_benchmark_reports_feasibility_and_its_gap() {
 }
 
 #[test]
-fn a_multi_objective_result_reports_no_feasibility_or_gap() {
+fn a_multi_objective_result_reports_feasibility_and_no_gap() {
+    // ZDT and DTLZ have no constraints, so every front point is feasible;
+    // UC2's front is feasible or says it is not (#1795). None of them has a
+    // single optimum to report a gap against.
     for bench in ["zdt1", "dtlz1", "uc2_dosing"] {
         let out =
             run_solver("nsga2", true, bench, 2, CATALOG_DIM, cfg(), Some(ENVELOPE_SEED)).unwrap();
-        assert_eq!(out.feasible, None, "{bench}");
+        if bench != "uc2_dosing" {
+            assert_eq!(out.feasible, Some(true), "{bench}");
+        }
+        assert!(out.feasible.is_some(), "{bench}: a non-empty front says");
         assert_eq!(out.gap, None, "{bench}");
         assert_eq!(optimum_of(bench), None, "{bench}: the catalog lists no optimum");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Infeasible points on the front (OPT-10, #1795)
+// ---------------------------------------------------------------------------
+
+fn point(objective: f64, violation: f64) -> samyama_optimization::common::MultiObjectiveIndividual {
+    samyama_optimization::common::MultiObjectiveIndividual::new(
+        Array1::zeros(1),
+        vec![objective],
+        violation,
+    )
+}
+
+#[test]
+fn a_front_with_feasible_points_returns_only_those() {
+    let front = [point(1.0, 0.0), point(0.5, 0.3), point(2.0, 0.0)];
+    let (returned, feasible) = returned_front(&front);
+    assert_eq!(feasible, Some(true));
+    let kept: Vec<f64> = returned.iter().map(|p| p.fitness[0]).collect();
+    assert_eq!(
+        kept,
+        vec![1.0, 2.0],
+        "the infeasible 0.5 is dropped, better or not"
+    );
+}
+
+#[test]
+fn a_front_with_no_feasible_point_is_returned_and_marked_infeasible() {
+    let front = [point(1.0, 0.2), point(0.5, 0.3)];
+    let (returned, feasible) = returned_front(&front);
+    assert_eq!(feasible, Some(false));
+    assert_eq!(returned.len(), 2, "something to look at, marked as such");
+    let (returned, feasible) = returned_front(&[]);
+    assert!(returned.is_empty());
+    assert_eq!(feasible, None);
+}
+
+#[test]
+fn no_uc2_front_point_is_infeasible_when_reported_feasible() {
+    // The OPT-10 measurement: UC2, population 4, one generation, 30 seeds,
+    // where 53 of 87 returned points carried the penalty. Each returned
+    // point is checked against the problem itself, from its own doses.
+    const POPULATION: usize = 4;
+    const GENERATIONS: usize = 1;
+    const RUNS: u64 = 30;
+    let problem = super::super::uc_problems::UC2DosingProblem::new();
+    let config = || SolverConfig {
+        population_size: POPULATION,
+        max_iterations: GENERATIONS,
+    };
+    // Checked from the doses directly, not through `penalties`, so a broken
+    // `penalties` cannot also break the check: UC2's contraindicated pair is
+    // simvastatin (D3) with clarithromycin (D4), each given at 5% or more.
+    const D3: usize = 3;
+    const D4: usize = 4;
+    const GIVEN: f64 = 0.05;
+    let violated = |vars: &Array1<f64>| vars[D3] >= GIVEN && vars[D4] >= GIVEN;
+    let (mut returned_total, mut infeasible_marked) = (0, 0);
+    for seed in 0..RUNS {
+        let fronts = [
+            (
+                "nsga2",
+                NSGA2Solver::new(config()).with_seed(seed).solve(&problem),
+            ),
+            (
+                "mo_rao_de",
+                MORaoDESolver::new(config()).with_seed(seed).solve(&problem),
+            ),
+            (
+                "mo_bmwr",
+                MOBMWRSolver::new(config(), MOBMWRVariant::MOBMWR)
+                    .with_seed(seed)
+                    .solve(&problem),
+            ),
+        ];
+        for (name, r) in &fronts {
+            let (returned, feasible) = returned_front(&r.pareto_front);
+            returned_total += returned.len();
+            for p in &returned {
+                if feasible == Some(true) {
+                    assert!(
+                        !violated(&p.variables),
+                        "{name} seed {seed}: {:?}",
+                        p.variables
+                    );
+                } else {
+                    infeasible_marked += 1;
+                }
+            }
+        }
+    }
+    assert!(returned_total > 0);
+    // Not an assertion on the count, which depends on the seeds: printed so a
+    // reader of the test log sees how often a whole front was infeasible.
+    println!("{returned_total} points returned, {infeasible_marked} in fronts marked infeasible");
 }
 
 #[test]
