@@ -5,7 +5,6 @@
 //! any snapshot. The value index is limited to primitive values that snapshot
 //! import itself accepts as dedup identifiers.
 
-use crate::graph::property::PropertyValue;
 use crate::snapshot::codec::json_to_property;
 use crate::snapshot::format::{SnapshotHeader, SnapshotNode};
 use flate2::read::GzDecoder;
