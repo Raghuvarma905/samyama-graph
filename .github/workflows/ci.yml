@@ -637,6 +637,25 @@ jobs:
       - name: Check out with the repository's line endings
         run: git config --global core.autocrlf false
 
+      # The first macos-15 run died at the linker with "No space left on
+      # device": every test binary and example links the whole engine
+      # statically, and the arm64 runner has far less free disk than the Linux
+      # ones. The Android SDK and the Xcode versions other than the selected one
+      # are the bulk of the image and nothing here uses them.
+      - name: Free disk space
+        if: runner.os == 'macOS'
+        run: |
+          df -h /
+          keep=$(xcode-select -p | sed 's#/Contents/Developer$##')
+          echo "keeping $keep"
+          sudo rm -rf "${ANDROID_HOME:-$HOME/Library/Android/sdk}" "$HOME/Library/Android"
+          for x in /Applications/Xcode*.app; do
+            [ "$(cd "$x" && pwd -P)" = "$(cd "$keep" && pwd -P)" ] && continue
+            [ -L "$x" ] && continue
+            sudo rm -rf "$x"
+          done
+          df -h /
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
